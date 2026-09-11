@@ -728,3 +728,234 @@ describe("CCC native CLI binding", () => {
     });
   });
 });
+
+describe("CCC native CLI held closure receipt/evidence usage (usage-lane U2/U5)", () => {
+  const buildCccNativeCliHeldClosureEvidence = nativeCliBinding["buildCccNativeCliHeldClosureEvidence"] as (
+    input: { sessionId: string; trigger: string; exitCode: number; exitSignal: number; usage: { inputTokens: number; outputTokens: number } | null },
+  ) => { usage: { inputTokens: number; outputTokens: number } | null };
+  const restoreCccNativeCliHeldClosureReceipt = nativeCliBinding["restoreCccNativeCliHeldClosureReceipt"] as (
+    value: unknown,
+    expected: {
+      sessionId: string;
+      attemptKey: string;
+      controllerToken: string;
+      taskId: string;
+      authorityBindingHash: string;
+      turnKey: string;
+      dispatchKey: string;
+    },
+  ) => { usage: { inputTokens: number; outputTokens: number } | null };
+  const validateCccNativeCliHeldClosureReceiptFn = nativeCliBinding["validateCccNativeCliHeldClosureReceipt"] as (
+    value: unknown,
+    expected: { sessionId: string; policy: unknown },
+  ) => unknown;
+
+  const expected = {
+    sessionId: "session-usage-1",
+    attemptKey: "ccc-provider-attempt-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    controllerToken: "ccc-provider-controller-01234567-89ab-cdef-0123-456789abcdef",
+    taskId: "REQ-9",
+    authorityBindingHash: "a".repeat(64),
+    turnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+  } as const;
+
+  function receiptFor(usage: { inputTokens: number; outputTokens: number } | null) {
+    return Object.freeze({
+      kind: "ccc-fusion.native-cli-held-closure",
+      version: 1,
+      sessionId: expected.sessionId,
+      attemptKey: expected.attemptKey,
+      controllerToken: expected.controllerToken,
+      taskId: expected.taskId,
+      authorityBindingHash: expected.authorityBindingHash,
+      turnKey: expected.turnKey,
+      dispatchKey: expected.dispatchKey,
+      trigger: "done",
+      exitCode: 0,
+      exitSignal: 0,
+      processGroupClosed: true,
+      proxyClosed: true,
+      durableFloorFlushed: true,
+      slotHeld: true,
+      // The receipt-level validator requires frozen usage (matches every
+      // other nested object this validator accepts) — freeze it here too.
+      usage: usage === null ? null : Object.freeze(usage),
+    });
+  }
+
+  it("RED-U2-1: buildCccNativeCliHeldClosureEvidence carries captured usage through", () => {
+    const evidence = buildCccNativeCliHeldClosureEvidence({
+      sessionId: expected.sessionId,
+      trigger: "done",
+      exitCode: 0,
+      exitSignal: 0,
+      usage: { inputTokens: 24327, outputTokens: 5 },
+    });
+
+    expect(evidence.usage).toEqual({ inputTokens: 24327, outputTokens: 5 });
+  });
+
+  it("RED-U2-2: buildCccNativeCliHeldClosureEvidence carries a null usage through (non-codex adapters, or no turn.completed observed)", () => {
+    const evidence = buildCccNativeCliHeldClosureEvidence({
+      sessionId: expected.sessionId,
+      trigger: "exit",
+      exitCode: 1,
+      exitSignal: 0,
+      usage: null,
+    });
+
+    expect(evidence.usage).toBeNull();
+  });
+
+  it("RED-U2-3: restoreCccNativeCliHeldClosureReceipt round-trips the persisted evidence usage into the receipt", () => {
+    const evidence = buildCccNativeCliHeldClosureEvidence({
+      sessionId: expected.sessionId,
+      trigger: "done",
+      exitCode: 0,
+      exitSignal: 0,
+      usage: { inputTokens: 100, outputTokens: 10 },
+    });
+
+    const receipt = restoreCccNativeCliHeldClosureReceipt(evidence, expected);
+
+    expect(receipt.usage).toEqual({ inputTokens: 100, outputTokens: 10 });
+  });
+
+  it("RED-U2-8: restoreCccNativeCliHeldClosureReceipt accepts pre-usage-lane persisted evidence (version 1, no usage key) as usage: null", () => {
+    // Simulates evidence written to durable storage (autonomyPosture.cccNativeCliHeldClosureEvidence)
+    // by the pre-usage-lane code, i.e. HELD_CLOSURE_EVIDENCE_KEYS before "usage" was added and read
+    // back on a restart-recovery path (executor.ts selectCccNativeCliHeldClosureReceipt) after the
+    // upgrade. A JSON.parse of that old row never gains a "usage" key, so the exact-key check must
+    // not refuse it — it must be accepted as the legacy shape with usage: null.
+    const legacyEvidence = {
+      kind: "ccc-fusion.native-cli-held-closure-evidence",
+      version: 1,
+      sessionId: expected.sessionId,
+      trigger: "done",
+      exitCode: 0,
+      exitSignal: 0,
+      processGroupClosed: true,
+      proxyClosed: true,
+      durableFloorFlushed: true,
+      slotHeld: true,
+      // deliberately no "usage" key
+    };
+
+    const receipt = restoreCccNativeCliHeldClosureReceipt(legacyEvidence, expected);
+
+    expect(receipt.usage).toBeNull();
+  });
+
+  it("RED-U2-4: validateCccNativeCliHeldClosureReceipt accepts a frozen exact receipt carrying usage", () => {
+    const receipt = receiptFor({ inputTokens: 5, outputTokens: 1 });
+    const policy = {
+      attemptKey: expected.attemptKey,
+      controllerToken: expected.controllerToken,
+      taskId: expected.taskId,
+      authorityBindingHash: expected.authorityBindingHash,
+      turnKey: expected.turnKey,
+      dispatchKey: expected.dispatchKey,
+    };
+
+    expect(validateCccNativeCliHeldClosureReceiptFn(receipt, { sessionId: expected.sessionId, policy })).toBe(receipt);
+  });
+
+  it("RED-U2-5: validateCccNativeCliHeldClosureReceipt accepts a frozen exact receipt with null usage", () => {
+    const receipt = receiptFor(null);
+    const policy = {
+      attemptKey: expected.attemptKey,
+      controllerToken: expected.controllerToken,
+      taskId: expected.taskId,
+      authorityBindingHash: expected.authorityBindingHash,
+      turnKey: expected.turnKey,
+      dispatchKey: expected.dispatchKey,
+    };
+
+    expect(validateCccNativeCliHeldClosureReceiptFn(receipt, { sessionId: expected.sessionId, policy })).toBe(receipt);
+  });
+
+  it("RED-U2-6: refuses a held closure receipt missing the usage key (exact-key discipline)", () => {
+    const withoutUsage = Object.freeze(
+      Object.fromEntries(Object.entries(receiptFor(null)).filter(([key]) => key !== "usage")),
+    );
+    const policy = {
+      attemptKey: expected.attemptKey,
+      controllerToken: expected.controllerToken,
+      taskId: expected.taskId,
+      authorityBindingHash: expected.authorityBindingHash,
+      turnKey: expected.turnKey,
+      dispatchKey: expected.dispatchKey,
+    };
+
+    expect(() => validateCccNativeCliHeldClosureReceiptFn(withoutUsage, { sessionId: expected.sessionId, policy }))
+      .toThrow(/exact keys/i);
+  });
+
+  it("RED-U2-7: refuses a held closure receipt whose usage has a negative token count", () => {
+    const receipt = receiptFor({ inputTokens: -1, outputTokens: 0 });
+    const policy = {
+      attemptKey: expected.attemptKey,
+      controllerToken: expected.controllerToken,
+      taskId: expected.taskId,
+      authorityBindingHash: expected.authorityBindingHash,
+      turnKey: expected.turnKey,
+      dispatchKey: expected.dispatchKey,
+    };
+
+    expect(() => validateCccNativeCliHeldClosureReceiptFn(receipt, { sessionId: expected.sessionId, policy }))
+      .toThrow();
+  });
+});
+
+describe("usage shape parity between core's provider-attempt validator and the binding's copy (usage-lane U5)", () => {
+  const validateCccNativeCliUsageShape = nativeCliBinding["validateCccNativeCliUsageShape"] as (
+    value: unknown,
+    label: string,
+  ) => unknown;
+
+  const requestedIdentity = { providerId: "openai", modelId: "gpt-4o" };
+  function coreInputFor(usage: unknown) {
+    return {
+      effectiveProvider: requestedIdentity.providerId,
+      effectiveModel: requestedIdentity.modelId,
+      usage,
+      cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+      receiptSource: "none" as const,
+    };
+  }
+
+  // The binding's copy additionally requires the usage object itself to be
+  // frozen (this file's exact-key validators are frozen-object-only
+  // throughout); core's requireUsage has no such requirement. Freezing every
+  // well-formed candidate here keeps the comparison on the dimension that
+  // actually matters — shape and value — rather than an unrelated mismatch.
+  const acceptedShapes: Array<{ label: string; usage: unknown }> = [
+    { label: "null", usage: null },
+    { label: "zero counts", usage: Object.freeze({ inputTokens: 0, outputTokens: 0 }) },
+    { label: "typical counts", usage: Object.freeze({ inputTokens: 24327, outputTokens: 5 }) },
+  ];
+  const rejectedShapes: Array<{ label: string; usage: unknown }> = [
+    { label: "negative inputTokens", usage: Object.freeze({ inputTokens: -1, outputTokens: 0 }) },
+    { label: "non-integer outputTokens", usage: Object.freeze({ inputTokens: 1, outputTokens: 1.5 }) },
+    { label: "extra key", usage: Object.freeze({ inputTokens: 1, outputTokens: 1, extra: true }) },
+    { label: "missing outputTokens", usage: Object.freeze({ inputTokens: 1 }) },
+    { label: "array instead of object", usage: Object.freeze([]) },
+  ];
+
+  for (const { label, usage } of acceptedShapes) {
+    it(`RED-U5-accept-${label}: core and binding both accept ${label}`, async () => {
+      const core = await import("@fusion/core");
+      expect(() => core.assertCccProviderAttemptEffectiveRoute(coreInputFor(usage), requestedIdentity)).not.toThrow();
+      expect(() => validateCccNativeCliUsageShape(usage, "test usage")).not.toThrow();
+    });
+  }
+
+  for (const { label, usage } of rejectedShapes) {
+    it(`RED-U5-reject-${label}: core and binding both reject ${label}`, async () => {
+      const core = await import("@fusion/core");
+      expect(() => core.assertCccProviderAttemptEffectiveRoute(coreInputFor(usage), requestedIdentity)).toThrow();
+      expect(() => validateCccNativeCliUsageShape(usage, "test usage")).toThrow();
+    });
+  }
+});

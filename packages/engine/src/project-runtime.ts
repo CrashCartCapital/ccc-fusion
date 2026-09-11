@@ -41,6 +41,11 @@ export interface ProjectRuntimeConfig {
    * and startup may safely park uncertain effects owned by a prior boot.
    */
   engineInstanceId?: string;
+  /**
+   * Frozen ownership identity for task-worktree mutations. C1 defines the
+   * interface; the integration wave makes this required at production entrypoints.
+   */
+  worktreeOwnershipContext?: import("./worktree-ownership.js").WorktreeOwnershipContext;
   /** Absolute path to the project working directory */
   workingDirectory: string;
   /** Execution isolation mode */

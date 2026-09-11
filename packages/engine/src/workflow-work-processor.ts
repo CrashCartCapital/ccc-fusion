@@ -281,6 +281,17 @@ export async function processDueWorkflowWorkItem(
     resolveCampaignCompletion?.(campaignCompletionError === undefined
       ? { runtime: runtimeResult! }
       : { error: campaignCompletionError });
+    /*
+    FNXC:CCCHardCancellation 2026-09-07:
+    Resolve campaignCompletion before task-log diagnostics. logEntry re-acquires
+    the same task lock held by a user move while it awaits this disposer; an
+    inline await deadlocks the move before Todo publication. Keep this ordered
+    projection awaited after durable terminal state and authorization cleanup;
+    it must not become void fire-and-forget.
+    */
+    for (const diagnostic of diagnostics) {
+      await bestEffortWorkflowDiagnostic(store, dispatch.taskId, diagnostic);
+    }
   }
   return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
 }
@@ -464,7 +475,6 @@ async function transitionCampaignTerminal(
       `[ccc-campaign:work-item-terminal] workItem=${workItem.id} `
       + `terminal=${terminalState} reason=${runtimeResult.reason ?? "<none recorded>"}`;
     diagnostics.push(diagnostic);
-    await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
   }
 
   if (terminalState === "succeeded" && store.getTask) {
@@ -531,7 +541,6 @@ async function closeClaimedSealedAuthorizationAfterTerminal(
         + `workItem=${workItem.id} authorization=${authorizationId} `
         + `terminal=${terminalState} openedApprovalRequests=${closure.openedApprovalRequestIds.join(",")}`;
       diagnostics.push(diagnostic);
-      await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
     }
   } catch (error) {
     const diagnostic =
@@ -539,7 +548,6 @@ async function closeClaimedSealedAuthorizationAfterTerminal(
       + `workItem=${workItem.id} authorization=${authorizationId} `
       + `terminal=${terminalState} error=${error instanceof Error ? error.message : String(error)}`;
     diagnostics.push(diagnostic);
-    await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
   }
 }
 

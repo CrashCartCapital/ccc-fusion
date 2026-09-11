@@ -41,6 +41,8 @@ const LOCK_RETRY_OPTIONS = {
 } as const;
 
 export interface EngineSingletonLock {
+  /** Fail closed unless this process still owns both singleton guards. */
+  assertHeld(): void;
   /** Idempotent release of both the lockfile and the loopback listener. */
   release(): Promise<void>;
   /** Address of the loopback listener (UDS path or named pipe). */
@@ -62,6 +64,13 @@ export class EngineAlreadyRunningError extends Error {
     if (cause !== undefined) {
       (this as { cause?: unknown }).cause = cause;
     }
+  }
+}
+
+export class EngineMutationAuthorityError extends Error {
+  constructor() {
+    super("Engine mutation authority is not held");
+    this.name = "EngineMutationAuthorityError";
   }
 }
 
@@ -194,18 +203,39 @@ export async function acquireEngineSingleton(
 ): Promise<EngineSingletonLock> {
   let lock: { release: () => Promise<void>; path: string } | undefined;
   let server: net.Server | undefined;
+  let held = false;
+  let compromised = false;
+  let released = false;
+  let compromiseNotified = false;
   const socketPath = computeEngineSocketPath(projectId);
+  const revoke = (error?: Error) => {
+    compromised = true;
+    held = false;
+    if (error && !released && !compromiseNotified) {
+      compromiseNotified = true;
+      onCompromised(error);
+    }
+  };
   try {
     try {
       server = await bindLoopback(socketPath);
+      server.once("close", () => {
+        if (!released) revoke(new EngineMutationAuthorityError());
+      });
     } catch (err) {
       throw new EngineAlreadyRunningError(projectId, "socket", err);
     }
     try {
-      lock = await acquireLockfile(workingDir, onCompromised);
+      lock = await acquireLockfile(workingDir, (error) => {
+        revoke(error);
+      });
     } catch (err) {
       throw new EngineAlreadyRunningError(projectId, "lockfile", err);
     }
+    if (compromised || !server.listening) {
+      throw new EngineMutationAuthorityError();
+    }
+    held = true;
   } catch (err) {
     if (server) {
       await closeServer(server).catch(() => {});
@@ -216,16 +246,19 @@ export async function acquireEngineSingleton(
     throw err;
   }
 
-  let released = false;
   const lockPath = lock.path;
   const release = lock.release;
   const boundServer = server;
   return {
     socketPath,
     lockFilePath: lockPath,
+    assertHeld() {
+      if (!held) throw new EngineMutationAuthorityError();
+    },
     async release() {
       if (released) return;
       released = true;
+      held = false;
       await closeServer(boundServer).catch(() => {});
       await release().catch(() => {});
     },

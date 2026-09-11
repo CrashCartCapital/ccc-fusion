@@ -1080,6 +1080,7 @@ export {
   computeEngineLockFilePath,
   computeEngineSocketPath,
   EngineAlreadyRunningError,
+  EngineMutationAuthorityError,
   type EngineSingletonLock,
 } from "./engine-singleton-lock.js";
 export { NodeHealthMonitor } from "./node-health-monitor.js";
@@ -1264,6 +1265,28 @@ export {
   type CliAdapterDescriptor,
 } from "./cli-agent/adapters/index.js";
 export { installBaselineArchiveWorktreeDisposer } from "./archive-worktree-disposer-install.js";
+export {
+  WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH,
+  WORKTREE_OWNERSHIP_OWNER,
+  WORKTREE_OWNERSHIP_SCHEMA,
+  WorktreeOwnershipError,
+  classifyWorktreeOwnership,
+  createWorktreeOwnershipMarker,
+  inspectStrictGitWorktreeInventory,
+  parseWorktreeOwnershipMarker,
+  serializeWorktreeOwnershipMarker,
+  transitionWorktreeOwnershipMarkers,
+  writeWorktreeOwnershipMarkers,
+  type EngineMutationAuthority,
+  type GitInventoryRunner,
+  type StrictGitWorktreeInventory,
+  type StrictGitWorktreeInventoryEntry,
+  type WorktreeOwnershipClassification,
+  type WorktreeOwnershipContext,
+  type WorktreeOwnershipErrorCode,
+  type WorktreeOwnershipLifecycle,
+  type WorktreeOwnershipMarker,
+} from "./worktree-ownership.js";
 
 // CLI Agent Executor — task ↔ session orchestration (U7).
 export {

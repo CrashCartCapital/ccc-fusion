@@ -100,6 +100,90 @@ async function authorSemanticV2Packet(
   });
 }
 
+function generatedAuthorArgs(
+  packet: ReturnType<typeof createPacketRoot>,
+): string[] {
+  return [
+    "author",
+    packet.root,
+    packet.manifest,
+    packet.sidecar,
+    "--target", packet.target,
+    "--base", packet.base,
+    "--provider", "loopback",
+    "--model", "fixture",
+    "--max-requests", "2",
+    "--max-duration-ms", "30000",
+    "--max-concurrency", "1",
+    "--max-prompt-bytes", "1000000",
+    "--max-response-bytes", "262144",
+    "--max-review-items", "8",
+  ];
+}
+
+/**
+ * The semantic-proof sandbox has a Darwin-only backend, so the real readiness
+ * probe reports "unavailable" on a Linux CI runner and the preflight refuses
+ * before the assertion under test can run. Any test that pins
+ * `preflightPlatform` must pin this probe too; only the tests that are *about*
+ * sandbox readiness should let it vary.
+ */
+function readySemanticProofSandbox() {
+  return vi.fn(async () => ({
+    ready: true,
+    backend: "sandbox-exec" as const,
+    code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+    message: "semantic-proof sandbox-exec backend is available",
+    trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+  }));
+}
+
+function generatedAuthorHarness(
+  packet: ReturnType<typeof createPacketRoot>,
+  overrides: Record<string, unknown> = {},
+) {
+  const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
+  const adapter = {
+    id: "fusion-native-model-runtime-v1",
+    model: "loopback/fixture",
+    generateCandidate: vi.fn(async () => proposal),
+  };
+  const createNativeCccPrdAuthoringAdapter = vi.fn(() => adapter);
+  const authorCccPrdPacket = vi.fn(async ({ adapter: suppliedAdapter }: {
+    adapter: { generateCandidate: () => Promise<unknown> };
+  }) => {
+    await suppliedAdapter.generateCandidate();
+    return {
+      kind: "candidate" as const,
+      sidecar: { schema: "ccc-prd.sidecar.v2" },
+      review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
+    };
+  });
+  const bootstrapProofAdmission = vi.fn(async () => ({}) as never);
+  const readTargetHead = vi.fn(async () => packet.base);
+  const resolveSemanticProofToolchainPaths = vi.fn(() => packet.semanticProofToolchainPaths!);
+  const inspectSemanticProofSandboxReadiness = readySemanticProofSandbox();
+  const dependencies = {
+    authorCccPrdPacket: authorCccPrdPacket as never,
+    bootstrapProofAdmission,
+    createNativeCccPrdAuthoringAdapter,
+    inspectSemanticProofSandboxReadiness,
+    readTargetHead,
+    resolveSemanticProofToolchainPaths,
+    ...overrides,
+  } as unknown as Parameters<typeof runPrdCommand>[2];
+  return {
+    adapter,
+    authorCccPrdPacket,
+    bootstrapProofAdmission,
+    createNativeCccPrdAuthoringAdapter,
+    inspectSemanticProofSandboxReadiness,
+    readTargetHead,
+    resolveSemanticProofToolchainPaths,
+    dependencies,
+  };
+}
+
 /**
  * The operator loop prints human-readable prose by default. These assertions
  * pin the machine-readable contract, so they ask for it explicitly.
@@ -265,22 +349,14 @@ function snapshotPacketRoot(root: string): Record<string, string> {
 }
 
 describe("prd command exit contract", () => {
-  it("RED-S4-executable-author: generated author defers controller toolchain custody until proposal parsing", async () => {
-    const packet = createPacketRoot();
+  it("generated author runs fixed host preflight before proposal parsing", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
     const adapter = {
       id: "fusion-native-model-runtime-v1",
       model: "loopback/fixture",
       generateCandidate: vi.fn(),
     };
-    const toolchainPaths = {
-      taskExecutablePath: "/controller/task",
-      nodeExecutablePath: "/controller/node",
-      proofHost: {
-        id: "fusion-cli-semantic-proof-host.v1" as const,
-        executablePath: "/controller/fusion-cli",
-      },
-    };
-    const resolveToolchain = vi.fn(() => toolchainPaths);
+    const resolveToolchain = vi.fn(() => packet.semanticProofToolchainPaths!);
     const authorCccPrdPacket = vi.fn(async () => ({
       kind: "candidate" as const,
       sidecar: { schema: "ccc-prd.sidecar.v2" },
@@ -307,10 +383,12 @@ describe("prd command exit contract", () => {
       authorCccPrdPacket: authorCccPrdPacket as never,
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
 
-    expect(resolveToolchain).not.toHaveBeenCalled();
+    expect(resolveToolchain).toHaveBeenCalledWith({ pythonRequired: false });
     expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
       semanticProofContract: "v2",
       resolveSemanticProofToolchainPaths: expect.any(Function),
@@ -322,6 +400,223 @@ describe("prd command exit contract", () => {
     expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toEqual({
       schema: "ccc-prd.sidecar.v2",
     });
+  });
+
+  it("generated author preflight refuses unsupported platform before adapter creation", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "linux" });
+    const output: string[] = [];
+    const before = snapshotPacketRoot(packet.root);
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(1);
+
+    expect(harness.createNativeCccPrdAuthoringAdapter).not.toHaveBeenCalled();
+    expect(harness.adapter.generateCandidate).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PREFLIGHT_UNSUPPORTED_PLATFORM" }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "platform", status: "fail" }),
+        ]),
+      },
+    });
+    expect(snapshotPacketRoot(packet.root)).toEqual(before);
+  });
+
+  it("generated author preflight refuses a missing Darwin sandbox backend before any authoring dispatch", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
+      ready: false,
+      backend: "sandbox-exec" as const,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox-exec backend is unavailable",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      detail: "/usr/bin/sandbox-exec does not exist",
+    }));
+    const harness = generatedAuthorHarness(packet, {
+      preflightPlatform: "darwin",
+      inspectSemanticProofSandboxReadiness,
+    });
+    const output: string[] = [];
+    const before = snapshotPacketRoot(packet.root);
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(1);
+
+    expect(inspectSemanticProofSandboxReadiness).toHaveBeenCalledTimes(1);
+    expect(harness.createNativeCccPrdAuthoringAdapter).not.toHaveBeenCalled();
+    expect(harness.bootstrapProofAdmission).not.toHaveBeenCalled();
+    expect(harness.authorCccPrdPacket).not.toHaveBeenCalled();
+    expect(harness.adapter.generateCandidate).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_AUTHORING_PREFLIGHT_SANDBOX_UNAVAILABLE",
+        message: expect.stringContaining("/usr/bin/sandbox-exec does not exist"),
+      }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "platform", status: "pass" }),
+          expect.objectContaining({
+            id: "sandbox",
+            status: "fail",
+            message: expect.stringContaining("/usr/bin/sandbox-exec does not exist"),
+          }),
+        ]),
+      },
+    });
+    expect(snapshotPacketRoot(packet.root)).toEqual(before);
+  });
+
+  it("generated author preflight refuses target baseline mismatch before adapter creation", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
+    harness.readTargetHead.mockResolvedValue("f".repeat(40));
+    const output: string[] = [];
+    const before = snapshotPacketRoot(packet.root);
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(1);
+
+    expect(harness.readTargetHead).toHaveBeenCalledWith(packet.target);
+    expect(harness.createNativeCccPrdAuthoringAdapter).not.toHaveBeenCalled();
+    expect(harness.adapter.generateCandidate).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PREFLIGHT_BASELINE_MISMATCH" }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "baseline_head", status: "fail" }),
+        ]),
+      },
+    });
+    expect(snapshotPacketRoot(packet.root)).toEqual(before);
+  });
+
+  it("generated author preflight refuses missing fixed tool paths before adapter creation", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const harness = generatedAuthorHarness(packet, {
+      preflightPlatform: "darwin",
+      resolveSemanticProofToolchainPaths: vi.fn(() => {
+        throw new Error("Task executable is unavailable");
+      }),
+    });
+    const output: string[] = [];
+    const before = snapshotPacketRoot(packet.root);
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(1);
+
+    expect(harness.createNativeCccPrdAuthoringAdapter).not.toHaveBeenCalled();
+    expect(harness.adapter.generateCandidate).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PREFLIGHT_TOOLCHAIN_UNAVAILABLE" }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "fixed_host_toolchain", status: "fail" }),
+        ]),
+      },
+    });
+    expect(snapshotPacketRoot(packet.root)).toEqual(before);
+  });
+
+  it("generated author preflight reports proposal and provider unknown while continuing", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(0);
+
+    expect(harness.createNativeCccPrdAuthoringAdapter).toHaveBeenCalledTimes(1);
+    expect(harness.adapter.generateCandidate).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "candidate",
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: true,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "provider_route", status: "unknown" }),
+          expect.objectContaining({ id: "proposal_proof", status: "unknown" }),
+        ]),
+      },
+    });
+  });
+
+  it("generated author preflight reports known readiness and continues the existing author path", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(0);
+
+    expect(harness.createNativeCccPrdAuthoringAdapter).toHaveBeenCalledTimes(1);
+    expect(harness.authorCccPrdPacket).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "candidate",
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: true,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "platform", status: "pass" }),
+          expect.objectContaining({ id: "baseline_head", status: "pass" }),
+          expect.objectContaining({ id: "fixed_host_toolchain", status: "pass" }),
+        ]),
+      },
+    });
+  });
+
+  it("classic proposal-file author route remains unchanged without generated preflight", async () => {
+    const packet = createPacketRoot();
+    const output: string[] = [];
+    const authorCccPrdPacket = vi.fn(async () => ({
+      kind: "candidate" as const,
+      sidecar: { schema: "ccc-prd.sidecar.v1" },
+      review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
+    }));
+
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => output.push(line) },
+      {
+        authorCccPrdPacket: authorCccPrdPacket as never,
+        bootstrapProofAdmission: async () => ({}) as never,
+      },
+    )).toBe(0);
+
+    expect(authorCccPrdPacket).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({ kind: "candidate" });
+    expect(JSON.parse(output[0]!).preflight).toBeUndefined();
   });
 
   it("RED-R1-generated-author-python: resolves the target Python venv after the model proposal", async () => {
@@ -364,7 +659,8 @@ describe("prd command exit contract", () => {
       model: "loopback/fixture",
       generateCandidate: vi.fn(async () => proposal),
     };
-    const resolveToolchain = vi.fn(() => {
+    const resolveToolchain = vi.fn(({ pythonRequired }: { pythonRequired?: boolean } = {}) => {
+      if (!pythonRequired) return packet.semanticProofToolchainPaths!;
       throw new Error("CCC semantic-proof active Python venv is unavailable: target/.venv");
     });
     const output: string[] = [];
@@ -387,6 +683,8 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       bootstrapProofAdmission,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(1);
 
@@ -476,7 +774,7 @@ describe("prd command exit contract", () => {
     }));
   });
 
-  it("refuses generated executable authoring after model setup when controller toolchain custody is unavailable", async () => {
+  it("refuses generated executable authoring before adapter setup when fixed toolchain custody is unavailable", async () => {
     const packet = createPacketRoot({ semanticV2: true });
     const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
     const createAdapter = vi.fn(() => ({
@@ -504,18 +802,24 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       createNativeCccPrdAuthoringAdapter: createAdapter,
       bootstrapProofAdmission,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: () => {
         throw new Error("built proof host missing");
       },
     })).toBe(1);
 
-    expect(createAdapter).toHaveBeenCalledTimes(1);
+    expect(createAdapter).not.toHaveBeenCalled();
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",
       diagnostics: [{
-        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        code: "CCC_PRD_AUTHORING_PREFLIGHT_TOOLCHAIN_UNAVAILABLE",
         message: "built proof host missing",
       }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+      },
     });
   });
 
@@ -1673,6 +1977,132 @@ describe("prd command exit contract", () => {
     }));
     expect(closeProjectStore).toHaveBeenCalledTimes(2);
     expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it("R5-generated-v2-route-nonconforming-proof-refuses-before-import", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
+    const nativeAdapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    };
+    const createNativeCccPrdAuthoringAdapter = vi.fn(() => nativeAdapter);
+    const generatedAuthorOutput: string[] = [];
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => generatedAuthorOutput.push(line) },
+      {
+        bootstrapProofAdmission,
+        createNativeCccPrdAuthoringAdapter,
+        inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "sandbox-exec" as const,
+          code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+          message: "semantic-proof sandbox-exec backend is available",
+          trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        })),
+        readTargetHead: vi.fn(async () => packet.base),
+        preflightPlatform: "darwin",
+        resolveSemanticProofToolchainPaths: vi.fn(() => packet.semanticProofToolchainPaths!),
+        // Keep the engine authoring function real: it must hydrate controller
+        // proof custody and emit the complete admissible semantic-v2 sidecar.
+      },
+    )).toBe(0);
+    expect(createNativeCccPrdAuthoringAdapter).toHaveBeenCalledTimes(1);
+    expect(nativeAdapter.generateCandidate).toHaveBeenCalledTimes(1);
+    expect(generatedAuthorOutput.join("\n")).toContain('"kind":"candidate"');
+    const authoredSidecar = JSON.parse(readFileSync(packet.sidecar, "utf8")) as {
+      schema: string;
+      provenance: { authoringModel?: string };
+    };
+    expect(authoredSidecar).toMatchObject({
+      schema: "ccc-prd.sidecar.v2",
+      provenance: { authoringModel: "loopback/fixture" },
+    });
+    expect(authoredSidecar.provenance.authoringModel).not.toBe("proposal-file-v2");
+    const policyPath = await createExecutionPlan(packet);
+    const layer = {};
+    const store = { getAsyncLayer: vi.fn(() => layer) };
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store,
+    };
+    const importBundle = vi.fn();
+    const closeProjectStore = vi.fn(async () => undefined);
+    const conformanceInputs: unknown[] = [];
+    const assertSemanticProofVerifierConformance = vi.fn(async (input: unknown) => {
+      conformanceInputs.push(input);
+    });
+    const dependencies = {
+      resolveProject: vi.fn(async () => context),
+      closeProjectStore,
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+        message: "semantic-proof sandbox readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance,
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      policyPath,
+      packet.target,
+      packet.base,
+    ];
+    const previewOutput: string[] = [];
+    expect(await runPrdJson(
+      ["preview", ...common],
+      { write: (line) => previewOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(0);
+    const preview = JSON.parse(previewOutput[0]!) as { confirmationDigest: string };
+    expect(conformanceInputs).toHaveLength(1);
+
+    assertSemanticProofVerifierConformance.mockImplementationOnce(async (input: unknown) => {
+      conformanceInputs.push(input);
+      const error = new Error("fixture verifier output is not ccc-prd.proof-evidence.v2");
+      Object.assign(error, { code: "CCC_PRD_PROOF_VERIFIER_NONCONFORMING" });
+      throw error;
+    });
+
+    const importOutput: string[] = [];
+    expect(await runPrdJson(
+      ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
+      { write: (line) => importOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(1);
+    expect(JSON.parse(importOutput[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [expect.objectContaining({ code: "CCC_PRD_PROOF_VERIFIER_NONCONFORMING" })],
+    });
+    // Preview and import send the same generated v2 proof set through the
+    // controller conformance seam; the refusal happens before importer,
+    // campaign, provider, or proof-attempt effects can begin.
+    expect(conformanceInputs).toHaveLength(2);
+    expect(conformanceInputs[1]).toEqual(conformanceInputs[0]);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(closeProjectStore).toHaveBeenCalledTimes(2);
   });
 
   it("shows extracted PRD work and actionable verifier guidance when confinement is unavailable", async () => {

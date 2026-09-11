@@ -2,11 +2,15 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
+  closeUnopenedCccCampaignExecutionAuthorizationMembers,
+  createCccCampaignAuthorityBinding,
+  drizzleSql,
   getApprovalRequest,
   getCccCampaignExecutionAuthorization,
   importCccPrdBundle,
   inspectCccPrdProductStatus,
   queryRunAuditEvents,
+  recordRunAuditEventWithinTransaction,
   TaskStore,
   type ApprovalRequestActorSnapshot,
   type CccPrdProtectedActionIntent,
@@ -25,8 +29,10 @@ import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
 } from "../../../core/src/__test-utils__/pg-test-harness.js";
+import * as schema from "../../../core/src/postgres/schema/index.js";
 import * as productControl from "../ccc-campaign-product-control.js";
 import { TaskExecutor } from "../executor.js";
+import { formatCccPermanentWorkItemError } from "../workflow-task-runtime.js";
 import type { WorkflowNodeExecutionContext } from "../workflow-graph-executor.js";
 
 const execFile = promisify(execFileCallback);
@@ -39,6 +45,8 @@ const OPERATOR: ApprovalRequestActorSnapshot = Object.freeze({
 });
 
 const LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS = 60_000;
+const NON_LIVE_PERMANENT_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 
 type SealedLiveExecutionApproval = Omit<
   CccCampaignExecutionAuthorization,
@@ -240,6 +248,374 @@ pgTest("CCC campaign live-execution approval", () => {
       secondLiveAction,
     };
   }
+
+  async function prepareFormatterToStoreFixture(
+    suffix: string,
+    reason: string,
+    error: unknown,
+  ) {
+    const api = liveExecutionApprovalApi();
+    const fixture = await importFixture(suffix);
+    const issued = await api.issueCccCampaignLiveExecutionApproval({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.firstTaskId,
+      runId: `RUN-${suffix}-issue`,
+    });
+    const confirmation =
+      api.computeCccCampaignLiveExecutionApprovalConfirmation(issued);
+    const claimed = await api.approveCccCampaignLiveExecution({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.firstTaskId,
+      authorizationId: issued.authorizationId,
+      confirmation,
+      actor: OPERATOR,
+    });
+    const formatted = formatCccPermanentWorkItemError(reason, error);
+    expect(formatted).toBe(reason);
+    await h.layer().db.execute(drizzleSql`
+      UPDATE project.workflow_work_items
+      SET state = 'manual-required',
+          last_error = ${formatted},
+          blocked_reason = ${reason},
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          updated_at = ${new Date().toISOString()}
+      WHERE id = ${claimed.workItemId}
+    `);
+    await expect(h.store().getWorkflowWorkItem(fixture.workItem.id))
+      .resolves.toMatchObject({
+        state: "manual-required",
+        lastError: formatted,
+        blockedReason: reason,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+    return { fixture, claimed, formatted };
+  }
+
+  async function childRows(importId: string) {
+    return await h.layer().db.execute(drizzleSql`
+      SELECT id, status, claim_token
+      FROM project.approval_requests
+      WHERE campaign_import_id = ${importId}
+      ORDER BY id
+    `) as unknown as Array<{
+      id: string;
+      status: string;
+      claim_token: string | null;
+    }>;
+  }
+
+  async function closureAuditRows(importId: string) {
+    return await h.layer().db.execute(drizzleSql`
+      SELECT mutation_type, campaign_binding_hash
+      FROM project.run_audit_events
+      WHERE campaign_import_id = ${importId}
+        AND mutation_type IN (
+          'ccc-campaign:provider-attempt:reserved',
+          'execution-authorization:child-closed-no-effect',
+          'execution-authorization:settled'
+        )
+      ORDER BY id
+    `) as unknown as Array<{
+      mutation_type: string;
+      campaign_binding_hash: string | null;
+    }>;
+  }
+
+  function actionFor(
+    fixture: Awaited<ReturnType<typeof importFixture>>,
+    taskId: string,
+  ) {
+    if (taskId === fixture.firstTaskId) {
+      return {
+        actionId: fixture.firstLiveAction.id,
+        actionTarget: fixture.firstLiveAction.target,
+      };
+    }
+    if (taskId === fixture.secondTaskId) {
+      return {
+        actionId: fixture.secondLiveAction.id,
+        actionTarget: fixture.secondLiveAction.target,
+      };
+    }
+    throw new Error(`unknown formatter-to-store task ${taskId}`);
+  }
+
+  async function assertClaimedLeases(
+    fixture: Awaited<ReturnType<typeof importFixture>>,
+    claimed: SealedLiveExecutionApproval,
+  ) {
+    for (const member of claimed.members) {
+      await expect(h.store().inspectCccCampaignActionLease(
+        member.nativeTaskId,
+        actionFor(fixture, member.nativeTaskId),
+      )).resolves.toMatchObject({
+        binding: { bindingHash: member.bindingHash },
+        lease: { approvalRequestId: member.approvalRequestId },
+      });
+    }
+  }
+
+  async function assertNoEffectSettlement(
+    prepared: Awaited<ReturnType<typeof prepareFormatterToStoreFixture>>,
+    runId: string,
+  ) {
+    const { fixture, claimed } = prepared;
+    const closed = await closeUnopenedCccCampaignExecutionAuthorizationMembers(
+      h.layer(),
+      {
+        authorityStore: h.store(),
+        rootDir: fixture.rootDir,
+        authorizationId: claimed.authorizationId,
+        actor: OPERATOR,
+        runId,
+      },
+    );
+    expect(closed).toMatchObject({
+      authorization: { status: "settled" },
+      openedApprovalRequestIds: [],
+    });
+    expect([...closed.closedApprovalRequestIds].sort()).toEqual(
+      claimed.members.map(({ approvalRequestId }) => approvalRequestId).sort(),
+    );
+    const children = await childRows(fixture.imported.importId);
+    expect(children).toHaveLength(2);
+    expect(children.every(({ status, claim_token }) =>
+      status === "expired" && typeof claim_token === "string")).toBe(true);
+    for (const member of claimed.members) {
+      await expect(h.store().inspectCccCampaignActionLease(
+        member.nativeTaskId,
+        actionFor(fixture, member.nativeTaskId),
+      )).resolves.toBeNull();
+    }
+    const audits = await closureAuditRows(fixture.imported.importId);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:child-closed-no-effect")).toHaveLength(2);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:settled")).toHaveLength(1);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "ccc-campaign:provider-attempt:reserved")).toEqual([]);
+  }
+
+  it("formatter-to-store allows bare normalized non-live reason with no reservation or effect", async () => {
+    const prepared = await prepareFormatterToStoreFixture(
+      "formatter-bare-no-effect",
+      NON_LIVE_PERMANENT_REASON,
+      new Error(NON_LIVE_PERMANENT_REASON),
+    );
+    await assertNoEffectSettlement(
+      prepared,
+      `formatter-to-store-bare-no-effect:${prepared.claimed.authorizationId}`,
+    );
+  });
+
+  it("formatter-to-store allows already-prefixed-empty normalized non-live reason with no reservation or effect", async () => {
+    const prepared = await prepareFormatterToStoreFixture(
+      "formatter-empty-suffix-no-effect",
+      NON_LIVE_PERMANENT_REASON,
+      new Error(`${NON_LIVE_PERMANENT_REASON}:`),
+    );
+    await assertNoEffectSettlement(
+      prepared,
+      `formatter-to-store-empty-suffix-no-effect:${prepared.claimed.authorizationId}`,
+    );
+  });
+
+  it("formatter-to-store keeps normalized non-live reason open when a durable reservation exists", async () => {
+    const prepared = await prepareFormatterToStoreFixture(
+      "formatter-reservation",
+      NON_LIVE_PERMANENT_REASON,
+      new Error(`${NON_LIVE_PERMANENT_REASON}:`),
+    );
+    const { fixture, claimed } = prepared;
+    const openedTaskId = fixture.secondTaskId;
+    const openedContext = await h.store().getCccCampaignContextForTask(openedTaskId);
+    if (!openedContext) throw new Error("missing formatter reservation context");
+    const openedBinding = createCccCampaignAuthorityBinding(openedContext, {
+      ...actionFor(fixture, openedTaskId),
+    });
+    await h.layer().transactionImmediate((tx) => recordRunAuditEventWithinTransaction(tx, {
+      timestamp: new Date().toISOString(),
+      taskId: openedTaskId,
+      agentId: "ccc-provider-controller",
+      runId: `ccc-campaign:provider-attempt:reserved:${claimed.authorizationId}`,
+      domain: "database",
+      mutationType: "ccc-campaign:provider-attempt:reserved",
+      target: openedBinding.actionTarget,
+      metadata: { fixture: "formatter-to-store-reservation" },
+      campaign: {
+        eventKey: `ccc-formatter-to-store-reservation:${openedBinding.bindingHash}`,
+        binding: openedBinding,
+      },
+    }));
+
+    const closed = await closeUnopenedCccCampaignExecutionAuthorizationMembers(
+      h.layer(),
+      {
+        authorityStore: h.store(),
+        rootDir: fixture.rootDir,
+        authorizationId: claimed.authorizationId,
+        actor: OPERATOR,
+        runId: `formatter-to-store-reservation-closure:${claimed.authorizationId}`,
+      },
+    );
+    const openedMember = claimed.members.find(({ nativeTaskId }) =>
+      nativeTaskId === openedTaskId);
+    if (!openedMember) throw new Error("missing formatter reservation member");
+    expect(closed.authorization.status).toBe("claimed");
+    expect(closed.openedApprovalRequestIds).toEqual([
+      openedMember.approvalRequestId,
+    ]);
+    expect(closed.closedApprovalRequestIds).toHaveLength(1);
+    const children = await childRows(fixture.imported.importId);
+    expect(children.find(({ id }) => id === openedMember.approvalRequestId)?.status)
+      .toBe("claimed");
+    expect(children.find(({ id }) => id !== openedMember.approvalRequestId)?.status)
+      .toBe("expired");
+    await expect(h.store().inspectCccCampaignActionLease(
+      openedTaskId,
+      actionFor(fixture, openedTaskId),
+    )).resolves.toMatchObject({
+      binding: { bindingHash: openedBinding.bindingHash },
+      lease: { approvalRequestId: openedMember.approvalRequestId },
+    });
+    await expect(h.store().inspectCccCampaignActionLease(
+      fixture.firstTaskId,
+      actionFor(fixture, fixture.firstTaskId),
+    )).resolves.toBeNull();
+    const audits = await closureAuditRows(fixture.imported.importId);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "ccc-campaign:provider-attempt:reserved")).toHaveLength(1);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:child-closed-no-effect")).toHaveLength(1);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:settled")).toEqual([]);
+  });
+
+  it("formatter-to-store refuses normalized non-live reason with dispatched unknown effect", async () => {
+    const prepared = await prepareFormatterToStoreFixture(
+      "formatter-unknown-effect",
+      NON_LIVE_PERMANENT_REASON,
+      new Error(`${NON_LIVE_PERMANENT_REASON}:`),
+    );
+    const { fixture, claimed } = prepared;
+    const unknownTaskId = fixture.firstTaskId;
+    const unknownContext = await h.store().getCccCampaignContextForTask(unknownTaskId);
+    if (!unknownContext) throw new Error("missing formatter unknown-effect context");
+    const unknownBinding = createCccCampaignAuthorityBinding(unknownContext, {
+      ...actionFor(fixture, unknownTaskId),
+    });
+    const now = new Date().toISOString();
+    await h.layer().db.insert(schema.project.cccEffectReceipts).values({
+      projectId: unknownBinding.projectId,
+      ownerProjectId: unknownBinding.projectId,
+      effectScopeId: "formatter-to-store-unknown-effect",
+      logicalKey: `formatter-to-store-unknown-effect:${claimed.authorizationId}`,
+      turnKey: "formatter-to-store-unknown-effect-turn",
+      slotOrdinal: 0,
+      toolAuthority: "formatter-to-store-fixture",
+      argumentsDigest: "formatter-to-store-unknown-effect-arguments",
+      repeatOf: null,
+      state: "dispatched_unknown",
+      controllerToken: "formatter-to-store-unknown-effect-controller",
+      evidenceDigest: null,
+      resultJson: null,
+      createdAt: now,
+      updatedAt: now,
+      campaignProjectId: unknownBinding.projectId,
+      campaignImportId: unknownBinding.importId,
+      campaignId: unknownBinding.campaignId,
+      campaignTaskId: unknownBinding.taskId,
+      campaignActionId: unknownBinding.actionId,
+      campaignActionTarget: unknownBinding.actionTarget,
+      campaignIdempotencyKey: unknownBinding.idempotencyKey,
+      campaignPacketHash: unknownBinding.packetHash,
+      campaignSidecarHash: unknownBinding.sidecarHash,
+      campaignBundleHash: unknownBinding.bundleHash,
+      campaignTargetRepository: unknownBinding.targetRepository,
+      campaignTargetBase: unknownBinding.targetBase,
+      campaignProviderId: unknownBinding.providerId,
+      campaignModelId: unknownBinding.modelId,
+      campaignTransport: unknownBinding.transport,
+      campaignManifestHash: unknownBinding.manifestHash,
+      campaignBindingHash: unknownBinding.bindingHash,
+    });
+
+    await expect(closeUnopenedCccCampaignExecutionAuthorizationMembers(
+      h.layer(),
+      {
+        authorityStore: h.store(),
+        rootDir: fixture.rootDir,
+        authorizationId: claimed.authorizationId,
+        actor: OPERATOR,
+        runId: `formatter-to-store-unknown-effect-closure:${claimed.authorizationId}`,
+      },
+    )).rejects.toThrow(/unresolved dispatched receipt/u);
+    await expect(getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      claimed.authorizationId,
+    )).resolves.toMatchObject({ status: "claimed" });
+    const children = await childRows(fixture.imported.importId);
+    expect(children.every(({ status }) => status === "claimed")).toBe(true);
+    await assertClaimedLeases(fixture, claimed);
+    const audits = await closureAuditRows(fixture.imported.importId);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "ccc-campaign:provider-attempt:reserved")).toEqual([]);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:child-closed-no-effect")).toEqual([]);
+    expect(audits.filter(({ mutation_type }) =>
+      mutation_type === "execution-authorization:settled")).toEqual([]);
+  });
+
+  it("formatter-to-store refuses normalized live approval reason", async () => {
+    const liveReason = liveExecutionRequireApi()
+      .CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON;
+    const prepared = await prepareFormatterToStoreFixture(
+      "formatter-live-approval",
+      liveReason,
+      new Error(`${liveReason}:`),
+    );
+    const { fixture, claimed } = prepared;
+    const parentBefore = await getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      claimed.authorizationId,
+    );
+    const childrenBefore = await childRows(fixture.imported.importId);
+    const leasesBefore = await Promise.all(claimed.members.map((member) =>
+      h.store().inspectCccCampaignActionLease(
+        member.nativeTaskId,
+        actionFor(fixture, member.nativeTaskId),
+      )));
+    const auditsBefore = await closureAuditRows(fixture.imported.importId);
+
+    await expect(closeUnopenedCccCampaignExecutionAuthorizationMembers(
+      h.layer(),
+      {
+        authorityStore: h.store(),
+        rootDir: fixture.rootDir,
+        authorizationId: claimed.authorizationId,
+        actor: OPERATOR,
+        runId: `formatter-to-store-live-approval-closure:${claimed.authorizationId}`,
+      },
+    )).rejects.toThrow(/cannot close unopened members from work-item state manual-required/u);
+    await expect(getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      claimed.authorizationId,
+    )).resolves.toEqual(parentBefore);
+    await expect(childRows(fixture.imported.importId))
+      .resolves.toEqual(childrenBefore);
+    const leasesAfter = await Promise.all(claimed.members.map((member) =>
+      h.store().inspectCccCampaignActionLease(
+        member.nativeTaskId,
+        actionFor(fixture, member.nativeTaskId),
+      )));
+    expect(leasesAfter).toEqual(leasesBefore);
+    await expect(closureAuditRows(fixture.imported.importId))
+      .resolves.toEqual(auditsBefore);
+  });
 
   it("issues one immutable, idempotent, redacted approval without execution side effects", async () => {
     const api = liveExecutionApprovalApi();

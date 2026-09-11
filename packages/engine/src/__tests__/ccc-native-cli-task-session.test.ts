@@ -14,6 +14,7 @@ import {
   type CccNativeCliHeldClosureTrigger,
 } from "@fusion/core";
 import { CliAdapterRegistry } from "../cli-agent/adapter.js";
+import { codexAdapter } from "../cli-agent/adapters/codex.js";
 import type { CliSessionManager } from "../cli-agent/session-manager.js";
 import type { TelemetryHub } from "../cli-agent/telemetry-hub.js";
 import {
@@ -573,5 +574,97 @@ describe("Task 4 RED task-session native CLI seam harness", () => {
     await Promise.resolve();
 
     expect(killSettled).toBe(false);
+  });
+});
+
+/**
+ * A campaign turn is unattended by construction: one request, a hard deadline,
+ * and nobody at the terminal. Interactive CLI forms are the wrong shape for it —
+ * Codex's TUI blocks in startup waiting for terminal capability replies that an
+ * engine-owned PTY never sends, and it never exits on its own. Three Round 11
+ * attempts died exactly that way; the last burned 10h42m of wall clock on 0.44s
+ * of CPU, having never opened a socket to the API.
+ */
+describe("native CLI campaign turns run the provider's non-interactive form", () => {
+  function setupCodexHarness() {
+    const harness = setupHarness();
+    harness.opts.registry.register(codexAdapter);
+    harness.opts.config = {
+      cliAdapterId: codexAdapter.id,
+      settings: { profile: "ccc-fusion", subscriptionReady: true, model: "gpt-5.6-sol" },
+    };
+    return harness;
+  }
+
+  it("hands the prompt to the adapter at launch instead of injecting it", async () => {
+    const { opts, manager } = setupCodexHarness();
+
+    await launchCliTaskSession(opts);
+
+    const spawned = manager.spawn.mock.calls[0]?.[0] as { settings?: Record<string, unknown> };
+    expect(spawned.settings?.oneShot).toBe(true);
+    // The sealed prompt is carried verbatim as a prefix; the runtime worktree
+    // binding is appended after it (see sealed-worktree-binding.ts).
+    expect(spawned.settings?.oneShotPrompt as string).toContain(opts.prompt);
+    expect((spawned.settings?.oneShotPrompt as string).startsWith(opts.prompt)).toBe(true);
+  });
+
+  it("binds the sealed prompt to the isolated worktree it actually runs in", async () => {
+    // Regression: the first Round 11 turn that executed refused to edit because
+    // the sealed prompt named the campaign target repo while the session ran in
+    // a different worktree. Without this binding the turn burns a request, exits
+    // 0, and lands an empty diff.
+    const { opts, manager } = setupCodexHarness();
+
+    await launchCliTaskSession(opts);
+
+    const spawned = manager.spawn.mock.calls[0]?.[0] as { settings?: Record<string, unknown> };
+    expect(spawned.settings?.oneShotPrompt as string).toContain(opts.worktreePath);
+  });
+
+  it("resolves to a `codex exec` argv carrying that prompt", async () => {
+    const { opts, manager } = setupCodexHarness();
+
+    await launchCliTaskSession(opts);
+
+    const spawned = manager.spawn.mock.calls[0]?.[0] as { settings: Record<string, unknown> };
+    const launch = codexAdapter.buildLaunch({ settings: spawned.settings, posture: null });
+
+    expect(launch.args[0]).toBe("exec");
+    expect(launch.args).toContain("--json");
+    expect(launch.args[launch.args.length - 1]).toBe(spawned.settings.oneShotPrompt);
+    expect(launch.args[launch.args.length - 1] as string).toContain(opts.prompt);
+    // `codex exec` rejects this flag outright; emitting it would fail the launch.
+    expect(launch.args).not.toContain("--ask-for-approval");
+    // The sandbox contract still rides along on the exec argv.
+    expect(launch.args).toContain('default_permissions="ccc_fusion"');
+    // The turn-complete shim is still wired: `codex exec` runs `notify` too.
+    expect(launch.args).toContain(`notify=${JSON.stringify([spawned.settings.notifyProgram])}`);
+  });
+
+  it("never writes prompt bytes to a child that is not reading the tty", async () => {
+    const { opts, manager } = setupCodexHarness();
+
+    await launchCliTaskSession(opts);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(manager.inject).not.toHaveBeenCalled();
+  });
+
+  it("still injects for an adapter whose launch does not carry the prompt", async () => {
+    // The interactive contract is unchanged for every other adapter.
+    const { opts, manager } = setupHarness();
+
+    await launchCliTaskSession(opts);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Still injected (interactive contract unchanged), and still worktree-bound:
+    // the sealed-prompt/worktree mismatch is adapter-independent.
+    const injected = manager.inject.mock.calls[0]?.[1] as string;
+    expect(manager.inject).toHaveBeenCalledWith("cli-task-session-1", expect.any(String));
+    expect(injected.startsWith(opts.prompt)).toBe(true);
+    expect(injected).toContain(opts.worktreePath);
   });
 });

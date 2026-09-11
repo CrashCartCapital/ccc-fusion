@@ -185,8 +185,26 @@ export interface CliAgentAdapter {
    */
   buildEnvAllowlist(ctx: CliAdapterLaunchContext): string[];
 
-  /** Create a fresh readiness detector for a new session. */
-  createReadinessDetector(): CliReadinessDetector;
+  /**
+   * Create a fresh readiness detector for a new session.
+   *
+   * The launch context is passed so an adapter whose readiness markers depend on
+   * the invocation form can pick the right detector — Codex's interactive TUI
+   * and its non-interactive `exec` form share no readiness marker at all. The
+   * parameter is optional so adapters with one invocation form ignore it.
+   */
+  createReadinessDetector(ctx?: CliAdapterLaunchContext): CliReadinessDetector;
+
+  /**
+   * Whether this launch already carries the prompt on its argv, so the session
+   * manager must NOT inject it as keystrokes after readiness.
+   *
+   * Non-interactive invocations (`codex exec <prompt>`) consume the prompt at
+   * launch and never read the tty for input; injecting into one writes bytes
+   * nothing will read. Omitted (or false) means the interactive contract: the
+   * caller injects the prompt once the child reports ready.
+   */
+  consumesPromptOnLaunch?(ctx: CliAdapterLaunchContext): boolean;
 
   /**
    * Format an injected (engine- or composer-composed) prompt for the wire.

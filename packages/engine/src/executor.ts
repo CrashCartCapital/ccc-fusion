@@ -233,7 +233,7 @@ import {
   validateCccNativeCliTerminalScope,
   restoreCccNativeCliHeldClosureReceipt,
 } from "./cli-agent/ccc-native-cli-binding.js";
-import type { CccProviderAttemptScope, CliSession, CliSessionStore } from "@fusion/core";
+import type { CccProviderAttemptScope, CccProviderAttemptUsage, CliSession, CliSessionStore } from "@fusion/core";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -314,6 +314,36 @@ function selectCccNativeCliHeldClosureReceipt(
     },
   );
 }
+
+/** No usage was ever observed for this CLI dispatch (non-Codex adapter, non-exec-mode Codex, or an exec-mode session that closed before any turn.completed). */
+const CCC_NATIVE_CLI_NO_USAGE_TELEMETRY_REASON = "cli-adapter-observes-no-usage-or-identity-telemetry";
+/** Usage-lane U4: Codex exec-mode's usage IS observed, but the ChatGPT-subscription transport carries no per-token dollar charge and no event reports model identity. */
+const CCC_NATIVE_CLI_OBSERVED_USAGE_COST_REASON =
+  "subscription-billed transport; tokens observed, no per-token charge; model identity not reported";
+
+/**
+ * Honest "this is what we launched" identity, not an independent
+ * confirmation — the CLI adapter never reports model identity, so cost stays
+ * `unknown` either way (usage-lane U4). When the held-closure receipt
+ * carries a captured usage total (currently: Codex exec-mode only, see
+ * codex-exec-usage.ts), record it truthfully with receiptSource
+ * "stream-usage"; otherwise the adapter genuinely observed no usage/identity
+ * telemetry at all.
+ */
+function cccNativeCliEffectiveRouteFor(
+  route: Readonly<{ providerId: string; modelId: string }>,
+  usage: CccProviderAttemptUsage | null,
+) {
+  return {
+    effectiveProvider: route.providerId,
+    effectiveModel: route.modelId,
+    usage,
+    cost: usage
+      ? { kind: "unknown" as const, reason: CCC_NATIVE_CLI_OBSERVED_USAGE_COST_REASON }
+      : { kind: "unknown" as const, reason: CCC_NATIVE_CLI_NO_USAGE_TELEMETRY_REASON },
+    receiptSource: usage ? ("stream-usage" as const) : ("none" as const),
+  };
+}
 import {
   BranchConflictError,
   BranchCrossContaminationError,
@@ -369,7 +399,15 @@ import {
   assertCccCampaignEntryFrozenBaseCustody,
   CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
   type AcquireTaskWorktreeResult,
+  type CreatedTaskWorktree,
 } from "./worktree-acquisition.js";
+import {
+  createWorktreeOwnershipMarker,
+  WorktreeOwnershipError,
+  writeWorktreeOwnershipMarkers,
+  type WorktreeOwnershipContext,
+  type WorktreeOwnershipCreationReceipt,
+} from "./worktree-ownership.js";
 import { resolveCapturedBaseCommitSha } from "./base-commit-capture.js";
 import { installTaskWorktreeIdentityGuard } from "./worktree-hooks.js";
 import {
@@ -1804,6 +1842,8 @@ export interface TaskExecutorOptions {
   cliAgentRuntime?: CliAgentRuntime;
   /** Bound for a real AgentSession abort plus its owned CCC transport closure. */
   cancellationTimeoutMs?: number;
+  worktreeOwnershipContext?: WorktreeOwnershipContext;
+  requireWorktreeOwnership?: boolean;
 }
 
 /** Bundled CLI Agent Executor runtime dependencies (U7). */
@@ -3779,7 +3819,7 @@ export class TaskExecutor {
         try {
           if (await canonicalizeWorktreePath(entry.worktreePath) === await canonicalizeWorktreePath(entry.repoRootDir)) throw new Error("Refusing to remove workspace repository root");
           activeSessionRegistry.unregisterPath(entry.worktreePath);
-          await removeWorktree({worktreePath: entry.worktreePath, rootDir: entry.repoRootDir, settings: await store.getSettings(), taskId: task.id, reason: RemovalReason.ExecutorDispose, force: true});
+          await removeWorktree({worktreePath: entry.worktreePath, rootDir: entry.repoRootDir, settings: await store.getSettings(), taskId: task.id, reason: RemovalReason.ExecutorDispose, force: true, ...this.ownershipRemovalOptions()});
           /* FNXC:WorkflowLifecycle 2026-07-16-16:00: Archive metadata can contain valid Git refs with shell metacharacters. Pass the ref as an argv value so cleanup never evaluates it as shell code. */
           await execFileAsync("git", ["branch", "-D", entry.branch], {cwd: entry.repoRootDir, timeout: 120_000, maxBuffer: 10 * 1024 * 1024});
           if (task.workspaceWorktrees) for (const repoRel of [entry.repoRel, ...entry.aliasRepoRels]) delete task.workspaceWorktrees[repoRel];
@@ -9357,6 +9397,8 @@ export class TaskExecutor {
           }),
         taskEnv: process.env,
         secretsStore: this.options.secretsStore,
+        ownershipContext: this.options.worktreeOwnershipContext,
+        requireOwnership: this.options.requireWorktreeOwnership,
       });
       this.addActiveWorktree(task.id, acquisition.worktreePath);
       if (!acquisition.isResume) {
@@ -9641,11 +9683,17 @@ export class TaskExecutor {
       });
     }
     try {
+      const nodeTrustedIgnoredBaseline = this.cccControllerIgnoredBaselines.get(
+        nodeTask.id,
+      );
       await enforceCccCampaignRequiredCommitAfterNode({
           rootDir: this.rootDir,
           store: this.store,
           taskId: nodeTask.id,
           result,
+          ...(nodeTrustedIgnoredBaseline
+            ? { trustedIgnoredBaseline: nodeTrustedIgnoredBaseline }
+            : {}),
           executionContext,
           verifiedCandidateHandoff: phaseVerificationKey
             ? this.cccPhaseVerifiedCandidateHandoffs.get(phaseVerificationKey)
@@ -10406,15 +10454,7 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
-          // Honest "this is what we launched" identity, not an independent
-          // confirmation — the CLI adapter has no usage/cost telemetry.
-          effectiveRoute: {
-            effectiveProvider: binding.route.providerId,
-            effectiveModel: binding.route.modelId,
-            usage: null,
-            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
-            receiptSource: "none" as const,
-          },
+          effectiveRoute: cccNativeCliEffectiveRouteFor(binding.route, receipt.usage),
         })), {
           permitScope: heldScope,
           observation,
@@ -10634,15 +10674,7 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
-          // Honest "this is what we launched" identity, not an independent
-          // confirmation — the CLI adapter has no usage/cost telemetry.
-          effectiveRoute: {
-            effectiveProvider: nativeCliBinding.route.providerId,
-            effectiveModel: nativeCliBinding.route.modelId,
-            usage: null,
-            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
-            receiptSource: "none" as const,
-          },
+          effectiveRoute: cccNativeCliEffectiveRouteFor(nativeCliBinding.route, receipt.usage),
         })), {
           permitScope: nativeCliPermitScope,
           observation,
@@ -13039,6 +13071,8 @@ export class TaskExecutor {
               }),
             taskEnv,
             secretsStore: this.options.secretsStore,
+            ownershipContext: this.options.worktreeOwnershipContext,
+            requireOwnership: this.options.requireWorktreeOwnership,
           });
         } finally {
           this.unregisterConfiguredCommandController(task.id, taskCommandAbortController);
@@ -13788,6 +13822,7 @@ export class TaskExecutor {
                     reason: RemovalReason.ExecutorTransientRetry,
                     expectedOwnerTaskId: task.id,
                     liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                    ...this.ownershipRemovalOptions(),
                   });
                 } catch (wtErr: unknown) {
                   const msg = wtErr instanceof Error ? wtErr.message : String(wtErr);
@@ -13883,6 +13918,7 @@ export class TaskExecutor {
                       reason: RemovalReason.ExecutorStuckKilled,
                       expectedOwnerTaskId: task.id,
                       liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                      ...this.ownershipRemovalOptions(),
                     });
                   } catch (wtErr: unknown) {
                     const msg = wtErr instanceof Error ? wtErr.message : String(wtErr);
@@ -15291,6 +15327,7 @@ export class TaskExecutor {
                 reason: RemovalReason.ExecutorDispose,
                 expectedOwnerTaskId: task.id,
                 liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                ...this.ownershipRemovalOptions(),
               });
               executorLog.log(`Removed old worktree for paused task: ${worktreePath}`);
             } catch (cleanupErr: unknown) {
@@ -15815,6 +15852,7 @@ export class TaskExecutor {
                   reason: RemovalReason.ExecutorTransientRetry,
                   expectedOwnerTaskId: task.id,
                   liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                  ...this.ownershipRemovalOptions(),
                 });
                 executorLog.log(`Removed old worktree for transient retry: ${worktreePath}`);
               } catch (cleanupErr: unknown) {
@@ -16006,6 +16044,7 @@ export class TaskExecutor {
                   reason: RemovalReason.ExecutorStuckKilled,
                   expectedOwnerTaskId: task.id,
                   liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                  ...this.ownershipRemovalOptions(),
                 });
                 executorLog.log(`Removed old worktree for stuck-killed retry: ${worktreePath}`);
               } catch (cleanupErr: unknown) {
@@ -20373,7 +20412,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     taskId: string,
     startPoint?: string,
     allowSiblingBranchRename = false,
-  ): Promise<{ path: string; branch: string }> {
+  ): Promise<CreatedTaskWorktree> {
     // Track the worktree path we're attempting to use (may change during recovery)
     const currentPath = path;
     let resolvedStartPoint: string | undefined;
@@ -20496,7 +20535,10 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         const errorMessage = error instanceof Error ? error.message : String(error);
         const isLastAttempt = attempt === this.MAX_WORKTREE_RETRIES - 1;
         const isBranchConflict = isBranchConflictError(error);
-        const isTerminalWorktreeError = error instanceof NonRetryableWorktreeError || error instanceof StaleWorktreeIndexLockError || isBranchConflict;
+        const isTerminalWorktreeError = error instanceof NonRetryableWorktreeError
+          || error instanceof StaleWorktreeIndexLockError
+          || error instanceof WorktreeOwnershipError
+          || isBranchConflict;
 
         if (isLastAttempt || isTerminalWorktreeError) {
           await this.store.logEntry(
@@ -20505,6 +20547,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             errorMessage,
           );
           if (isBranchConflict) {
+            throw error;
+          }
+          if (error instanceof WorktreeOwnershipError) {
             throw error;
           }
           throw new Error(
@@ -20910,6 +20955,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           audit,
           expectedOwnerTaskId: task.id,
           liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+          ...this.ownershipRemovalOptions(),
         });
       } catch (removeErr) {
         executorLog.warn(`${task.id}: failed to remove unusable session-start worktree ${staleWorktreePath}: ${formatError(removeErr)}`);
@@ -21101,7 +21147,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     recoveryDepth = 0,
     allowSiblingBranchRename = false,
     settings: Partial<Settings> = {},
-  ): Promise<{ path: string; branch: string }> {
+  ): Promise<CreatedTaskWorktree> {
     // Guard: refuse to create a worktree nested inside another worktree.
     // Nested worktrees happen when the executor is launched with rootDir pointed
     // at a worktree directory instead of the main repo — produces paths like
@@ -21109,7 +21155,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     // and confuse every tool that walks git state.
     await this.assertWorktreePathNotNested(path, taskId, settings);
 
-    const installGuardOrCleanup = async () => {
+    const installGuardOrCleanup = async (ownershipPublished = false) => {
       try {
         await installTaskWorktreeIdentityGuard({
           worktreePath: path,
@@ -21122,17 +21168,81 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           commitAuthorEmail: settings.commitAuthorEmail,
         });
       } catch (error) {
-        try {
-          await rm(path, { recursive: true, force: true });
-        } catch {
-          executorLog.log(`Warning: failed to remove worktree after identity-guard install failure: ${path}`);
+        if (!ownershipPublished) {
+          try {
+            await rm(path, { recursive: true, force: true });
+          } catch {
+            executorLog.log(`Warning: failed to remove worktree after identity-guard install failure: ${path}`);
+          }
         }
         throw error;
       }
     };
 
-    // If directory exists but is not a registered worktree, remove it first
+    const publishOwnershipForNewWorktree = async (): Promise<WorktreeOwnershipCreationReceipt | undefined> => {
+      const context = this.options.worktreeOwnershipContext;
+      if (!context) {
+        if (this.options.requireWorktreeOwnership) {
+          throw new WorktreeOwnershipError(
+            "MARKER_CONTEXT_MISMATCH",
+            `Fresh worktree ${path} cannot be owned without an engine ownership context`,
+          );
+        }
+        return undefined;
+      }
+      if (resolvePath(context.projectRoot) !== resolvePath(this.rootDir)) {
+        throw new WorktreeOwnershipError(
+          "MARKER_CONTEXT_MISMATCH",
+          `Engine ownership context does not match executor root ${this.rootDir}`,
+        );
+      }
+      const [commonResult, gitDirResult] = await Promise.all([
+        execAsync("git rev-parse --git-common-dir", { cwd: path, encoding: "utf8" }),
+        execAsync("git rev-parse --absolute-git-dir", { cwd: path, encoding: "utf8" }),
+      ]);
+      const commonRaw = commonResult.stdout.trim();
+      const gitDirRaw = gitDirResult.stdout.trim();
+      if (!commonRaw || !gitDirRaw || commonRaw.includes("\n") || gitDirRaw.includes("\n")) {
+        throw new WorktreeOwnershipError("MARKER_CONTEXT_MISMATCH", `Git returned invalid ownership paths for ${path}`);
+      }
+      const repositoryCommonDir = isAbsolute(commonRaw) ? resolvePath(commonRaw) : resolvePath(path, commonRaw);
+      const worktreeGitDir = isAbsolute(gitDirRaw) ? resolvePath(gitDirRaw) : resolvePath(path, gitDirRaw);
+      const marker = createWorktreeOwnershipMarker({
+        context,
+        repositoryCommonDir,
+        worktreePath: resolvePath(path),
+        worktreeGitDir,
+      });
+      const adminMarkerPath = resolvePath(worktreeGitDir, "fusion-owner.json");
+      const worktreeMarkerPath = resolvePath(path, ".fusion", "fusion-owner.json");
+      const creatingBytes = await writeWorktreeOwnershipMarkers({
+        authority: context.mutationAuthority,
+        marker,
+        adminMarkerPath,
+        worktreeMarkerPath,
+      });
+      return Object.freeze({ creatingBytes, adminMarkerPath, worktreeMarkerPath });
+    };
+
+    const finalizeNewWorktree = async (): Promise<CreatedTaskWorktree> => {
+      const ownershipReceipt = await publishOwnershipForNewWorktree();
+      await installGuardOrCleanup(ownershipReceipt !== undefined);
+      return ownershipReceipt ? { path, branch, ownershipReceipt } : { path, branch };
+    };
+
+    // A guarded creation may only claim a path that was absent when creation started.
+    // The path can contain foreign files or a registered worktree, so classify neither
+    // case by mutating it: leave the existing state for an operator or later explicit
+    // ownership decision.
     if (existsSync(path)) {
+      if (this.options.requireWorktreeOwnership || this.options.worktreeOwnershipContext !== undefined) {
+        throw new WorktreeOwnershipError(
+          "MARKER_ALREADY_EXISTS",
+          `Refusing guarded worktree creation over pre-existing path: ${path}`,
+        );
+      }
+
+      // If directory exists but is not a registered worktree, remove it first
       const isRegistered = await this.isRegisteredWorktree(path);
       if (!isRegistered) {
         await this.store.logEntry(
@@ -21195,9 +21305,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       if (attemptNumber > 0) {
         await this.store.logEntry(taskId, `Worktree created on attempt ${attemptNumber + 1}`, path);
       }
-      await installGuardOrCleanup();
-      return { path, branch };
+      return finalizeNewWorktree();
     } catch (initialError: unknown) {
+      if (initialError instanceof WorktreeOwnershipError) throw initialError;
       const conflictInfo = this.extractWorktreeConflictInfo(initialError);
 
       if (conflictInfo.type === "index-lock-contention" && !staleLockRecoveryAttempted) {
@@ -21206,8 +21316,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         if (recovered) {
           await createWithBranch(branch);
           executorLog.log(`Worktree created after stale lock recovery: ${path}`);
-          await installGuardOrCleanup();
-          return { path, branch };
+          return finalizeNewWorktree();
         }
       }
 
@@ -21217,8 +21326,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         if (recovered) {
           await createWithBranch(branch);
           executorLog.log(`Worktree created after stale registration recovery: ${path}`);
-          await installGuardOrCleanup();
-          return { path, branch };
+          return finalizeNewWorktree();
         }
       }
 
@@ -21277,9 +21385,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       try {
         await createFromExistingBranch();
         executorLog.log(`Worktree created from existing branch: ${path}`);
-        await installGuardOrCleanup();
-        return { path, branch };
+        return finalizeNewWorktree();
       } catch (fallbackError: unknown) {
+        if (fallbackError instanceof WorktreeOwnershipError) throw fallbackError;
         const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
         // Check if the fallback also hit an "already used" conflict
         const fallbackConflictInfo = this.extractWorktreeConflictInfo(fallbackError);
@@ -21289,8 +21397,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           if (recovered) {
             await createFromExistingBranch();
             executorLog.log(`Worktree created from existing branch after stale lock recovery: ${path}`);
-            await installGuardOrCleanup();
-            return { path, branch };
+            return finalizeNewWorktree();
           }
         }
 
@@ -21300,8 +21407,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           if (recovered) {
             await createFromExistingBranch();
             executorLog.log(`Worktree created from existing branch after stale registration recovery: ${path}`);
-            await installGuardOrCleanup();
-            return { path, branch };
+            return finalizeNewWorktree();
           }
         }
 
@@ -21780,6 +21886,13 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     return paths ? paths.has(worktreePath) : false;
   }
 
+  private ownershipRemovalOptions(): Pick<Parameters<typeof removeWorktree>[0], "ownershipContext" | "requireOwnership"> {
+    return {
+      ownershipContext: this.options.worktreeOwnershipContext,
+      requireOwnership: this.options.requireWorktreeOwnership,
+    };
+  }
+
   private async reconcileSelfOwnedBeforeRemove(worktreePath: string, taskId: string): Promise<void> {
     const outcome = reconcileSelfOwnedActiveSessionForRemoval(
       activeSessionRegistry,
@@ -21846,6 +21959,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       // FN-5256: route the worktree-backend defensive reconcile through the
       // hardened gates (process-active + min-idle window).
       processActiveProbe: (probeTaskId: string) => executingTaskLock.has(probeTaskId),
+      ...this.ownershipRemovalOptions(),
     } as const;
     try {
       await removeWorktree(removeArgs);
@@ -22590,6 +22704,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 reason: RemovalReason.ExecutorStuckKilled,
                 expectedOwnerTaskId: taskId,
                 liveOwnerProbe: (path, ownerTaskId) => this.hasActiveWorktreeBinding(ownerTaskId, path),
+                ...this.ownershipRemovalOptions(),
               });
               executorLog.log(`${taskId}: removed worktree during force-requeue cleanup: ${worktreePath}`);
             } catch (cleanupErr: unknown) {

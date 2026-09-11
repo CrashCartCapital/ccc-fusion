@@ -24,6 +24,11 @@ import {
   tryRemoveStaleLock,
 } from "./worktree-stale-lock.js";
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
+import {
+  inspectWorktreeOwnership,
+  type WorktreeOwnershipClassification,
+  type WorktreeOwnershipContext,
+} from "./worktree-ownership.js";
 
 const execAsync = promisify(exec);
 const NATIVE_TIMEOUT_MS = 120_000;
@@ -1052,6 +1057,18 @@ export class ActiveSessionWorktreeRemovalError extends Error {
   }
 }
 
+export class WorktreeNotOwnedError extends Error {
+  readonly code = "WORKTREE_NOT_OWNED" as const;
+
+  constructor(
+    public readonly worktreePath: string,
+    public readonly classification: WorktreeOwnershipClassification | { kind: "ambiguous"; reason: "context-missing" },
+  ) {
+    super(`refusing to remove worktree without exact ccc-fusion ownership: ${worktreePath} (${classification.kind})`);
+    this.name = "WorktreeNotOwnedError";
+  }
+}
+
 /**
  * Remove a worktree via configured backend.
  * Only executor-owned hard-cancel/dispose paths may use force=true.
@@ -1069,6 +1086,8 @@ export async function removeWorktree(input: {
   liveOwnerProbe?: LiveBindingProbe;
   processActiveProbe?: ProcessActiveProbe;
   reconcileMinIdleMs?: number;
+  ownershipContext?: WorktreeOwnershipContext;
+  requireOwnership?: boolean;
 }): Promise<WorktreeRemoveOutcome> {
   const logger = {
     log: (_message: string): void => {},
@@ -1077,6 +1096,25 @@ export async function removeWorktree(input: {
 
   if (input.force === true && !ALLOWED_FORCE_REASONS.has(input.reason)) {
     throw new InvalidForceUsageError(input.reason);
+  }
+
+  if (input.requireOwnership === true || input.ownershipContext) {
+    if (!input.ownershipContext) {
+      throw new WorktreeNotOwnedError(input.worktreePath, { kind: "ambiguous", reason: "context-missing" });
+    }
+    const ownership = await inspectWorktreeOwnership({
+      context: input.ownershipContext,
+      repositoryRoot: input.rootDir,
+      worktreePath: input.worktreePath,
+    });
+    if (ownership.kind !== "owned-managed" && ownership.kind !== "owned-dangling-orphan") {
+      await input.audit?.git({
+        type: "worktree:removal-refused-unowned",
+        target: input.worktreePath,
+        metadata: { classification: ownership.kind, reason: "reason" in ownership ? ownership.reason : undefined },
+      });
+      throw new WorktreeNotOwnedError(input.worktreePath, ownership);
+    }
   }
 
   if (input.expectedOwnerTaskId && input.liveOwnerProbe) {

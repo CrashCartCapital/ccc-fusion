@@ -562,7 +562,11 @@ export class InProcessRuntime
       const { reapOrphanWorktrees, scanIdleWorktrees } = await import("../worktree-pool.js");
       const settings = await this.taskStore.getSettings();
       try {
-        const reaped = await reapOrphanWorktrees(this.config.workingDirectory, settings);
+        const reaped = await reapOrphanWorktrees(
+          this.config.workingDirectory,
+          settings,
+          this.config.worktreeOwnershipContext,
+        );
         if (reaped > 0) {
           runtimeLog.log(`Reaped ${reaped} half-initialized orphan worktree(s) on startup`);
         }
@@ -590,6 +594,7 @@ export class InProcessRuntime
         this.config.workingDirectory,
         this.taskStore,
         settings,
+        this.config.worktreeOwnershipContext,
       );
       if (idleWorktrees.length > 0) {
         this.worktreePool.rehydrate(idleWorktrees);
@@ -892,6 +897,8 @@ export class InProcessRuntime
         messageStore: this.messageStore,
         missionStore,
         reflectionService,
+        worktreeOwnershipContext: this.config.worktreeOwnershipContext,
+        requireWorktreeOwnership: this.config.engineInstanceId !== undefined,
         // PR-entity nodes (U3): assemble the handler deps from the CLI-injected
         // GitHub ops (createPr/mergePr/respond) + the engine-owned store. The CLI
         // layer never holds a store reference; the engine binds it here. Absent
@@ -1479,6 +1486,7 @@ export class InProcessRuntime
     */
     const backendShutdown = this.backendShutdown;
     this.backendShutdown = undefined;
+    const startupRecovery = this.startupRecoveryPromise;
     let stopError: Error | undefined;
     try {
       if (this.workflowContinuationTimer) {
@@ -1672,6 +1680,13 @@ export class InProcessRuntime
       runtimeLog.error(`Error during shutdown:`, err.message);
       this.emit("error", err);
     } finally {
+      if (startupRecovery) {
+        try {
+          await startupRecovery;
+        } catch {
+          // Startup already records this failure; preserve the original stop error.
+        }
+      }
       if (backendShutdown) {
         try {
           await backendShutdown();
@@ -2226,7 +2241,7 @@ export class InProcessRuntime
         }
         const resolved = resolvePlanningContinuationCandidate(item, task, { taskLookupFailed });
         if (resolved.kind === "orphan") {
-          await this.cancelOrphanedWorkflowWorkItem(resolved.item, resolved.reason);
+          await this.cancelOrphanedWorkflowWorkItem(resolved.item);
           continue;
         }
         if (resolved.kind !== "actionable") continue;
@@ -2293,22 +2308,28 @@ export class InProcessRuntime
    */
   private async cancelOrphanedWorkflowWorkItem(
     item: WorkflowWorkItem,
-    reason: "task-not-found" | "task-terminal",
   ): Promise<void> {
-    if (typeof this.taskStore.transitionWorkflowWorkItem !== "function") return;
-    try {
-      await this.taskStore.transitionWorkflowWorkItem(item.id, "cancelled", {
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        lastError: `orphaned-continuation:${reason}`,
-        blockedReason: reason,
-      });
-      runtimeLog.log(
-        `Cancelled orphaned workflow work item ${item.id} (task=${item.taskId}, node=${item.nodeId}, reason=${reason})`,
+    const cancelOrphanedWorkflowWorkItemIfExact = (this.taskStore as TaskStore & {
+      cancelOrphanedWorkflowWorkItemIfExact?: (
+        expected: WorkflowWorkItem,
+      ) => Promise<{ kind: "cancelled" | "no-op"; reason: string; item?: WorkflowWorkItem }>;
+    }).cancelOrphanedWorkflowWorkItemIfExact;
+    if (typeof cancelOrphanedWorkflowWorkItemIfExact !== "function") {
+      runtimeLog.warn(
+        `Failed to classify orphaned workflow work item ${item.id}: atomic cancellation helper is unwired`,
       );
+      return;
+    }
+    try {
+      const result = await cancelOrphanedWorkflowWorkItemIfExact.call(this.taskStore, item);
+      if (result.kind === "cancelled") {
+        runtimeLog.log(
+          `Cancelled orphaned workflow work item ${item.id} (task=${item.taskId}, node=${item.nodeId}, reason=${result.reason})`,
+        );
+      }
     } catch (error) {
       runtimeLog.warn(
-        `Failed to cancel orphaned workflow work item ${item.id}: ${
+        `Failed to classify orphaned workflow work item ${item.id}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );

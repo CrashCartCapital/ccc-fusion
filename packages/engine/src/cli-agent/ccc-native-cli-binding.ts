@@ -4,6 +4,7 @@ import type {
   CccCampaignProviderDispatchInput,
   CccProviderAttemptReconciliation,
   CccProviderAttemptScope,
+  CccProviderAttemptUsage,
   CliTerminationReason,
 } from "@fusion/core";
 import { assertCccCampaignAuthorityBinding } from "@fusion/core";
@@ -26,7 +27,17 @@ export const CCC_NATIVE_CLI_SESSION_POLICY_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_KIND = "ccc-fusion.native-cli-held-closure" as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND = "ccc-fusion.native-cli-held-closure-evidence" as const;
-export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION = 1 as const;
+/**
+ * Usage-lane U2: bumped 1 -> 2 when the "usage" key was added. Evidence is
+ * durable JSON (autonomyPosture.cccNativeCliHeldClosureEvidence), so rows
+ * written by the pre-usage-lane code are version 1 and lack "usage" forever
+ * — they are read back on restart recovery (executor.ts
+ * selectCccNativeCliHeldClosureReceipt) alongside fresh version-2 rows.
+ * validateCccNativeCliHeldClosureEvidence accepts both versions; see
+ * HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.
+ */
+export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION = 2 as const;
+const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY = 1 as const;
 export const CCC_NATIVE_CLI_TRANSPORT = "cli" as const;
 export const CCC_NATIVE_CLI_BINDING_REFUSED_CODE = "CCC_NATIVE_CLI_BINDING_REFUSED" as const;
 
@@ -91,11 +102,21 @@ export type CccNativeCliHeldClosureReceipt = Readonly<{
   proxyClosed: true;
   durableFloorFlushed: true;
   slotHeld: true;
+  /**
+   * The Codex exec-mode session's last observed `turn.completed.usage`
+   * (usage-lane U2), or null for non-Codex adapters, non-exec-mode Codex
+   * sessions, or an exec-mode session that closed before any turn.completed
+   * was observed. Never a thread-cumulative total misattributed to an
+   * attempt — see computeCodexExecAttemptUsage (codex-exec-usage.ts).
+   */
+  usage: CccProviderAttemptUsage | null;
 }>;
 
 export type CccNativeCliHeldClosureEvidence = Readonly<{
   kind: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND;
-  version: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION;
+  // Usage-lane U2: version 2 (current) or 1 (pre-usage-lane legacy, accepted
+  // read-only for back-compat with rows already persisted to durable storage).
+  version: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION | typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY;
   sessionId: string;
   trigger: CccNativeCliHeldClosureTrigger;
   exitCode: number;
@@ -104,6 +125,7 @@ export type CccNativeCliHeldClosureEvidence = Readonly<{
   proxyClosed: true;
   durableFloorFlushed: true;
   slotHeld: true;
+  usage: CccProviderAttemptUsage | null;
 }>;
 
 export type CccNativeCliController = Readonly<{
@@ -191,8 +213,10 @@ const EFFECTIVE_ROUTE_KEYS = ["effectiveProvider", "effectiveModel", "usage", "c
 const EFFECTIVE_ROUTE_USAGE_KEYS = ["inputTokens", "outputTokens"] as const;
 const EFFECTIVE_ROUTE_COST_CLAIM_KEYS = ["amountUsd", "source"] as const;
 const EFFECTIVE_ROUTE_COST_UNKNOWN_KEYS = ["kind", "reason"] as const;
-const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
-const HELD_CLOSURE_EVIDENCE_KEYS = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
+const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld", "usage"] as const;
+const HELD_CLOSURE_EVIDENCE_KEYS = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld", "usage"] as const;
+/** Pre-usage-lane persisted evidence shape (version 1): no "usage" key at all. */
+const HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
 const ROUTE_KEYS = ["adapterId", "providerId", "modelId", "transport"] as const;
 const LIMIT_KEYS = ["maxRequests", "lifetimeMs", "termGraceMs", "killClosureMs"] as const;
 const OBSERVER_KEYS = ["id", "observe"] as const;
@@ -481,6 +505,7 @@ export function validateCccNativeCliHeldClosureReceipt(
   if (receipt.proxyClosed !== true) throw refused("held closure receipt proxyClosed must be true");
   if (receipt.durableFloorFlushed !== true) throw refused("held closure receipt durableFloorFlushed must be true");
   if (receipt.slotHeld !== true) throw refused("held closure receipt slotHeld must be true");
+  validateCccNativeCliUsageShape(receipt.usage, "held closure receipt usage");
   return receipt as unknown as CccNativeCliHeldClosureReceipt;
 }
 
@@ -490,6 +515,7 @@ export function buildCccNativeCliHeldClosureEvidence(
     trigger: CccNativeCliHeldClosureTrigger;
     exitCode: number;
     exitSignal: number;
+    usage: CccProviderAttemptUsage | null;
   }>,
 ): CccNativeCliHeldClosureEvidence {
   return validateCccNativeCliHeldClosureEvidence(Object.freeze({
@@ -503,6 +529,7 @@ export function buildCccNativeCliHeldClosureEvidence(
     proxyClosed: true,
     durableFloorFlushed: true,
     slotHeld: true,
+    usage: input.usage,
   }), input.sessionId);
 }
 
@@ -536,6 +563,7 @@ export function restoreCccNativeCliHeldClosureReceipt(
     proxyClosed: true,
     durableFloorFlushed: true,
     slotHeld: true,
+    usage: evidence.usage,
   });
 }
 
@@ -545,14 +573,24 @@ function validateCccNativeCliHeldClosureEvidence(
 ): CccNativeCliHeldClosureEvidence {
   if (!isPlainObject(value)) throw refused("held closure evidence must be a plain object");
   const actualKeys = Object.keys(value);
-  if (
-    actualKeys.length !== HELD_CLOSURE_EVIDENCE_KEYS.length
-    || HELD_CLOSURE_EVIDENCE_KEYS.some((key) => !Object.hasOwn(value, key))
-  ) {
-    throw refused(`held closure evidence must have exact keys: ${HELD_CLOSURE_EVIDENCE_KEYS.join(", ")}`);
+  // Usage-lane U2 back-compat: durable evidence rows written before "usage"
+  // was added (version 1) never gain that key on JSON round-trip, so both
+  // the current shape and that exact legacy shape are accepted here.
+  const isLegacyShape = actualKeys.length === HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.length
+    && HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.every((key) => Object.hasOwn(value, key));
+  const isCurrentShape = actualKeys.length === HELD_CLOSURE_EVIDENCE_KEYS.length
+    && HELD_CLOSURE_EVIDENCE_KEYS.every((key) => Object.hasOwn(value, key));
+  if (!isLegacyShape && !isCurrentShape) {
+    throw refused(
+      `held closure evidence must have exact keys: ${HELD_CLOSURE_EVIDENCE_KEYS.join(", ")} `
+      + `(or the pre-usage-lane legacy shape: ${HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.join(", ")})`,
+    );
   }
   if (value.kind !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND) throw refused("held closure evidence.kind mismatch");
-  if (value.version !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION) throw refused("held closure evidence.version mismatch");
+  const expectedVersion = isLegacyShape
+    ? CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY
+    : CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION;
+  if (value.version !== expectedVersion) throw refused("held closure evidence.version mismatch");
   if (value.sessionId !== expectedSessionId) throw refused("held closure evidence sessionId mismatch");
   if (!isHeldClosureTrigger(value.trigger)) throw refused("held closure evidence trigger mismatch");
   if (typeof value.exitCode !== "number" || !Number.isSafeInteger(value.exitCode)) {
@@ -565,9 +603,16 @@ function validateCccNativeCliHeldClosureEvidence(
   if (value.proxyClosed !== true) throw refused("held closure evidence proxyClosed must be true");
   if (value.durableFloorFlushed !== true) throw refused("held closure evidence durableFloorFlushed must be true");
   if (value.slotHeld !== true) throw refused("held closure evidence slotHeld must be true");
+  // Legacy rows carry no usage key at all: they predate any usage capture,
+  // so usage is honestly null rather than validated against a missing field.
+  // Not requireFrozen: evidence is read back verbatim from a durable JSON
+  // store on restart, and JSON.parse never reproduces Object.freeze.
+  const usage = isLegacyShape
+    ? null
+    : validateCccNativeCliUsageShape(value.usage, "held closure evidence usage", { requireFrozen: false });
   return Object.freeze({
     kind: value.kind,
-    version: value.version,
+    version: expectedVersion,
     sessionId: value.sessionId,
     trigger: value.trigger,
     exitCode: value.exitCode,
@@ -576,6 +621,7 @@ function validateCccNativeCliHeldClosureEvidence(
     proxyClosed: true,
     durableFloorFlushed: true,
     slotHeld: true,
+    usage,
   });
 }
 
@@ -716,15 +762,45 @@ function validateCccNativeCliEffectiveRoute(value: unknown): void {
   }
 }
 
+/**
+ * Shared usage-shape validator (usage-lane U2/U5): the one place this binding
+ * file re-validates the CCC provider-attempt usage shape (exactly
+ * `{inputTokens, outputTokens}`, both non-negative safe integers, or null),
+ * so the terminal-scope effectiveRoute validator and the held-closure
+ * receipt/evidence validator below cannot drift from EACH OTHER. Mirrors
+ * core's `requireUsage` (provider-attempt.ts) without importing its
+ * unexported parser; ccc-native-cli-binding.test.ts pins this function and
+ * core's exported `assertCccProviderAttemptEffectiveRoute` to the same
+ * accept/reject verdicts on the same usage shapes.
+ *
+ * `requireFrozen` defaults to true, matching every other nested object this
+ * file validates. It must be false for the held-closure EVIDENCE path only:
+ * evidence is read back verbatim from a durable JSON store on restart
+ * (`restoreCccNativeCliHeldClosureReceipt`), and a JSON round trip never
+ * reproduces `Object.freeze`.
+ */
+export function validateCccNativeCliUsageShape(
+  value: unknown,
+  label: string,
+  opts: Readonly<{ requireFrozen?: boolean }> = {},
+): CccProviderAttemptUsage | null {
+  if (value === null) return null;
+  const usage = (opts.requireFrozen === false
+    ? requirePlainExactObject(value, EFFECTIVE_ROUTE_USAGE_KEYS, label)
+    : requirePlainFrozenExactObject(value, EFFECTIVE_ROUTE_USAGE_KEYS, label)) as Record<string, unknown>;
+  // Always return a freshly frozen result, regardless of whether the input
+  // needed to be frozen: re-validating this return value anywhere that DOES
+  // require frozen usage (e.g. validateCccNativeCliHeldClosureReceipt) must
+  // never fail just because it passed through the non-frozen evidence path
+  // first (see restoreCccNativeCliHeldClosureReceipt).
+  return Object.freeze({
+    inputTokens: requireNonNegativeSafeInteger(usage.inputTokens, `${label}.inputTokens`),
+    outputTokens: requireNonNegativeSafeInteger(usage.outputTokens, `${label}.outputTokens`),
+  });
+}
+
 function validateEffectiveRouteUsage(value: unknown): void {
-  if (value === null) return;
-  const usage = requirePlainFrozenExactObject(
-    value,
-    EFFECTIVE_ROUTE_USAGE_KEYS,
-    "terminal scope terminal.effectiveRoute.usage",
-  ) as Record<string, unknown>;
-  requireNonNegativeSafeInteger(usage.inputTokens, "terminal scope terminal.effectiveRoute.usage.inputTokens");
-  requireNonNegativeSafeInteger(usage.outputTokens, "terminal scope terminal.effectiveRoute.usage.outputTokens");
+  validateCccNativeCliUsageShape(value, "terminal scope terminal.effectiveRoute.usage");
 }
 
 function validateEffectiveRouteCost(value: unknown): void {
@@ -787,6 +863,16 @@ function requirePlainFrozenExactObject(
 ): object {
   if (!isPlainObject(value)) throw refused(`${label} must be a plain object`);
   if (!Object.isFrozen(value)) throw refused(`${label} must be frozen`);
+  const actualKeys = Object.keys(value);
+  if (actualKeys.length !== keys.length || keys.some((key) => !Object.hasOwn(value, key))) {
+    throw refused(`${label} must have exact keys: ${keys.join(", ")}`);
+  }
+  return value;
+}
+
+/** Like {@link requirePlainFrozenExactObject}, without the frozen requirement. */
+function requirePlainExactObject(value: unknown, keys: readonly string[], label: string): object {
+  if (!isPlainObject(value)) throw refused(`${label} must be a plain object`);
   const actualKeys = Object.keys(value);
   if (actualKeys.length !== keys.length || keys.some((key) => !Object.hasOwn(value, key))) {
     throw refused(`${label} must have exact keys: ${keys.join(", ")}`);

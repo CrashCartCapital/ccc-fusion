@@ -32,8 +32,11 @@ import {
   mockedStepSessionExecutor,
   mockedWithRateLimitRetry,
   mockedExec,
+  mockedExecFile,
   mockedExecSync,
   mockedExistsSync,
+  mockedRealpathSync,
+  mockedStatSync,
   mockedHydrateWorktreeDb,
   mockedClassifyTaskWorktree,
   mockedIsUsableTaskWorktree,
@@ -46,8 +49,52 @@ import {
   mockCleanup,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { EngineMutationAuthority, WorktreeOwnershipContext } from "../worktree-ownership.js";
 
 const mockedReviewStep = vi.mocked(mockedReviewStepFn);
+
+async function enableRealGitSeams(): Promise<typeof import("node:child_process")> {
+  const childProcess = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+  mockedExec.mockImplementation(((command: string, options: unknown, callback: unknown) =>
+    childProcess.exec(command, options as never, callback as never)) as never);
+  mockedExecFile.mockImplementation(((file: string, args: readonly string[], options: unknown, callback: unknown) =>
+    childProcess.execFile(file, args, options as never, callback as never)) as never);
+  mockedExecSync.mockImplementation(((command: string, options?: unknown) =>
+    childProcess.execSync(command, options as never)) as never);
+  mockedExistsSync.mockImplementation(fs.existsSync as never);
+  mockedRealpathSync.mockImplementation(fs.realpathSync as never);
+  mockedStatSync.mockImplementation(fs.statSync as never);
+  return childProcess;
+}
+
+async function makeRealGitRepository(childProcess: typeof import("node:child_process")) {
+  const rawRoot = await mkdtemp(join(tmpdir(), "fusion-executor-ownership-"));
+  const root = await realpath(rawRoot);
+  await mkdir(join(root, ".worktrees"), { recursive: true });
+  const git = (args: string[], cwd = root) => childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  git(["init", "-b", "main"]);
+  git(["config", "user.email", "test@example.com"]);
+  git(["config", "user.name", "Test User"]);
+  await writeFile(join(root, "README.md"), "root\n");
+  git(["add", "README.md"]);
+  git(["commit", "-m", "init"]);
+  return { root, git };
+}
+
+function ownershipContext(projectRoot: string): { context: WorktreeOwnershipContext; authority: EngineMutationAuthority } {
+  const authority: EngineMutationAuthority = { assertHeld: vi.fn() };
+  const context: WorktreeOwnershipContext = Object.freeze({
+    projectId: "project-real-collision",
+    projectRoot,
+    engineInstanceId: "engine-real-collision",
+    mutationAuthority: authority,
+  });
+  return { context, authority };
+}
 
 describe("TaskExecutor with semaphore", () => {
   beforeEach(() => {
@@ -2161,6 +2208,92 @@ describe("TaskExecutor worktree recovery", () => {
     );
     expect(unlockCalls.length).toBeGreaterThanOrEqual(0); // Unlock is attempted but may fail silently
   });
+});
+
+describe("TaskExecutor guarded worktree creation collisions", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    resetExecutorMocks();
+    mockedGenerateWorktreeName.mockReturnValue("swift-falcon");
+  });
+
+  afterEach(() => {
+    mockedExistsSync.mockReturnValue(true);
+    mockedRealpathSync.mockImplementation((path) => path as never);
+    mockedStatSync.mockReturnValue({ isDirectory: () => true } as ReturnType<typeof import("node:fs").statSync>);
+  });
+
+  it("refuses a guarded pre-existing unregistered directory before deleting or minting markers", async () => {
+    const childProcess = await enableRealGitSeams();
+    const { root } = await makeRealGitRepository(childProcess);
+    const target = join(root, ".worktrees", "foreign-unregistered");
+    const sentinel = join(target, "operator-data.txt");
+    try {
+      await mkdir(target, { recursive: true });
+      await writeFile(sentinel, "keep me\n");
+      const before = await readFile(sentinel);
+      const store = createMockStore();
+      store.getSettings.mockResolvedValue({
+        ...(await store.getSettings()),
+        worktreeRebaseBeforeMerge: false,
+        worktreesDir: join(root, ".worktrees"),
+      });
+      const { context } = ownershipContext(root);
+      const executor = new TaskExecutor(store, root, {
+        worktreeOwnershipContext: context,
+        requireWorktreeOwnership: true,
+      });
+
+      await expect(
+        (executor as any).createWorktree("fusion/fn-guard-collision", target, "FN-GUARD-COLLISION"),
+      ).rejects.toMatchObject({ name: "WorktreeOwnershipError", code: "MARKER_ALREADY_EXISTS" });
+
+      expect(await readFile(sentinel)).toEqual(before);
+      await expect(lstat(join(target, ".fusion", "fusion-owner.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(store.logEntry).not.toHaveBeenCalledWith(
+        "FN-GUARD-COLLISION",
+        expect.stringContaining("Removing existing directory"),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a guarded registered foreign worktree without changing identity metadata", async () => {
+    const childProcess = await enableRealGitSeams();
+    const { root, git } = await makeRealGitRepository(childProcess);
+    const target = join(root, ".worktrees", "foreign-registered");
+    try {
+      git(["worktree", "add", "-b", "foreign/registered", target, "main"]);
+      const gitDir = git(["rev-parse", "--absolute-git-dir"], target);
+      const identityPath = join(gitDir, "fusion-task-id");
+      await writeFile(identityPath, "foreign-task\n");
+      const identityBefore = await readFile(identityPath);
+      const inventoryBefore = git(["worktree", "list", "--porcelain"]);
+      const store = createMockStore();
+      store.getSettings.mockResolvedValue({
+        ...(await store.getSettings()),
+        worktreeRebaseBeforeMerge: false,
+        worktreesDir: join(root, ".worktrees"),
+      });
+      const { context } = ownershipContext(root);
+      const executor = new TaskExecutor(store, root, {
+        worktreeOwnershipContext: context,
+        requireWorktreeOwnership: true,
+      });
+
+      await expect(
+        (executor as any).createWorktree("fusion/fn-guard-foreign", target, "FN-GUARD-FOREIGN"),
+      ).rejects.toMatchObject({ name: "WorktreeOwnershipError", code: "MARKER_ALREADY_EXISTS" });
+
+      expect(await readFile(identityPath)).toEqual(identityBefore);
+      expect(git(["worktree", "list", "--porcelain"])).toBe(inventoryBefore);
+      expect(mockedInstallTaskWorktreeIdentityGuard).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
 });
 
 describe("TaskExecutor dependency-based worktree creation", () => {

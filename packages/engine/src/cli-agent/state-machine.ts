@@ -115,6 +115,29 @@ export interface CliProcessEndInfo {
   hadDone?: boolean;
 }
 
+/**
+ * Default inactivity / stall backstop (ms) when no caller supplies one.
+ *
+ * The backstop exists for interactive sessions, where a quiet agent usually
+ * means a wedged terminal. Long unattended provider turns are the other case:
+ * a reasoning model can work for far longer than this without emitting any PTY
+ * output, and the backstop then reads that legitimate work as a stall and fails
+ * the workflow node. `FUSION_CLI_AGENT_STALL_THRESHOLD_MS` lets an unattended
+ * run widen (or effectively disable) the backstop without changing the
+ * interactive default.
+ *
+ * Read lazily so an env-var change between module load and session creation is
+ * observed, matching `getResumeOrphanDelayMs()` in the executor.
+ */
+function getDefaultStallThresholdMs(): number {
+  const raw = process.env.FUSION_CLI_AGENT_STALL_THRESHOLD_MS;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 5 * 60_000;
+}
+
 export interface CliStateMachineOptions {
   sessionId: string;
   store: CliSessionStore;
@@ -123,7 +146,8 @@ export interface CliStateMachineOptions {
   /**
    * Inactivity / stall threshold (ms). If no output progress and no done/waiting
    * signal arrives within this window of a busy turn, the backstop fires
-   * (needsAttention). Default 5 minutes.
+   * (needsAttention). Defaults to 5 minutes, overridable per process with
+   * `FUSION_CLI_AGENT_STALL_THRESHOLD_MS`.
    */
   stallThresholdMs?: number;
   /** Max resume attempts before giving up. Default 2 (KTD). */
@@ -227,7 +251,7 @@ export class CliSessionStateMachine {
   constructor(opts: CliStateMachineOptions) {
     this.sessionId = opts.sessionId;
     this.store = opts.store;
-    this.stallThresholdMs = opts.stallThresholdMs ?? 5 * 60_000;
+    this.stallThresholdMs = opts.stallThresholdMs ?? getDefaultStallThresholdMs();
     this.maxResumeAttempts =
       opts.maxResumeAttempts ??
       (typeof opts.posture?.maxResumeAttempts === "number"

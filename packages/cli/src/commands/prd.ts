@@ -155,6 +155,7 @@ export type PrdCommandDependencies = {
   resolveProject?: (projectName?: string) => Promise<ProjectContext>;
   closeProjectStore?: (context: ProjectContext) => Promise<void>;
   readTargetHead?: (targetRoot: string) => Promise<string>;
+  preflightPlatform?: NodeJS.Platform;
   importCccPrdBundle?: typeof importCccPrdBundle;
   inspectVerifierConfinementReadiness?: typeof engine.inspectVerifierConfinementReadiness;
   inspectSemanticProofSandboxReadiness?: typeof engine.inspectCccSemanticProofSandboxReadiness;
@@ -379,6 +380,32 @@ type GeneratedAuthorArgs = {
   maxPromptBytes: number;
   maxResponseBytes: number;
 };
+
+type AuthoringPreflightCheckId =
+  | "platform"
+  | "sandbox"
+  | "target_repository"
+  | "baseline_head"
+  | "fixed_host_toolchain"
+  | "provider_route"
+  | "proposal_proof";
+
+type AuthoringPreflightCheck = Readonly<{
+  id: AuthoringPreflightCheckId;
+  status: "pass" | "fail" | "unknown";
+  message: string;
+}>;
+
+type AuthoringPreflight = Readonly<{
+  schema: "ccc-prd.authoring-preflight.v1";
+  readyForAuthoring: boolean;
+  checks: readonly AuthoringPreflightCheck[];
+}>;
+
+type AuthoringPreflightOutcome = Readonly<{
+  report: AuthoringPreflight;
+  refusal?: Readonly<{ code: string; message: string }>;
+}>;
 
 type GeneratedUnderstandingArgs = {
   rootDir: string;
@@ -910,6 +937,141 @@ async function runProductPolicyCommand(
   }
 }
 
+async function runAuthoringPreflight(
+  input: GeneratedAuthorArgs,
+  dependencies: PrdCommandDependencies,
+): Promise<AuthoringPreflightOutcome> {
+  const checks: AuthoringPreflightCheck[] = [];
+  const platform = dependencies.preflightPlatform ?? process.platform;
+  if (platform !== "darwin") {
+    checks.push({
+      id: "platform",
+      status: "fail",
+      message: `semantic-v2 authoring requires the supported macOS host; current platform is ${platform}`,
+    });
+  } else {
+    checks.push({
+      id: "platform",
+      status: "pass",
+      message: "supported macOS semantic-v2 host",
+    });
+  }
+
+  try {
+    const readiness = await (
+      dependencies.inspectSemanticProofSandboxReadiness
+      ?? compiler.inspectCccSemanticProofSandboxReadiness
+    )();
+    const message = readiness.detail
+      ? `${readiness.message}; ${readiness.detail}`
+      : readiness.message;
+    checks.push({
+      id: "sandbox",
+      status: readiness.ready ? "pass" : "fail",
+      message,
+    });
+  } catch (error) {
+    checks.push({
+      id: "sandbox",
+      status: "fail",
+      message: error instanceof Error
+        ? `semantic-proof sandbox readiness probe failed: ${error.message}`
+        : "semantic-proof sandbox readiness probe failed",
+    });
+  }
+
+  let targetHead: string | undefined;
+  try {
+    targetHead = await (
+      dependencies.readTargetHead ?? readTargetHead
+    )(input.constraints.targetRepository.path);
+    checks.push({
+      id: "target_repository",
+      status: "pass",
+      message: "target repository is readable as a Git checkout",
+    });
+  } catch (error) {
+    checks.push({
+      id: "target_repository",
+      status: "fail",
+      message: error instanceof Error
+        ? error.message
+        : `target repository is unavailable: ${input.constraints.targetRepository.path}`,
+    });
+  }
+  if (targetHead === undefined) {
+    checks.push({
+      id: "baseline_head",
+      status: "unknown",
+      message: "baseline HEAD could not be compared because the target repository probe failed",
+    });
+  } else if (targetHead !== input.constraints.targetRepository.baseCommit) {
+    checks.push({
+      id: "baseline_head",
+      status: "fail",
+      message: `target HEAD ${targetHead} does not match requested baseline ${input.constraints.targetRepository.baseCommit}`,
+    });
+  } else {
+    checks.push({
+      id: "baseline_head",
+      status: "pass",
+      message: "target HEAD matches the requested baseline",
+    });
+  }
+
+  try {
+    (
+      dependencies.resolveSemanticProofToolchainPaths
+      ?? resolveCccPrdSemanticProofToolchainPaths
+    )({ pythonRequired: false });
+    checks.push({
+      id: "fixed_host_toolchain",
+      status: "pass",
+      message: "fixed Task, Node, and proof-host paths passed PATH/X_OK identity checks; runtime execution and byte hashing were not probed",
+    });
+  } catch (error) {
+    checks.push({
+      id: "fixed_host_toolchain",
+      status: "fail",
+      message: error instanceof Error
+        ? error.message
+        : "fixed Task, Node, or proof-host identity is unavailable",
+    });
+  }
+
+  checks.push({
+    id: "provider_route",
+    status: "unknown",
+    message: `provider route receipt is unavailable for ${input.provider}/${input.model}; no provider probe was run`,
+  });
+  checks.push({
+    id: "proposal_proof",
+    status: "unknown",
+    message: "selected proof target, verifier closure, candidate inputs, and Python requirement are proposal-dependent",
+  });
+
+  const report: AuthoringPreflight = {
+    schema: "ccc-prd.authoring-preflight.v1",
+    readyForAuthoring: checks.every((check) => check.status !== "fail"),
+    checks,
+  };
+  const failed = checks.find((check) => check.status === "fail");
+  if (!failed) return { report };
+  const code = failed.id === "platform"
+    ? "CCC_PRD_AUTHORING_PREFLIGHT_UNSUPPORTED_PLATFORM"
+    : failed.id === "sandbox"
+      ? "CCC_PRD_AUTHORING_PREFLIGHT_SANDBOX_UNAVAILABLE"
+    : failed.id === "baseline_head"
+      ? "CCC_PRD_AUTHORING_PREFLIGHT_BASELINE_MISMATCH"
+      : failed.id === "fixed_host_toolchain"
+        ? "CCC_PRD_AUTHORING_PREFLIGHT_TOOLCHAIN_UNAVAILABLE"
+        : "CCC_PRD_AUTHORING_PREFLIGHT_TARGET_UNAVAILABLE";
+  return {
+    report,
+    refusal: { code, message: failed.message },
+  };
+}
+
 async function runGeneratedAuthor(
   input: GeneratedAuthorArgs,
   io: PrdCommandIo,
@@ -934,6 +1096,16 @@ async function runGeneratedAuthor(
         code: "CCC_PRD_AUTHORING_ADMISSION_FAILED",
         message: error instanceof Error ? error.message : "authoring request could not be admitted",
       }],
+    }));
+    return 1;
+  }
+
+  const preflight = await runAuthoringPreflight(input, dependencies);
+  if (preflight.refusal) {
+    io.write(JSON.stringify({
+      kind: "refusal",
+      diagnostics: [preflight.refusal],
+      preflight: preflight.report,
     }));
     return 1;
   }
@@ -1023,6 +1195,7 @@ async function runGeneratedAuthor(
     kind: "candidate",
     sidecarPath: outputPath,
     review: result.review,
+    preflight: preflight.report,
   }));
   return 0;
 }

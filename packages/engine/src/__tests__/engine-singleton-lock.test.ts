@@ -9,7 +9,8 @@ import {
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireEngineSingleton,
   computeEngineLockFilePath,
@@ -122,6 +123,64 @@ describe("engine-singleton-lock", () => {
     await lock.release();
     // proper-lockfile uses `<path>.lock` as the actual mutex dir.
     expect(existsSync(`${lock.lockFilePath}.lock`)).toBe(false);
+  });
+
+  it("revokes mutation authority before release completes", async () => {
+    const id = uniqueProjectId("authority-release");
+    const lock = await acquireEngineSingleton(id, workDir);
+    acquired.push(lock);
+
+    expect(() => lock.assertHeld()).not.toThrow();
+
+    await lock.release();
+
+    expect(() => lock.assertHeld()).toThrow(/mutation authority is not held/i);
+  });
+
+  it("revokes mutation authority before reporting a compromised lock", async () => {
+    const originalLock = lockfile.lock.bind(lockfile);
+    let compromise!: (error: Error) => void;
+    const spy = vi.spyOn(lockfile, "lock").mockImplementationOnce(async (path, options) => {
+      compromise = options.onCompromised!;
+      return originalLock(path, options);
+    });
+    let lock!: EngineSingletonLock;
+    let callbackObservedRevocation = false;
+    try {
+      lock = await acquireEngineSingleton(uniqueProjectId("authority-compromise"), workDir, () => {
+        expect(() => lock.assertHeld()).toThrow(/mutation authority is not held/i);
+        callbackObservedRevocation = true;
+      });
+      acquired.push(lock);
+
+      compromise(new Error("simulated compromise"));
+
+      expect(callbackObservedRevocation).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("revokes mutation authority when the bound socket closes unexpectedly", async () => {
+    const originalCreateServer = net.createServer.bind(net);
+    let boundServer: net.Server | undefined;
+    const serverSpy = vi.spyOn(net, "createServer").mockImplementationOnce((...args: Parameters<typeof net.createServer>) => {
+      boundServer = originalCreateServer(...args);
+      return boundServer;
+    });
+    const compromised = vi.fn();
+    try {
+      const lock = await acquireEngineSingleton(uniqueProjectId("authority-socket-close"), workDir, compromised);
+      acquired.push(lock);
+      expect(() => lock.assertHeld()).not.toThrow();
+
+      await new Promise<void>((resolve) => boundServer!.close(() => resolve()));
+
+      expect(() => lock.assertHeld()).toThrow(/mutation authority is not held/i);
+      expect(compromised).toHaveBeenCalledTimes(1);
+    } finally {
+      serverSpy.mockRestore();
+    }
   });
 
   it("different projects don't block each other", async () => {

@@ -101,10 +101,13 @@ export type {
   CccProviderAttemptDispatchDecision,
   CccProviderAttemptRequest,
   CccProviderAttemptSettlementInput,
+  CccProviderAttemptEffectiveRoute,
+  CccProviderAttemptEffectiveRouteInput,
   CccProviderAttemptScope,
   CccProviderAttemptState,
   CccProviderAttemptTerminalEvidence,
   CccProviderAttemptTransition,
+  CccProviderAttemptUsage,
 } from "./types.js";
 export {
   CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MEMBER_SCHEMA_VERSION,
@@ -156,6 +159,7 @@ export type {
 } from "./provider-controller.js";
 export {
   listCccProviderAttemptsForCampaign,
+  assertCccProviderAttemptEffectiveRoute,
   assertCccProviderAttemptLaunchHeadroom,
   CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS,
 } from "./provider-attempt.js";

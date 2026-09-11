@@ -761,6 +761,147 @@ type CancelActiveWorkflowWorkItemsForTaskOptions = {
   excludeIds?: string[];
 };
 
+export type OrphanCancellationSnapshot = Readonly<WorkflowWorkItem>;
+
+export type CancelOrphanedWorkflowWorkItemResult =
+  | { kind: "cancelled"; reason: "task-terminal"; item: WorkflowWorkItem }
+  | {
+      kind: "no-op";
+      reason:
+        | "work-item-missing"
+        | "work-item-changed"
+        | "work-item-ineligible"
+        | "task-reactivated"
+        | "task-lock-busy";
+    };
+
+export class OrphanCancellationBackendDependencyError extends Error {
+  public readonly code = "ORPHAN_CANCELLATION_BACKEND_DEPENDENCY";
+
+  public constructor() {
+    super("Orphan workflow work-item cancellation requires a project-bound PostgreSQL data layer");
+    this.name = "OrphanCancellationBackendDependencyError";
+  }
+}
+
+class OrphanCancellationTaskLockBusyAbort extends Error {
+  public constructor() {
+    super("The parent task row is locked");
+    this.name = "OrphanCancellationTaskLockBusyAbort";
+  }
+}
+
+const ORPHAN_CANCELLATION_WORK_ITEM_FIELDS = [
+  "id",
+  "runId",
+  "taskId",
+  "nodeId",
+  "kind",
+  "state",
+  "attempt",
+  "retryAfter",
+  "leaseOwner",
+  "leaseExpiresAt",
+  "lastError",
+  "blockedReason",
+  "stableWorkflowRunId",
+  "continuationSequence",
+  "waitReason",
+  "sourceColumn",
+  "targetColumn",
+  "irHash",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+function isExactOrphanCancellationSnapshot(
+  row: WorkflowWorkItemRow,
+  expected: OrphanCancellationSnapshot,
+): boolean {
+  return ORPHAN_CANCELLATION_WORK_ITEM_FIELDS.every((field) => Object.is(row[field], expected[field]));
+}
+
+function hasPostgresSqlState(error: unknown, code: string, seen = new Set<object>()): boolean {
+  if (error === null || typeof error !== "object" || seen.has(error)) return false;
+  seen.add(error);
+  if ((error as { code?: unknown }).code === code) return true;
+  return hasPostgresSqlState((error as { cause?: unknown }).cause, code, seen);
+}
+
+export async function cancelOrphanedWorkflowWorkItemIfExactImpl(
+  store: TaskStore,
+  expected: OrphanCancellationSnapshot,
+): Promise<CancelOrphanedWorkflowWorkItemResult> {
+  const layer = store.asyncLayer;
+  const projectId = layer?.projectId?.trim();
+  if (!store.backendMode || !layer || !projectId) {
+    throw new OrphanCancellationBackendDependencyError();
+  }
+
+  try {
+    return await layer.transactionImmediate(async (tx) => {
+      const workItemTable = schema.project.workflowWorkItems;
+      const rows = await tx
+        .select()
+        .from(workItemTable)
+        .where(and(eq(workItemTable.projectId, projectId), eq(workItemTable.id, expected.id)))
+        .limit(1)
+        .for("update");
+      const row = rows[0] as WorkflowWorkItemRow | undefined;
+      if (!row) return {kind: "no-op", reason: "work-item-missing"};
+      if (!isExactOrphanCancellationSnapshot(row, expected)) {
+        return {kind: "no-op", reason: "work-item-changed"};
+      }
+      if (row.kind !== "task" || (row.state !== "runnable" && row.state !== "retrying") || row.leaseOwner !== null) {
+        return {kind: "no-op", reason: "work-item-ineligible"};
+      }
+
+      const taskTable = schema.project.tasks;
+      let taskRows: unknown[];
+      try {
+        taskRows = await tx
+          .select({
+            id: taskTable.id,
+            column: taskTable.column,
+            deletedAt: taskTable.deletedAt,
+          })
+          .from(taskTable)
+          .where(and(eq(taskTable.projectId, projectId), eq(taskTable.id, expected.taskId)))
+          .limit(1)
+          .for("update", {noWait: true});
+      } catch (error) {
+        if (hasPostgresSqlState(error, "55P03")) throw new OrphanCancellationTaskLockBusyAbort();
+        throw error;
+      }
+      const task = taskRows[0] as { id: string; column: string; deletedAt: string | null } | undefined;
+      if (!task) {
+        throw new Error(`Orphan workflow work item ${expected.id} has no parent task ${expected.taskId}`);
+      }
+      if (task.deletedAt === null && task.column !== "done" && task.column !== "archived") {
+        return {kind: "no-op", reason: "task-reactivated"};
+      }
+
+      const item = await store.transitionWorkflowWorkItem(
+        row.id,
+        "cancelled",
+        {
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: "orphaned-continuation:task-terminal",
+          blockedReason: "task-terminal",
+        },
+        tx,
+      );
+      return {kind: "cancelled", reason: "task-terminal", item};
+    });
+  } catch (error) {
+    if (error instanceof OrphanCancellationTaskLockBusyAbort) {
+      return {kind: "no-op", reason: "task-lock-busy"};
+    }
+    throw error;
+  }
+}
+
 export async function cancelActiveWorkflowWorkItemsForTaskBackendInTransaction(
   store: TaskStore,
   taskId: string,

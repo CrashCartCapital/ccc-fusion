@@ -31,6 +31,7 @@
 import {
   CCC_EFFECT_RECEIPT_CONTRACT,
   CliSessionStore,
+  redactSecrets,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionPurpose,
@@ -40,6 +41,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { PermanentError } from "../engine-errors.js";
 import { loadPtyModule } from "../pty-native.js";
+import { createLogger } from "../logger.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
 import {
@@ -69,6 +71,8 @@ import {
   validateCccNativeCliSessionPolicy,
   validateCccNativeCliTerminalScope,
 } from "./ccc-native-cli-binding.js";
+import { isCodexExecMode, type CodexLaunchSettings } from "./adapters/codex.js";
+import { computeCodexExecAttemptUsage, CodexExecUsageObserver } from "./codex-exec-usage.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -195,6 +199,157 @@ export class CliCancellationSignalError extends Error {
     super(`CLI cancellation could not signal registered resource: ${sessionId}`, options);
     this.name = "CliCancellationSignalError";
   }
+}
+
+/**
+ * A spawned session never reported readiness before its startup deadline
+ * (see armReadyDeadline). Interactive CLIs can stop at startup waiting for a
+ * person or a terminal — an "Update available… Press enter to continue"
+ * screen, a trust/login prompt, or an unanswered terminal query — and without
+ * this ceiling `waitForReady()` would wait forever (the stall watchdog is
+ * only armed by beginTurn(), which runs after readiness).
+ */
+export class CliSessionReadyTimeoutError extends Error {
+  readonly code = "CLI_SESSION_READY_TIMEOUT";
+
+  constructor(public readonly sessionId: string, public readonly timeoutMs: number, public readonly lastScreen: string) {
+    super(`CLI never became ready within ${Math.round(timeoutMs / 1000)}s; last screen: ${lastScreen}`);
+    this.name = "CliSessionReadyTimeoutError";
+  }
+}
+
+/**
+ * A session's PTY exited before it was ever observed ready. Without this,
+ * any pending waitForReady() caller would hang forever a second way: exit
+ * settles exitWaiters but previously left readyWaiters untouched.
+ */
+export class CliSessionExitBeforeReadyError extends Error {
+  readonly code = "CLI_SESSION_EXIT_BEFORE_READY";
+
+  constructor(public readonly sessionId: string, public readonly exitCode: number, public readonly signal: number | undefined) {
+    super(`CLI session exited before becoming ready: ${sessionId} (exitCode=${exitCode}, signal=${signal ?? "none"})`);
+    this.name = "CliSessionExitBeforeReadyError";
+  }
+}
+
+// ── Startup readiness deadline ──────────────────────────────────────────────
+
+const log = createLogger("cli-session-manager");
+
+/**
+ * Default ceiling (ms) a spawned session has to report readiness before the
+ * manager kills it and rejects waitForReady. Complements
+ * armCccNativeCliLifetimeTimer (a whole-campaign ceiling measured in hours,
+ * CCC-campaign-only): this one catches ANY session wedged at startup.
+ */
+export const DEFAULT_CLI_READY_TIMEOUT_MS = 120_000;
+
+/** Cap on the sanitized last-screen tail carried in a ready-timeout error. */
+const CLI_READY_TAIL_MAX_CHARS = 500;
+
+/**
+ * How long a "done" close on an exec-mode Codex session waits for the child
+ * to exit on its own before escalating to SIGTERM.
+ *
+ * `policy.limits.termGraceMs` is the SIGTERM->SIGKILL escalation budget and
+ * production sets it to 1_000ms. That is not the same quantity as "how long
+ * after the turn finishes does codex exec actually exit", which was measured
+ * live (codex-cli 0.147.0, node-pty 0.13.1, 5 runs) at 1.9s-21.2s after the
+ * notify hook fires — longer than the escalation budget in every single run.
+ * Reusing termGraceMs here therefore changed nothing: the engine still
+ * SIGTERM'd a turn that had already completed, the receipt recorded
+ * exitSignal 15, and the committed-observation predicate (trigger "done" AND
+ * exitCode 0 AND exitSignal 0, ccc-native-cli-production-resolver.ts) failed
+ * a turn whose work had landed.
+ *
+ * 30s clears the measured maximum with headroom. The wait is always bounded
+ * by the campaign deadline, and it reserves the full termGraceMs +
+ * killClosureMs escalation budget inside that bound, so the worst case is
+ * still a closed, bounded session before the deadline.
+ *
+ * The predicate is deliberately NOT relaxed to accept an engine-sent SIGTERM.
+ * The same probe showed a mid-flight SIGTERM producing exitCode 0 AND
+ * exitSignal 0 in 2 of 3 runs, so exitSignal 0 never proved a natural exit
+ * in the first place; accepting signal 15 would replace an observation of
+ * how the process actually ended with the engine's own record of what it
+ * intended. Waiting makes the receipt true instead of making the check
+ * weaker.
+ */
+export const CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS = 30_000;
+
+/**
+ * Node's setTimeout delay is a signed 32-bit int under the hood; anything
+ * above this is silently clamped to ~1ms instead of firing after the
+ * intended delay, which would turn a huge "generous" deadline into an
+ * immediate kill. Never pass a larger delay to setTimeout.
+ */
+export const MAX_READY_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Resolve the default startup-readiness deadline. Override via
+ * FUSION_CLI_AGENT_READY_TIMEOUT_MS (a positive integer no larger than
+ * MAX_READY_TIMEOUT_MS; anything else falls back to the default — mirrors
+ * the parseInt + Number.isFinite pattern used by FUSION_RESUME_ORPHAN_DELAY_MS
+ * in executor.ts). An in-range-but-oversized value logs one warning before
+ * falling back, since it is very likely a misconfiguration (seconds entered
+ * where ms was expected, etc.) rather than a deliberate huge deadline. Read
+ * lazily, at spawn time, so an env change between module load and spawn()
+ * (e.g. set in a test setup file) is observed.
+ */
+function resolveDefaultReadyTimeoutMs(): number {
+  const raw = process.env.FUSION_CLI_AGENT_READY_TIMEOUT_MS;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      if (parsed <= MAX_READY_TIMEOUT_MS) return parsed;
+      log.warn(
+        `FUSION_CLI_AGENT_READY_TIMEOUT_MS=${raw} exceeds the setTimeout ceiling ` +
+          `(${MAX_READY_TIMEOUT_MS}ms); Node would clamp it to ~1ms instead of the ` +
+          `intended delay. Falling back to the default (${DEFAULT_CLI_READY_TIMEOUT_MS}ms).`,
+      );
+    }
+  }
+  return DEFAULT_CLI_READY_TIMEOUT_MS;
+}
+
+/**
+ * Strip ANSI/OSC/DCS escape sequences and control characters from raw PTY
+ * text, leaving a short, readable tail for a human-facing failure reason.
+ * This is a best-effort readability pass over the manager's OWN scrollback —
+ * distinct from the dashboard's neutralizeTerminalOutput (U10), which is a
+ * security-hardening pass applied to bytes forwarded to a browser/TUI and
+ * lives in a package this one does not depend on.
+ */
+export function sanitizeCliReadyTail(raw: string, maxChars: number = CLI_READY_TAIL_MAX_CHARS): string {
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const code = ch.codePointAt(0)!;
+    if (code === 0x1b) {
+      const next = raw[i + 1];
+      if (next === "[") {
+        // CSI: ESC [ params/intermediates, terminated by a final byte @-~.
+        let j = i + 2;
+        while (j < raw.length && !/[@-~]/.test(raw[j])) j++;
+        i = j;
+        continue;
+      }
+      if (next === "]" || next === "P" || next === "X" || next === "^" || next === "_") {
+        // OSC/DCS/SOS/PM/APC: terminated by BEL or ST (ESC \).
+        let j = i + 2;
+        while (j < raw.length && raw[j] !== "\x07" && !(raw[j] === "\x1b" && raw[j + 1] === "\\")) j++;
+        i = raw[j] === "\x1b" ? j + 1 : j;
+        continue;
+      }
+      i += 1; // ESC + one following byte (short two-byte escape)
+      continue;
+    }
+    if (code < 0x20 && ch !== "\n" && ch !== "\t") continue; // other C0 controls
+    if (code === 0x7f) continue; // DEL
+    out += ch;
+  }
+  const collapsed = out.replace(/\s+/g, " ").trim();
+  return collapsed.length > maxChars ? collapsed.slice(-maxChars) : collapsed;
 }
 
 interface CccResumeContract {
@@ -563,6 +718,15 @@ export interface SpawnCliSessionOptions {
     nativeSessionId: string;
   };
   cccNativeCliPolicy?: unknown;
+  /**
+   * Startup-readiness deadline override for this spawn (ms). Defaults to
+   * FUSION_CLI_AGENT_READY_TIMEOUT_MS or DEFAULT_CLI_READY_TIMEOUT_MS
+   * (120000ms) when omitted. Pass `null` to disable the deadline entirely —
+   * e.g. dashboard chat sessions, where a human is at the screen and may need
+   * time to answer a login/trust prompt (see
+   * packages/dashboard/src/cli-chat.ts ensureSession).
+   */
+  readyTimeoutMs?: number | null;
 }
 
 // ── Internal live-session state ─────────────────────────────────────────────
@@ -575,8 +739,17 @@ interface LiveSession {
   scrollback: ScrollbackRing;
   readiness: CliReadinessDetector;
   ready: boolean;
-  /** Resolvers waiting on readiness. */
-  readyWaiters: (() => void)[];
+  /** Resolvers/rejecters waiting on readiness. */
+  readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
+  /** Startup-readiness deadline (cleared on ready/exit; see armReadyDeadline). */
+  readyDeadlineTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Set once handleReadyDeadline has fired and dispatched a kill. Prevents a
+   * late-arriving readiness signal (buffered output flushing on the way to
+   * exit) from flipping ready/agentState back to "ready" after the session
+   * has already been condemned.
+   */
+  readyDeadlineExpired?: boolean;
   /** True while bracketed paste is active (observed enable, no later disable). */
   bracketedPasteActive: boolean;
   /** Live attach streams. */
@@ -616,6 +789,22 @@ interface LiveSession {
     reject: (cause: unknown) => void;
   }>;
   cccNativeCliLifetimeTimer?: ReturnType<typeof setTimeout>;
+  /** Deferred `exit` close, held open so an in-flight `done` can win the close. */
+  cccNativeCliExitGraceTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Usage-lane U2: present only for exec-mode Codex sessions (`adapter.id ===
+   * "codex" && isCodexExecMode(settings)`). Fed every raw PTY chunk in
+   * handleData; its `.usage` is the last observed `turn.completed.usage`, or
+   * null before/absent a turn.completed event.
+   */
+  codexExecUsage?: CodexExecUsageObserver;
+  /**
+   * Usage-lane review-round-2 C: true only when this LiveSession was created
+   * via `spawn({ resume: {...} })`. Backs the closeCccNativeCliSessionLive
+   * assertion that a codexExecUsage-bearing session is never a resume (see
+   * that assertion for the invariant it depends on).
+   */
+  resumedFromExisting: boolean;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -1007,7 +1196,12 @@ export class CliSessionManager {
       pty: child,
       pid: child.pid,
       scrollback: new ScrollbackRing(this.scrollbackBytes),
-      readiness: adapter.createReadinessDetector(),
+      // The launch context decides which readiness markers apply: an adapter's
+      // interactive and non-interactive forms can share none of them.
+      readiness: adapter.createReadinessDetector({
+        settings: launchSettings,
+        posture: record.autonomyPosture,
+      }),
       ready: false,
       readyWaiters: [],
       bracketedPasteActive: false,
@@ -1029,9 +1223,15 @@ export class CliSessionManager {
       cccNativeCliPolicy,
       cccNativeCliHeldClosure: null,
       cccNativeCliHeldClosureWaiters: [],
+      resumedFromExisting: Boolean(options.resume),
+      // Usage-lane U2: only exec-mode Codex sessions get a usage observer.
+      ...(adapter.id === "codex" && isCodexExecMode(launchSettings as CodexLaunchSettings)
+        ? { codexExecUsage: new CodexExecUsageObserver() }
+        : {}),
     };
     this.sessions.set(record.id, live);
     this.armCccNativeCliLifetimeTimer(live);
+    this.armReadyDeadline(live, options.readyTimeoutMs);
 
     // Optional adapter telemetry wiring.
     let disposeTelemetry: (() => void) | void;
@@ -1076,6 +1276,10 @@ export class CliSessionManager {
   private handleData(live: LiveSession, data: string): void {
     live.lastOutputAt = Date.now();
 
+    // Usage-lane U2: exec-mode Codex sessions only (undefined for every
+    // other session — see spawn()).
+    live.codexExecUsage?.observe(data);
+
     // Track bracketed-paste negotiation by scanning the raw output text.
     if (data.includes(BRACKETED_PASTE_ENABLE)) {
       live.bracketedPasteActive = true;
@@ -1085,10 +1289,11 @@ export class CliSessionManager {
     }
 
     // Readiness detection (until satisfied once).
-    if (!live.ready && live.readiness.observe(data)) {
+    if (!live.ready && !live.readyDeadlineExpired && live.readiness.observe(data)) {
       live.ready = true;
+      this.clearReadyDeadline(live);
       const waiters = live.readyWaiters.splice(0);
-      for (const w of waiters) w();
+      for (const w of waiters) w.resolve();
       this.maybeUpdateState(live, "ready");
     }
 
@@ -1122,9 +1327,42 @@ export class CliSessionManager {
     // still observing closure. Never let that old generation touch the new one.
     if (live.terminated || this.sessions.get(live.id) !== live) return;
     this.settleExit(live, exitCode, signal);
+    this.clearReadyDeadline(live);
+    if (!live.ready) {
+      this.rejectReadyWaiters(live, new CliSessionExitBeforeReadyError(live.id, exitCode, signal));
+    }
 
     if (live.cccNativeCliPolicy) {
-      void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+      // A campaign turn's positive completion is OUT OF BAND: the provider runs
+      // its notify program, which posts to the engine, which drives the state
+      // machine to `done`, which closes with trigger "done". The child exiting
+      // is a separate, in-band event. A non-interactive provider exits by itself
+      // moments after notifying (measured: `codex exec` notified ~1.55s before
+      // exit), but that ordering is incidental, not contractual.
+      //
+      // Closing immediately on the exit stamps trigger "exit", which the campaign
+      // observer reads as proved_failed. On the losing side of that race a turn
+      // whose work actually landed would be recorded as failed. So a CLEAN exit
+      // yields for a bounded grace to a done already in flight. The close is
+      // first-call-wins, so a done arriving in the window takes it and this
+      // deferred call becomes a no-op.
+      //
+      // This never accepts an exit AS a done: with no done the close still stamps
+      // "exit" and the turn still proves failed. The grace only decides WHEN that
+      // verdict is written, never WHAT it says.
+      const graceMs = exitCode === 0 && (signal === undefined || signal === 0)
+        ? this.cccNativeCliExitGraceMs(live.cccNativeCliPolicy)
+        : 0;
+      if (graceMs <= 0) {
+        void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+        return;
+      }
+      const timer = setTimeout(() => {
+        live.cccNativeCliExitGraceTimer = undefined;
+        void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+      }, graceMs);
+      timer.unref?.();
+      live.cccNativeCliExitGraceTimer = timer;
       return;
     }
 
@@ -1193,7 +1431,7 @@ export class CliSessionManager {
   waitForReady(sessionId: string): Promise<void> {
     const live = this.require(sessionId);
     if (live.ready) return Promise.resolve();
-    return new Promise((resolve) => live.readyWaiters.push(resolve));
+    return new Promise((resolve, reject) => live.readyWaiters.push({ resolve, reject }));
   }
 
   /**
@@ -1397,6 +1635,7 @@ export class CliSessionManager {
       throw new Error("CCC native CLI close trigger must be one of: done, exit, cancel, lifetime");
     }
     this.clearCccNativeCliLifetimeTimer(live);
+    this.clearCccNativeCliExitGraceTimer(live);
     if (live.cccNativeCliHeldClosure) return live.cccNativeCliHeldClosure.promise;
     const closure = {
       promise: this.closeCccNativeCliSessionLive(live, trigger),
@@ -1464,7 +1703,15 @@ export class CliSessionManager {
     const policy = live.cccNativeCliPolicy;
     if (!policy) throw new UnknownCliSessionError(live.id);
     const closeStartedAtMs = Date.now();
-    const totalClosureBudgetMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+    // A "done" close on an exec-mode Codex session first waits for the child's
+    // own exit (CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS), so its window is that
+    // grace PLUS the unchanged SIGTERM escalation budget. Every other close
+    // keeps exactly the budget it had.
+    const postDoneExitGraceMs = trigger === "done" && live.codexExecUsage
+      ? CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS
+      : 0;
+    const escalationBudgetMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+    const totalClosureBudgetMs = postDoneExitGraceMs + escalationBudgetMs;
     const absoluteClosureDeadlineMs = Math.min(
       policy.deadlineAtMs,
       closeStartedAtMs + totalClosureBudgetMs,
@@ -1472,17 +1719,50 @@ export class CliSessionManager {
 
     let processClosure: Promise<void> = Promise.resolve();
     if (!live.exitResult) {
-      try {
-        live.pty.kill("SIGTERM");
-      } catch (cause) {
-        await this.failCancellationWithoutClosure(
-          live,
-          "CANCELLATION_SIGNAL_FAILED",
-          cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
+      // Usage-lane review-round-2 A: a "done" close for exec-mode Codex
+      // sessions is driven out-of-band by the provider's notify hook, which
+      // does NOT wait for the child to exit. Measured live (codex-cli
+      // 0.147.0, node-pty 0.13.1, 5 runs + 2 adversarial): notify fired
+      // 130ms-950ms AFTER turn.completed already landed on the PTY stream
+      // (so usage capture was never observed at risk from this ordering),
+      // but notify-to-natural-exit gaps were large and variable
+      // (1.9s-21.2s) — SIGTERM-ing immediately on "done" routinely kills a
+      // process still doing legitimate post-turn work (session persistence,
+      // etc.). Give exec-mode Codex sessions their termGraceMs to exit
+      // naturally before reaching for SIGTERM at all, clamped to the same
+      // absolute closure deadline the rest of this method already respects
+      // so the worst-case total closure time is unchanged.
+      let exitedNaturallyDuringGrace = false;
+      if (postDoneExitGraceMs > 0) {
+        // Reserve the escalation budget inside the absolute deadline, so a
+        // campaign deadline that lands mid-grace still leaves room to SIGTERM
+        // and close rather than being consumed entirely by waiting.
+        const graceMs = Math.min(
+          postDoneExitGraceMs,
+          Math.max(0, absoluteClosureDeadlineMs - escalationBudgetMs - Date.now()),
         );
+        if (graceMs > 0) {
+          try {
+            await this.waitForRegisteredExit(live, graceMs);
+            exitedNaturallyDuringGrace = true;
+          } catch {
+            // Grace elapsed with no natural exit; fall through to SIGTERM below.
+          }
+        }
       }
-      const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
-      processClosure = this.waitForRegisteredExit(live, remainingClosureBudgetMs);
+      if (!exitedNaturallyDuringGrace && !live.exitResult) {
+        try {
+          live.pty.kill("SIGTERM");
+        } catch (cause) {
+          await this.failCancellationWithoutClosure(
+            live,
+            "CANCELLATION_SIGNAL_FAILED",
+            cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
+          );
+        }
+        const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
+        processClosure = this.waitForRegisteredExit(live, remainingClosureBudgetMs);
+      }
     }
 
     const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
@@ -1523,11 +1803,55 @@ export class CliSessionManager {
 
     const exitCode = live.exitResult?.exitCode ?? -1;
     const exitSignal = live.exitResult?.signal ?? 0;
+    if (live.codexExecUsage) {
+      // Usage-lane review-round-2 A: the process has now exited. node-pty's
+      // own unix backend already defers emitting 'exit' until AFTER its
+      // underlying read stream reports 'close' (see node-pty's
+      // unixTerminal.ts: "Sometimes a data event is emitted after exit. Wait
+      // til socket is destroyed"), which normally guarantees any buffered PTY
+      // data has already reached handleData() by the time we get here. This
+      // is a second, cheap, defense-in-depth wait for that same hazard: give
+      // any data chunk that was already in flight one more event-loop turn to
+      // land. Node's poll phase (I/O callbacks, including PTY 'data') always
+      // runs before the check phase (setImmediate) within one loop iteration,
+      // so this lets anything already queued for delivery arrive before usage
+      // is read.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    // Usage-lane U2/U3: flush the trailing partial line (the process may have
+    // exited right after writing turn.completed with no final newline), then
+    // read the last observed cumulative usage. CCC native CLI bindings are
+    // always `followUp: false` (ccc-native-cli-production-resolver.ts) —
+    // every dispatch is a fresh `codex exec` thread, never a resume — so the
+    // thread's cumulative total IS this attempt's usage; there is no
+    // prior-attempt baseline to subtract.
+    live.codexExecUsage?.flush();
+    // Usage-lane review-round-2 C: isResumedThread is hard-coded false above,
+    // not derived from live state -- it relies on the resume-admission check
+    // in spawn() (autonomyPosture.cccNativeCliOneShot === true refuses any
+    // `resume`, and cccNativeCliOneShot is unconditionally set whenever
+    // cccNativeCliPolicy is provided, the same gate required for codexExecUsage
+    // to exist at all) to structurally guarantee a codexExecUsage-bearing
+    // session is never a resume. Assert that invariant here instead of only
+    // documenting it, so a future change to the admission check fails loudly
+    // here rather than silently mis-recording a resumed thread's cumulative
+    // total as if it were a fresh attempt's total.
+    if (live.codexExecUsage && live.resumedFromExisting) {
+      throw new Error(
+        "invariant violated: a resumed session should never carry a codexExecUsage observer",
+      );
+    }
+    const usage = computeCodexExecAttemptUsage({
+      observed: live.codexExecUsage?.usage ?? null,
+      isResumedThread: false,
+      priorCumulativeUsageForThread: null,
+    });
     const heldClosureEvidence = buildCccNativeCliHeldClosureEvidence({
       sessionId: live.id,
       trigger,
       exitCode,
       exitSignal,
+      usage,
     });
     await this.updateCccNativeCliHeldRow(live, policy, heldClosureEvidence);
     await this.store.flush();
@@ -1621,6 +1945,7 @@ export class CliSessionManager {
 
   private releaseLiveSlot(live: LiveSession): void {
     this.clearCccNativeCliLifetimeTimer(live);
+    this.clearCccNativeCliExitGraceTimer(live);
     live.terminated = true;
     for (const stream of live.streams) stream.close();
     live.streams.clear();
@@ -1842,5 +2167,98 @@ export class CliSessionManager {
     if (!live.cccNativeCliLifetimeTimer) return;
     clearTimeout(live.cccNativeCliLifetimeTimer);
     live.cccNativeCliLifetimeTimer = undefined;
+  }
+
+  /**
+   * How long a clean exit waits for an in-flight `done` before being closed as
+   * `exit`. Bounded by the policy's own term-grace budget and never past the
+   * campaign deadline, so the grace can neither be open-ended nor outlive the
+   * authority that funds it.
+   */
+  private cccNativeCliExitGraceMs(policy: CccNativeCliSessionPolicy): number {
+    const untilDeadlineMs = policy.deadlineAtMs - Date.now();
+    return Math.max(0, Math.min(policy.limits.termGraceMs, untilDeadlineMs));
+  }
+
+  private clearCccNativeCliExitGraceTimer(live: LiveSession): void {
+    if (!live.cccNativeCliExitGraceTimer) return;
+    clearTimeout(live.cccNativeCliExitGraceTimer);
+    live.cccNativeCliExitGraceTimer = undefined;
+  }
+
+  /**
+   * Arm the startup-readiness deadline for a freshly spawned session.
+   * `overrideMs === null` disables it entirely (e.g. dashboard chat); a
+   * numeric override wins over the env/default resolution; omitted falls
+   * back to resolveDefaultReadyTimeoutMs().
+   */
+  private armReadyDeadline(live: LiveSession, overrideMs: number | null | undefined): void {
+    const requested = overrideMs === null ? null : overrideMs ?? resolveDefaultReadyTimeoutMs();
+    if (requested === null || !Number.isFinite(requested) || requested <= 0) return;
+    // Clamp rather than throw: an oversized per-spawn override is generous
+    // configuration, not malformed input, and a spawn() caller should never
+    // fail to start a session merely because its timeout budget exceeds what
+    // setTimeout can represent. Clamping to the largest delay setTimeout can
+    // actually honor keeps the deadline the caller clearly intended (wait a
+    // very long time) instead of letting Node's silent int32 clamp turn it
+    // into an near-immediate kill.
+    const timeoutMs = Math.min(requested, MAX_READY_TIMEOUT_MS);
+    const timer = setTimeout(() => this.handleReadyDeadline(live, timeoutMs), timeoutMs);
+    timer.unref?.();
+    live.readyDeadlineTimer = timer;
+  }
+
+  private clearReadyDeadline(live: LiveSession): void {
+    if (!live.readyDeadlineTimer) return;
+    clearTimeout(live.readyDeadlineTimer);
+    live.readyDeadlineTimer = undefined;
+  }
+
+  /**
+   * The startup deadline fired: reject waiters with a typed, readable error
+   * (sanitized scrollback tail included) and kill the child through the
+   * manager's existing kill path — closeCccNativeCliSession for a
+   * CCC-governed session (held-closure protocol) or kill() for every other
+   * session. Uses the "cancel" trigger, not "lifetime": "lifetime" means the
+   * campaign's own deadline (policy.deadlineAtMs) was reached, which is false
+   * here — the campaign may have hours left. "cancel" (already used by
+   * killAll()/dispose()) honestly means the engine chose to stop this
+   * session. executor.ts treats both identically (cancelled/killed), so this
+   * is a labeling fix only, no behavior change.
+   *
+   * A kill()/closeCccNativeCliSession() may already be in flight when this
+   * fires (both set their in-flight marker — cancellationReason /
+   * cccNativeCliHeldClosure — synchronously before any await), racing a
+   * timeout rejection in front of the real cancellation reason. Skip the
+   * timeout path entirely in that case: handleExit's exit-before-ready path
+   * settles readyWaiters with the real reason once that cancellation
+   * completes.
+   */
+  private handleReadyDeadline(live: LiveSession, timeoutMs: number): void {
+    this.clearReadyDeadline(live);
+    if (live.ready || live.terminated) return;
+    if (live.cancellationReason !== null || live.cccNativeCliHeldClosure) return;
+    live.readyDeadlineExpired = true;
+    const tail = sanitizeCliReadyTail(redactSecrets(this.decodeScrollbackTail(live)));
+    this.rejectReadyWaiters(live, new CliSessionReadyTimeoutError(live.id, timeoutMs, tail));
+    if (live.cccNativeCliPolicy) {
+      void this.closeCccNativeCliSession(live.id, "cancel").catch(() => undefined);
+    } else {
+      void this.kill(live.id, "killed").catch(() => undefined);
+    }
+  }
+
+  private decodeScrollbackTail(live: LiveSession): string {
+    try {
+      return new TextDecoder("utf-8", { fatal: false }).decode(live.scrollback.snapshot());
+    } catch {
+      return "";
+    }
+  }
+
+  /** Reject every pending waitForReady() caller exactly once. */
+  private rejectReadyWaiters(live: LiveSession, error: Error): void {
+    const waiters = live.readyWaiters.splice(0);
+    for (const w of waiters) w.reject(error);
   }
 }

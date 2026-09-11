@@ -344,8 +344,16 @@ async function runInTransaction<T>(
 export async function recordRunAuditEventWithinTransaction(
   tx: DbTransaction,
   input: RunAuditEventInput,
+  projectId?: string,
 ): Promise<RunAuditEvent> {
+  const explicitProjectId = projectId === undefined ? undefined : projectId.trim();
+  if (projectId !== undefined && !explicitProjectId) {
+    throw new TypeError("run-audit event explicit projectId must be a non-blank string");
+  }
   const campaign = input.campaign ? normalizeCampaignEvent(input.campaign) : undefined;
+  if (campaign && explicitProjectId !== undefined && explicitProjectId !== campaign.binding.projectId) {
+    throw new CccCampaignContextError("run-audit event explicit projectId must match campaign binding projectId");
+  }
   const timestamp = campaign
     ? requireCanonicalCampaignTimestamp(input.timestamp)
     : (input.timestamp ?? new Date().toISOString());
@@ -373,6 +381,7 @@ export async function recordRunAuditEventWithinTransaction(
       mutationType: event.mutationType,
       target: event.target,
       metadata: event.metadata,
+      ...(explicitProjectId === undefined ? {} : {projectId: explicitProjectId}),
     });
     return event;
   }

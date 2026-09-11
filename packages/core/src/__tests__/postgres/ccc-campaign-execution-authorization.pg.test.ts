@@ -1367,7 +1367,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
   });
 
   it("RED-S3-race: provider settlement and no-effect closure converge on one terminal outcome per child", async () => {
-    const campaign = await fixture("settlement-closure-race");
+    const campaign = await fixture("settlement-closure-race", { maxDurationMs: 60_000 });
     const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
@@ -1539,7 +1539,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       "dispatched-unknown",
       "proved-failed",
     ] as const) {
-      const campaign = await fixture(`opened-${lifecycle}`);
+      const campaign = await fixture(`opened-${lifecycle}`, { maxDurationMs: 60_000 });
       const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
         authorityStore: h.store(),
         rootDir: h.rootDir(),

@@ -20,8 +20,44 @@
  *     never hardcoding the layout — it is version-sensitive);
  *   - resume via `codex resume <thread-id>`.
  *
- * ── Verified against the installed binary (Codex 0.128.0, arm64) ──
+ * ── Two invocation forms ──
+ * The adapter drives Codex in whichever form the caller's launch settings select:
+ *
+ *   - INTERACTIVE (default) — a bare `codex`, driven by injecting the prompt as
+ *     keystrokes after readiness. Correct only when something is on the other end
+ *     of the terminal.
+ *   - NON-INTERACTIVE (`settings.oneShot`) — `codex exec --json <prompt>`. The
+ *     right form for ANY unattended turn, and the only one that terminates on its
+ *     own.
+ *
+ * WHY THE SPLIT EXISTS. The interactive TUI queries the terminal about itself at
+ * startup — cursor position (DSR `ESC[6n`), foreground/background colour (OSC
+ * 10/11), kitty keyboard support (`ESC[?u`), device attributes (`ESC[c`) — and
+ * blocks until the terminal answers. A real emulator replies; an engine-owned PTY
+ * with no reader does not. Codex then never finishes starting: no API socket, no
+ * session, no rollout file, no output, indefinitely. Three CCC campaign turns
+ * died exactly there, the last one burning 10h42m of wall clock on 0.44s of CPU.
+ * Setting `TERM=dumb` does not help — the probes are unconditional.
+ *
+ * ── Verified against the installed binary (Codex 0.147.0, arm64) ──
  *   - `codex` is on PATH; `~/.codex/` is the default `CODEX_HOME`.
+ *   - `codex exec [OPTIONS] [PROMPT]` runs headless and exits 0 on a completed
+ *     turn. With no PROMPT (or `-`) it reads instructions from stdin instead,
+ *     which on a tty is another open-ended wait — so exec mode REQUIRES a prompt.
+ *   - `--json` emits ordered JSONL on stdout: `thread.started` (carrying
+ *     `thread_id`), `turn.started`, `item.completed`, `turn.completed` (carrying
+ *     token usage).
+ *   - `notify` fires under exec exactly as it does interactively, with the same
+ *     `agent-turn-complete` payload and `thread-id`, so the turn-complete wiring
+ *     below is shared by both forms. Measured ordering: notify ran 1.55s and
+ *     2.75s before process exit across two runs — comfortably ahead, though the
+ *     margin is incidental rather than contractual (the session manager gives a
+ *     clean exit a bounded grace so an in-flight done still wins the close).
+ *   - `codex exec` REJECTS `--ask-for-approval` ("unexpected argument"); it is
+ *     non-interactive and never prompts. The `-c permissions.*` /
+ *     `default_permissions` overrides ARE recognized (checked with
+ *     `--strict-config`, which errors on unknown keys), so the ccc_fusion sandbox
+ *     contract carries over intact.
  *   - Rollout JSONL layout CONFIRMED by inspecting real files:
  *       `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread-id>.jsonl`
  *     with a first line `{type:"session_meta", payload:{ id:<thread-id>, cwd,
@@ -31,11 +67,10 @@
  *     `thread-id` IS the `session_meta.payload.id` and is embedded in the
  *     filename. We PROBE for the file by thread-id (see {@link findRolloutPath}),
  *     never assuming the date path.
- *   - `codex resume` and `codex exec` subcommands exist (`codex --help`); the
- *     interactive `--help` for subcommands could not be captured in this sandbox
- *     (the binary opens a TUI), so the exact resume arg shape below is per the
- *     documented public interface: `codex resume <thread-id>` and the `-c
- *     key=value` config-override flag.
+ *   - Resume arg shapes read off `--help` directly (exec's help renders without
+ *     opening a TUI): `codex exec resume [SESSION_ID] [PROMPT]` for the headless
+ *     form, `codex resume <thread-id>` for the interactive one. Both take the
+ *     `-c key=value` config-override flag.
  *
  * ── Assumed / mechanism choice (marked so wiring composes; revisit on drift) ──
  *   - NOTIFY MECHANISM. Codex's documented native turn-complete is the `notify`
@@ -91,15 +126,32 @@ const DEFAULT_COMMAND = "codex";
 const CCC_CODEX_PERMISSION_PROFILE = "ccc_fusion";
 const CCC_CODEX_FILESYSTEM_PROFILE =
   'permissions.ccc_fusion.filesystem={":minimal"="read",":workspace_roots"={"."="write","**/_secrets/**"="deny","**/_KELSEY/**"="deny","**/.agentsecrets/**"="deny","**/.env"="deny","**/.env.*"="deny"}}';
-const CCC_CODEX_PERMISSION_ARGS = [
+/**
+ * The sandbox contract expressed purely as `-c key=value` config overrides.
+ * These are plain config tokens, so they parse identically on the interactive
+ * and `exec` argv (verified with `codex exec --strict-config`, which errors on
+ * any key this Codex version does not recognize).
+ */
+const CCC_CODEX_PERMISSION_CONFIG_ARGS = [
   "-c",
   CCC_CODEX_FILESYSTEM_PROFILE,
   "-c",
   `permissions.${CCC_CODEX_PERMISSION_PROFILE}.network.enabled=false`,
   "-c",
   `default_permissions=${JSON.stringify(CCC_CODEX_PERMISSION_PROFILE)}`,
-  "--ask-for-approval",
-  "never",
+] as const;
+
+/**
+ * The approval flag is INTERACTIVE-ONLY. `codex exec` rejects it outright
+ * ("error: unexpected argument '--ask-for-approval' found"), and it is redundant
+ * there: exec is non-interactive and never raises an approval prompt. Emitting
+ * it on the exec argv would make every unattended turn fail before it starts.
+ */
+const CCC_CODEX_INTERACTIVE_APPROVAL_ARGS = ["--ask-for-approval", "never"] as const;
+
+const CCC_CODEX_PERMISSION_ARGS = [
+  ...CCC_CODEX_PERMISSION_CONFIG_ARGS,
+  ...CCC_CODEX_INTERACTIVE_APPROVAL_ARGS,
 ] as const;
 
 export class CccCodexSandboxPolicyError extends Error {
@@ -142,6 +194,48 @@ export interface CodexLaunchSettings {
    * `<CODEX_HOME>/sessions`. The exact dated sub-layout is probed, never assumed.
    */
   sessionsDir?: string;
+  /**
+   * Run the NON-INTERACTIVE `codex exec` form instead of the interactive TUI.
+   *
+   * This is the correct shape for any unattended turn. The interactive TUI
+   * queries the terminal at startup (cursor position, colours, kitty keyboard,
+   * device attributes) and blocks until the terminal answers; an engine-owned
+   * PTY has nobody on the other end, so the TUI never finishes starting — no
+   * API socket, no rollout file, no output, forever. `codex exec` takes the
+   * prompt on argv, streams ordered JSONL events, fires the same `notify`
+   * turn-complete program, and exits on its own.
+   */
+  oneShot?: boolean;
+  /**
+   * The prompt for an exec-mode turn, passed as the trailing positional. REQUIRED
+   * when {@link oneShot} is set: `codex exec` with no prompt falls back to reading
+   * stdin, which on a tty is an open-ended wait with no terminal signal.
+   */
+  oneShotPrompt?: string;
+}
+
+/** Raised when exec mode is requested without the prompt it must carry. */
+export class CccCodexExecPromptError extends Error {
+  readonly code = "CCC_CODEX_EXEC_PROMPT_MISSING";
+
+  constructor() {
+    super("Codex exec mode requires a prompt (settings.oneShotPrompt)");
+    this.name = "CccCodexExecPromptError";
+  }
+}
+
+/** Whether these settings select the non-interactive `codex exec` form. */
+export function isCodexExecMode(settings: CodexLaunchSettings): boolean {
+  return settings.oneShot === true;
+}
+
+/** The exec-mode prompt, or throw when exec mode was requested without one. */
+function requireExecPrompt(settings: CodexLaunchSettings): string {
+  const prompt = settings.oneShotPrompt;
+  if (typeof prompt !== "string" || prompt.length === 0) {
+    throw new CccCodexExecPromptError();
+  }
+  return prompt;
 }
 
 function readSettings(ctx: CliAdapterLaunchContext): CodexLaunchSettings {
@@ -208,6 +302,15 @@ function buildBaseArgs(ctx: CliAdapterLaunchContext): { command: string; args: s
   const settings = readSettings(ctx);
   const command = settings.command ?? DEFAULT_COMMAND;
   const args: string[] = [];
+  if (isCodexExecMode(settings)) {
+    // Validate the prompt BEFORE any argv is assembled so a misconfigured exec
+    // launch fails here rather than as a stdin wait inside the child.
+    requireExecPrompt(settings);
+    // `codex exec [OPTIONS] [PROMPT]` — the subcommand leads, then `--json` so
+    // the turn reports ordered JSONL events (thread.started / turn.started /
+    // item.completed / turn.completed) on the merged PTY stream.
+    args.push("exec", "--json");
+  }
   if (typeof settings.model === "string" && settings.model.length > 0) {
     // Model is set via a config override so it composes with `-c notify`.
     args.push("-c", `model=${JSON.stringify(settings.model)}`);
@@ -244,7 +347,13 @@ function appendCccSandboxContract(
       "full-access autoApprove posture is not allowed",
     );
   }
-  args.push(...CCC_CODEX_PERMISSION_ARGS);
+  // The permission profile is identical in both forms; only the approval flag
+  // differs, because `codex exec` rejects it and never prompts anyway.
+  args.push(
+    ...(isCodexExecMode(settings)
+      ? CCC_CODEX_PERMISSION_CONFIG_ARGS
+      : CCC_CODEX_PERMISSION_ARGS),
+  );
   return true;
 }
 
@@ -658,6 +767,30 @@ export class CodexReadinessDetector implements CliReadinessDetector {
   }
 }
 
+/**
+ * Readiness detector for the non-interactive `codex exec` form.
+ *
+ * exec draws no composer, negotiates no bracketed paste, and prints no prompt
+ * glyph, so every marker {@link CodexReadinessDetector} looks for is absent — it
+ * would never report ready. exec also needs no readiness gate for its own sake:
+ * the prompt is already on argv. Readiness here exists only so the session's
+ * state machine can move `starting → ready → busy` and arm its watchdog, so the
+ * first byte of the event stream (`thread.started`) is the signal.
+ *
+ * A run that produces no output at all is no longer a silent hang: exec exits by
+ * itself, and the exit handler settles the session.
+ */
+export class CodexExecReadinessDetector implements CliReadinessDetector {
+  private ready = false;
+
+  observe(chunk: string): boolean {
+    if (this.ready) return true;
+    if (chunk.length === 0) return false;
+    this.ready = true;
+    return true;
+  }
+}
+
 // ── The adapter ─────────────────────────────────────────────────────────────
 
 export const codexAdapter: CliAgentAdapter = {
@@ -702,7 +835,18 @@ export const codexAdapter: CliAgentAdapter = {
       appendPostureFlags(args, ctx);
       if (settings.extraArgs) args.push(...settings.extraArgs);
     }
+    // The prompt is the TRAILING positional, after every flag — clap stops
+    // option parsing at the first positional, so it must come last.
+    if (isCodexExecMode(settings)) args.push(requireExecPrompt(settings));
     return { command, args };
+  },
+
+  consumesPromptOnLaunch(ctx: CliAdapterLaunchContext): boolean {
+    // In exec mode the prompt rides on argv, so the session manager must NOT
+    // inject it as keystrokes: exec does not read the tty for input, and the
+    // stray bytes would go nowhere while the caller waited on a readiness gate
+    // that had already passed.
+    return isCodexExecMode(readSettings(ctx));
   },
 
   buildEnvAllowlist(ctx: CliAdapterLaunchContext): string[] {
@@ -734,8 +878,11 @@ export const codexAdapter: CliAgentAdapter = {
     return cccFusionEnvAllowlist(settings.codexHome ? [...new Set([...base, "CODEX_HOME"])] : base, ctx.settings);
   },
 
-  createReadinessDetector(): CliReadinessDetector {
-    return new CodexReadinessDetector();
+  createReadinessDetector(ctx?: CliAdapterLaunchContext): CliReadinessDetector {
+    // The TUI markers (bracketed paste, composer glyph) never appear under exec.
+    return ctx && isCodexExecMode(readSettings(ctx))
+      ? new CodexExecReadinessDetector()
+      : new CodexReadinessDetector();
   },
 
   formatInjection(text: string, _opts: { bracketedPasteActive: boolean }): CliInjectionFormat {
@@ -751,7 +898,13 @@ export const codexAdapter: CliAgentAdapter = {
     // wiring. (The `resume` subcommand precedes the thread-id and config flags.)
     const settings = readSettings(ctx);
     const command = settings.command ?? DEFAULT_COMMAND;
-    const args: string[] = ["resume", ctx.nativeSessionId];
+    const execMode = isCodexExecMode(settings);
+    // `codex exec resume [SESSION_ID] [PROMPT]` for unattended turns;
+    // `codex resume <thread-id>` re-attaches the interactive TUI.
+    if (execMode) requireExecPrompt(settings);
+    const args: string[] = execMode
+      ? ["exec", "resume", ctx.nativeSessionId, "--json"]
+      : ["resume", ctx.nativeSessionId];
     if (typeof settings.model === "string" && settings.model.length > 0) {
       args.push("-c", `model=${JSON.stringify(settings.model)}`);
     }
@@ -762,6 +915,7 @@ export const codexAdapter: CliAgentAdapter = {
       appendPostureFlags(args, ctx);
       if (settings.extraArgs) args.push(...settings.extraArgs);
     }
+    if (execMode) args.push(requireExecPrompt(settings));
     return { command, args };
   },
 };

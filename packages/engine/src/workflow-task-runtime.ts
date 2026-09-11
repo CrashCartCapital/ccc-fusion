@@ -275,11 +275,27 @@ export function formatCccPermanentWorkItemError(
   reason: string,
   error: unknown,
 ): string {
-  const detail = (error instanceof Error ? error.message : String(error ?? ""))
+  let detail = (error instanceof Error ? error.message : String(error ?? ""))
     .replace(/\s+/gu, " ")
     .trim();
-  if (detail.length === 0) return reason;
+  if (reason.length === 0) {
+    if (detail.length === 0) return reason;
+    const emptyReasonPrefix = `${reason}: `;
+    return `${emptyReasonPrefix}${detail.slice(
+      0,
+      Math.max(0, CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS - emptyReasonPrefix.length),
+    )}`;
+  }
   const prefix = `${reason}: `;
+  for (;;) {
+    if (detail === reason || detail === `${reason}:`) {
+      detail = "";
+      break;
+    }
+    if (!detail.startsWith(prefix)) break;
+    detail = detail.slice(prefix.length);
+  }
+  if (detail.length === 0) return reason;
   return `${prefix}${detail.slice(
     0,
     Math.max(0, CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS - prefix.length),

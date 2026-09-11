@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -14,7 +14,9 @@ import type {
 } from "@fusion/core";
 import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
 import {
+  type CccCampaignIgnoredBaseline,
   type CccCampaignReadyCommitHandoff,
+  snapshotCccCampaignIgnoredBaseline,
   verifyCccCampaignReadyCandidate,
 } from "../ccc-campaign-ready.js";
 import { enforceCccCampaignRequiredCommitAfterNode } from "../ccc-campaign-required-commit.js";
@@ -1298,5 +1300,93 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
       contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
     });
     expect(await git(h.worktree, "rev-parse", "HEAD")).not.toBe(h.baseCommit);
+  });
+
+  /*
+   * The engine writes its own worktree-ownership marker into every worktree it
+   * creates (.fusion/fusion-owner.json, git-ignored via .git/info/exclude), so
+   * every CCC campaign candidate carries one. `listCandidatePaths` reports
+   * ignored roots as candidate paths, so without the controller's trusted
+   * ignored baseline the readiness verifier classifies `.fusion` as a foreign
+   * path and refuses the commit. The step path passes that baseline; this
+   * required-commit seam is the fallback the CLI-agent path lands on, because a
+   * cli-agent node never produces a verified-candidate handoff.
+   */
+  it.each<ExecutorShape>(["model", "cli-agent"])(
+    "commits a %s candidate that carries the controller's own ignored ownership marker",
+    async (shape) => {
+      const h = await fixture(shape);
+      await appendFile(join(h.rootDir, ".git", "info", "exclude"), "\n.fusion/\n", "utf8");
+      await mkdir(join(h.worktree, ".fusion"), { recursive: true });
+      await writeFile(
+        join(h.worktree, ".fusion", "fusion-owner.json"),
+        `${JSON.stringify({ schema: "fusion.worktree-owner/v1" })}\n`,
+        "utf8",
+      );
+      expect(
+        await git(h.worktree, "check-ignore", "--", ".fusion/fusion-owner.json"),
+      ).toBe(".fusion/fusion-owner.json");
+      await writeFile(
+        join(h.worktree, "src", "task-0", "result.txt"),
+        "result\n",
+        "utf8",
+      );
+
+      const executor = new TaskExecutor(h.store, h.rootDir);
+      const successfulResult: WorkflowNodeResult = {
+        outcome: "success",
+        value: "passed",
+        contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+      };
+      vi.spyOn(executor as never, "runGraphCustomNode" as never)
+        .mockResolvedValue(successfulResult as never);
+      // Stand in for the capture ensureGraphCustomNodeWorktree() performs at
+      // acquisition, which this fixture's pre-existing worktree skips.
+      (executor as unknown as {
+        cccControllerIgnoredBaselines: Map<string, CccCampaignIgnoredBaseline>;
+      }).cccControllerIgnoredBaselines.set(
+        h.task.id,
+        await snapshotCccCampaignIgnoredBaseline({ worktreePath: h.worktree }),
+      );
+
+      await expect(
+        executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+          node(shape),
+          h.task,
+          {},
+          sealedExecutionContext(h.task),
+        ),
+      ).resolves.toEqual(successfulResult);
+
+      const campaignHead = await git(h.worktree, "rev-parse", "HEAD");
+      expect(campaignHead).not.toBe(h.baseCommit);
+      expect(
+        await git(h.worktree, "diff", "--name-only", "--no-renames", h.baseCommit, campaignHead),
+      ).toBe("src/task-0/result.txt");
+    },
+  );
+
+  it("still refuses a candidate whose trusted ignored baseline drifted", async () => {
+    const h = await fixture("cli-agent");
+    await appendFile(join(h.rootDir, ".git", "info", "exclude"), "\n.fusion/\n", "utf8");
+    await mkdir(join(h.worktree, ".fusion"), { recursive: true });
+    await writeFile(join(h.worktree, ".fusion", "fusion-owner.json"), "owner\n", "utf8");
+    const baseline = await snapshotCccCampaignIgnoredBaseline({ worktreePath: h.worktree });
+    // The provider rewrote a controller-initialized ignored path after dispatch.
+    await writeFile(join(h.worktree, ".fusion", "fusion-owner.json"), "tampered\n", "utf8");
+    await writeFile(join(h.worktree, "src", "task-0", "result.txt"), "result\n", "utf8");
+
+    await expect(enforceCccCampaignRequiredCommitAfterNode({
+      rootDir: h.rootDir,
+      store: h.store,
+      taskId: h.task.id,
+      result: { outcome: "success", value: "passed" },
+      executionContext: sealedExecutionContext(h.task),
+      trustedIgnoredBaseline: baseline,
+    } as never)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("controller-initialized ignored paths changed"),
+    });
   });
 });

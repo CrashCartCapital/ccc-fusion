@@ -520,10 +520,19 @@ export class ProjectEngineManager {
     // the marker set here would make hasRunningEngine() report a phantom engine.
     this.externalEngines.delete(projectId);
 
+    const engineInstanceId = randomUUID();
+    const worktreeOwnershipContext = Object.freeze({
+      projectId,
+      projectRoot: runtimeConfig.workingDirectory,
+      engineInstanceId,
+      mutationAuthority: singleton,
+    });
+
     const engine = new ProjectEngine(
       {
         ...runtimeConfig,
-        engineInstanceId: randomUUID(),
+        engineInstanceId,
+        worktreeOwnershipContext,
       },
       this.centralCore,
       engineOptions,

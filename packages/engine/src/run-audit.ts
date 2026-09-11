@@ -149,6 +149,7 @@ export type GitMutationType =
    * ```
    */
   | "worktree:admin-entry-pruned"
+  | "worktree:removal-refused-unowned"
   | "worktree:removal-refused-active-session"
   | "worktree:removal-forced-over-active-session"
   | "worktree:active-session-reconciled"
