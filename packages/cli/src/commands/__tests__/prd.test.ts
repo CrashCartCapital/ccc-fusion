@@ -121,6 +121,23 @@ function generatedAuthorArgs(
   ];
 }
 
+/**
+ * The semantic-proof sandbox has a Darwin-only backend, so the real readiness
+ * probe reports "unavailable" on a Linux CI runner and the preflight refuses
+ * before the assertion under test can run. Any test that pins
+ * `preflightPlatform` must pin this probe too; only the tests that are *about*
+ * sandbox readiness should let it vary.
+ */
+function readySemanticProofSandbox() {
+  return vi.fn(async () => ({
+    ready: true,
+    backend: "sandbox-exec" as const,
+    code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+    message: "semantic-proof sandbox-exec backend is available",
+    trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+  }));
+}
+
 function generatedAuthorHarness(
   packet: ReturnType<typeof createPacketRoot>,
   overrides: Record<string, unknown> = {},
@@ -145,13 +162,7 @@ function generatedAuthorHarness(
   const bootstrapProofAdmission = vi.fn(async () => ({}) as never);
   const readTargetHead = vi.fn(async () => packet.base);
   const resolveSemanticProofToolchainPaths = vi.fn(() => packet.semanticProofToolchainPaths!);
-  const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
-    ready: true,
-    backend: "sandbox-exec" as const,
-    code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
-    message: "semantic-proof sandbox-exec backend is available",
-    trustedPaths: ["/usr/bin/sandbox-exec"] as const,
-  }));
+  const inspectSemanticProofSandboxReadiness = readySemanticProofSandbox();
   const dependencies = {
     authorCccPrdPacket: authorCccPrdPacket as never,
     bootstrapProofAdmission,
@@ -372,6 +383,7 @@ describe("prd command exit contract", () => {
       authorCccPrdPacket: authorCccPrdPacket as never,
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
       preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
@@ -671,6 +683,7 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       bootstrapProofAdmission,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
       preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(1);
@@ -789,6 +802,7 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       createNativeCccPrdAuthoringAdapter: createAdapter,
       bootstrapProofAdmission,
+      inspectSemanticProofSandboxReadiness: readySemanticProofSandbox(),
       preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: () => {
         throw new Error("built proof host missing");
