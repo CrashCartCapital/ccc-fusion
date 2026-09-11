@@ -13,7 +13,10 @@ import {
   resolveCccCampaignReadyTimeoutMs,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
-import type { CccCampaignReadyCommitHandoff } from "./ccc-campaign-ready.js";
+import type {
+  CccCampaignIgnoredBaseline,
+  CccCampaignReadyCommitHandoff,
+} from "./ccc-campaign-ready.js";
 import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
 import type {
@@ -53,6 +56,21 @@ export interface EnforceCccCampaignRequiredCommitInput {
   result: WorkflowNodeResult;
   executionContext?: WorkflowNodeExecutionContext;
   verifiedCandidateHandoff?: CccCampaignReadyCommitHandoff;
+  /*
+   * FNXC:CccCampaignReadyIgnoredBaseline 2026-09-11-02:00:
+   * The controller's snapshot of the ignored paths it initialized in this
+   * worktree before dispatch — in practice Fusion's own git-ignored
+   * `.fusion/fusion-owner.json` ownership marker, written while the worktree
+   * was created. The readiness verifier lists ignored roots as candidate
+   * paths, so without this baseline it classifies the controller's own marker
+   * as a foreign path and refuses the commit. The step path (executor
+   * `runWorkflowStep`) already passes it to the same verifier; this seam is
+   * the one a `cli-agent` node lands on, because that node returns through
+   * `runCliAgentNode` and never produces a verified-candidate handoff. Passing
+   * it also arms the fingerprint drift check, so a provider that rewrites a
+   * controller-initialized ignored path is still refused.
+   */
+  trustedIgnoredBaseline?: CccCampaignIgnoredBaseline;
   verificationCommandTimeoutMs?: number;
   onVerificationHeartbeat?: () => void;
 }
@@ -979,6 +997,7 @@ async function inspectRequiredCommit(
     signal?: AbortSignal;
     onHeartbeat?: () => void;
     verifiedCandidateHandoff?: CccCampaignReadyCommitHandoff;
+    trustedIgnoredBaseline?: CccCampaignIgnoredBaseline;
   }>,
 ): Promise<void> {
   const {
@@ -1021,6 +1040,9 @@ async function inspectRequiredCommit(
         timeoutMs: verification.timeoutMs,
         signal: verification.signal,
         onHeartbeat: verification.onHeartbeat,
+        ...(verification.trustedIgnoredBaseline
+          ? { trustedIgnoredBaseline: verification.trustedIgnoredBaseline }
+          : {}),
       });
       if (!readiness.ready) {
         refusal(
@@ -1205,6 +1227,9 @@ export async function enforceCccCampaignRequiredCommitAfterNode(
       signal: input.executionContext.signal,
       onHeartbeat: input.onVerificationHeartbeat,
       verifiedCandidateHandoff,
+      ...(input.trustedIgnoredBaseline
+        ? { trustedIgnoredBaseline: input.trustedIgnoredBaseline }
+        : {}),
     },
   );
 }

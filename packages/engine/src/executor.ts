@@ -9653,11 +9653,17 @@ export class TaskExecutor {
       });
     }
     try {
+      const nodeTrustedIgnoredBaseline = this.cccControllerIgnoredBaselines.get(
+        nodeTask.id,
+      );
       await enforceCccCampaignRequiredCommitAfterNode({
           rootDir: this.rootDir,
           store: this.store,
           taskId: nodeTask.id,
           result,
+          ...(nodeTrustedIgnoredBaseline
+            ? { trustedIgnoredBaseline: nodeTrustedIgnoredBaseline }
+            : {}),
           executionContext,
           verifiedCandidateHandoff: phaseVerificationKey
             ? this.cccPhaseVerifiedCandidateHandoffs.get(phaseVerificationKey)
