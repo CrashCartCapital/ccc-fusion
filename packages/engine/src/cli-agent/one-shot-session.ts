@@ -30,6 +30,7 @@
 
 import type { CliSessionPurpose } from "@fusion/core";
 
+import { decodeJsonObjectLine } from "./jsonl-line-scan.js";
 import type { CliSessionManager } from "./session-manager.js";
 
 // ── Bounds ────────────────────────────────────────────────────────────────
@@ -175,19 +176,16 @@ function pickString(obj: Record<string, unknown>, keys: string[]): string | null
  */
 export function extractJsonObjects(output: string): Record<string, unknown>[] {
   const objects: Record<string, unknown>[] = [];
-  // First try JSONL: each non-empty line that decodes to an object.
+  // First try JSONL: each non-empty line that decodes to an object. The line
+  // decode itself is shared with the Codex exec-mode usage observer (see
+  // jsonl-line-scan.ts) so the two scanners cannot drift on what counts as a
+  // decodable JSONL line.
   let sawLineJson = false;
   for (const line of output.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) continue;
-    try {
-      const v = JSON.parse(trimmed);
-      if (v && typeof v === "object") {
-        objects.push(v as Record<string, unknown>);
-        sawLineJson = true;
-      }
-    } catch {
-      // not a standalone JSON line; fall through to brace scanning below.
+    const obj = decodeJsonObjectLine(line);
+    if (obj) {
+      objects.push(obj);
+      sawLineJson = true;
     }
   }
   if (sawLineJson) return objects;

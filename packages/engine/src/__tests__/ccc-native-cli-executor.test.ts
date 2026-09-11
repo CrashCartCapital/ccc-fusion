@@ -182,6 +182,10 @@ function createHeldClosureReceipt(
   authorityBindingHash: string,
   trigger: "done" | "exit" | "cancel" | "lifetime" = "done",
   sessionId = "cli-session-1",
+  // This suite's fixture adapter is not "codex" exec-mode, so the session
+  // manager never attaches a usage observer (usage-lane U2) — null by
+  // default; usage-lane tests override this to prove the captured-usage path.
+  usage: { inputTokens: number; outputTokens: number } | null = null,
 ) {
   return Object.freeze({
     kind: "ccc-fusion.native-cli-held-closure",
@@ -200,6 +204,7 @@ function createHeldClosureReceipt(
     proxyClosed: true,
     durableFloorFlushed: true,
     slotHeld: true,
+    usage: usage === null ? null : Object.freeze(usage),
   });
 }
 
@@ -625,6 +630,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
           proxyClosed: true,
           durableFloorFlushed: true,
           slotHeld: true,
+          usage: receipt.usage,
         },
       },
     });
@@ -665,6 +671,87 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
           usage: null,
           cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
           receiptSource: "none",
+        },
+      }));
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
+  });
+
+  it("RED-U4-1: restart reconciliation records a durably persisted captured usage honestly", async () => {
+    const h = createHarness(({ scope }) => Object.freeze({
+      kind: "hold",
+      reason: "dispatched-unknown",
+      scope,
+    }));
+    const permitScope = createPermitScope(h.context, h.turnKey, h.authorityBinding);
+    const receipt = createHeldClosureReceipt(
+      permitScope,
+      h.authorityBinding.bindingHash,
+      "done",
+      "cli-session-1",
+      { inputTokens: 24327, outputTokens: 5 },
+    );
+    h.runtimeSessions.push({
+      id: receipt.sessionId,
+      taskId: permitScope.taskId,
+      purpose: "execute",
+      adapterId: h.route.adapterId,
+      agentState: "needsAttention",
+      terminationReason: null,
+      worktreePath: "/tmp/cli-test",
+      autonomyPosture: {
+        cccNativeCliOneShot: true,
+        cccProviderAttemptKey: permitScope.attemptKey,
+        cccProviderAttemptControllerToken: permitScope.controllerToken,
+        cccControllerGeneration: permitScope.controllerToken,
+        cccControllerFenced: false,
+        cccAuthorityBindingHash: h.authorityBinding.bindingHash,
+        cccNativeCliTurnKey: permitScope.turnKey,
+        cccNativeCliDispatchKey: permitScope.dispatchKey,
+        cccNativeCliClosureState: "held-closed",
+        cccNativeCliHeldClosureEvidence: {
+          kind: "ccc-fusion.native-cli-held-closure-evidence",
+          version: 1,
+          sessionId: receipt.sessionId,
+          trigger: receipt.trigger,
+          exitCode: receipt.exitCode,
+          exitSignal: receipt.exitSignal,
+          processGroupClosed: true,
+          proxyClosed: true,
+          durableFloorFlushed: true,
+          slotHeld: true,
+          // Read back exactly as JSON.parse would hand it — a plain,
+          // unfrozen object, never Object.freeze'd (usage-lane U2).
+          usage: { inputTokens: 24327, outputTokens: 5 },
+        },
+      },
+    });
+    vi.mocked(h.binding.observer.observe).mockImplementationOnce(() => {
+      h.sequence.push("observe-restart");
+      return Object.freeze({
+        kind: "ccc-fusion.native-cli-observation",
+        version: 1,
+        outcome: "committed",
+        evidenceDigest: "e".repeat(64),
+      });
+    });
+
+    try {
+      await expect(h.run()).resolves.toEqual({
+        outcome: "success",
+        value: "cli-agent-done",
+      });
+      expect(h.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        effectiveRoute: {
+          effectiveProvider: h.route.providerId,
+          effectiveModel: h.route.modelId,
+          usage: { inputTokens: 24327, outputTokens: 5 },
+          cost: {
+            kind: "unknown",
+            reason: "subscription-billed transport; tokens observed, no per-token charge; model identity not reported",
+          },
+          receiptSource: "stream-usage",
         },
       }));
     } finally {
@@ -1017,6 +1104,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observation = Object.freeze({
       kind: "ccc-fusion.native-cli-observation",
@@ -1106,6 +1194,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observation = Object.freeze({
       kind: "ccc-fusion.native-cli-observation",
@@ -1170,6 +1259,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observation = Object.freeze({
       kind: "ccc-fusion.native-cli-observation",
@@ -1235,6 +1325,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observerError = new Error("observer threw");
     vi.mocked(h.binding.observer.observe).mockImplementation(() => {
@@ -1289,6 +1380,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observation = Object.freeze({
       kind: "ccc-fusion.native-cli-observation",
@@ -1357,6 +1449,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     const observation = Object.freeze({
       kind: "ccc-fusion.native-cli-observation",
@@ -1458,6 +1551,50 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         usage: null,
         cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
         receiptSource: "none",
+      },
+    }));
+  });
+
+  it("RED-U4-2: live held-closure settlement records a captured Codex exec usage honestly, with a truthful cost reason and stream-usage receiptSource", async () => {
+    const h = createHarness();
+    const permitScope = createPermitScope(h.context, h.turnKey, h.authorityBinding);
+    const receipt = createHeldClosureReceipt(
+      permitScope,
+      h.authorityBinding.bindingHash,
+      "done",
+      "cli-session-1",
+      { inputTokens: 100, outputTokens: 10 },
+    );
+    const observation = Object.freeze({
+      kind: "ccc-fusion.native-cli-observation",
+      version: 1,
+      outcome: "committed" as const,
+      evidenceDigest: "e".repeat(64),
+    });
+    vi.mocked(h.binding.observer.observe).mockReturnValueOnce(observation);
+    h.launchCliTaskSession.mockImplementationOnce(async () => ({
+      sessionId: "cli-session-1",
+      result: async () => ({
+        kind: "ccc-native-held-closed" as const,
+        sessionId: "cli-session-1",
+        terminationReason: null,
+        nativeCliHeldClosureReceipt: receipt,
+      }),
+      reap: async () => undefined,
+      releaseCccNativeCli: async () => undefined,
+    }));
+
+    await expect(h.run()).resolves.toMatchObject({ outcome: "success" });
+    expect(h.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: { inputTokens: 100, outputTokens: 10 },
+        cost: {
+          kind: "unknown",
+          reason: "subscription-billed transport; tokens observed, no per-token charge; model identity not reported",
+        },
+        receiptSource: "stream-usage",
       },
     }));
   });

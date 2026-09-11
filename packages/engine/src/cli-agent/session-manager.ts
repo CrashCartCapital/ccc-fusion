@@ -71,6 +71,8 @@ import {
   validateCccNativeCliSessionPolicy,
   validateCccNativeCliTerminalScope,
 } from "./ccc-native-cli-binding.js";
+import { isCodexExecMode, type CodexLaunchSettings } from "./adapters/codex.js";
+import { computeCodexExecAttemptUsage, CodexExecUsageObserver } from "./codex-exec-usage.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -759,6 +761,13 @@ interface LiveSession {
   cccNativeCliLifetimeTimer?: ReturnType<typeof setTimeout>;
   /** Deferred `exit` close, held open so an in-flight `done` can win the close. */
   cccNativeCliExitGraceTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Usage-lane U2: present only for exec-mode Codex sessions (`adapter.id ===
+   * "codex" && isCodexExecMode(settings)`). Fed every raw PTY chunk in
+   * handleData; its `.usage` is the last observed `turn.completed.usage`, or
+   * null before/absent a turn.completed event.
+   */
+  codexExecUsage?: CodexExecUsageObserver;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -1177,6 +1186,10 @@ export class CliSessionManager {
       cccNativeCliPolicy,
       cccNativeCliHeldClosure: null,
       cccNativeCliHeldClosureWaiters: [],
+      // Usage-lane U2: only exec-mode Codex sessions get a usage observer.
+      ...(adapter.id === "codex" && isCodexExecMode(launchSettings as CodexLaunchSettings)
+        ? { codexExecUsage: new CodexExecUsageObserver() }
+        : {}),
     };
     this.sessions.set(record.id, live);
     this.armCccNativeCliLifetimeTimer(live);
@@ -1224,6 +1237,10 @@ export class CliSessionManager {
 
   private handleData(live: LiveSession, data: string): void {
     live.lastOutputAt = Date.now();
+
+    // Usage-lane U2: exec-mode Codex sessions only (undefined for every
+    // other session — see spawn()).
+    live.codexExecUsage?.observe(data);
 
     // Track bracketed-paste negotiation by scanning the raw output text.
     if (data.includes(BRACKETED_PASTE_ENABLE)) {
@@ -1707,11 +1724,25 @@ export class CliSessionManager {
 
     const exitCode = live.exitResult?.exitCode ?? -1;
     const exitSignal = live.exitResult?.signal ?? 0;
+    // Usage-lane U2/U3: flush the trailing partial line (the process may have
+    // exited right after writing turn.completed with no final newline), then
+    // read the last observed cumulative usage. CCC native CLI bindings are
+    // always `followUp: false` (ccc-native-cli-production-resolver.ts) —
+    // every dispatch is a fresh `codex exec` thread, never a resume — so the
+    // thread's cumulative total IS this attempt's usage; there is no
+    // prior-attempt baseline to subtract.
+    live.codexExecUsage?.flush();
+    const usage = computeCodexExecAttemptUsage({
+      observed: live.codexExecUsage?.usage ?? null,
+      isResumedThread: false,
+      priorCumulativeUsageForThread: null,
+    });
     const heldClosureEvidence = buildCccNativeCliHeldClosureEvidence({
       sessionId: live.id,
       trigger,
       exitCode,
       exitSignal,
+      usage,
     });
     await this.updateCccNativeCliHeldRow(live, policy, heldClosureEvidence);
     await this.store.flush();

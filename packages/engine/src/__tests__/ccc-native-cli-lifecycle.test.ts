@@ -235,6 +235,9 @@ function expectedReceipt(sessionId: string, trigger: string, exitCode = -1, exit
     proxyClosed: true,
     durableFloorFlushed: true,
     slotHeld: true,
+    // This suite's fixture adapter is not "codex" exec-mode, so the session
+    // manager never attaches a usage observer (usage-lane U2).
+    usage: null,
   };
 }
 
@@ -304,6 +307,7 @@ describe("CCC native CLI campaign-held lifecycle", () => {
       proxyClosed: true,
       durableFloorFlushed: true,
       slotHeld: true,
+      usage: null,
     });
     expect(store.flush).toHaveBeenCalled();
     expect(receipt).toEqual(expectedReceipt(session.id, "cancel"));

@@ -233,7 +233,7 @@ import {
   validateCccNativeCliTerminalScope,
   restoreCccNativeCliHeldClosureReceipt,
 } from "./cli-agent/ccc-native-cli-binding.js";
-import type { CccProviderAttemptScope, CliSession, CliSessionStore } from "@fusion/core";
+import type { CccProviderAttemptScope, CccProviderAttemptUsage, CliSession, CliSessionStore } from "@fusion/core";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -313,6 +313,36 @@ function selectCccNativeCliHeldClosureReceipt(
       dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
     },
   );
+}
+
+/** No usage was ever observed for this CLI dispatch (non-Codex adapter, non-exec-mode Codex, or an exec-mode session that closed before any turn.completed). */
+const CCC_NATIVE_CLI_NO_USAGE_TELEMETRY_REASON = "cli-adapter-observes-no-usage-or-identity-telemetry";
+/** Usage-lane U4: Codex exec-mode's usage IS observed, but the ChatGPT-subscription transport carries no per-token dollar charge and no event reports model identity. */
+const CCC_NATIVE_CLI_OBSERVED_USAGE_COST_REASON =
+  "subscription-billed transport; tokens observed, no per-token charge; model identity not reported";
+
+/**
+ * Honest "this is what we launched" identity, not an independent
+ * confirmation — the CLI adapter never reports model identity, so cost stays
+ * `unknown` either way (usage-lane U4). When the held-closure receipt
+ * carries a captured usage total (currently: Codex exec-mode only, see
+ * codex-exec-usage.ts), record it truthfully with receiptSource
+ * "stream-usage"; otherwise the adapter genuinely observed no usage/identity
+ * telemetry at all.
+ */
+function cccNativeCliEffectiveRouteFor(
+  route: Readonly<{ providerId: string; modelId: string }>,
+  usage: CccProviderAttemptUsage | null,
+) {
+  return {
+    effectiveProvider: route.providerId,
+    effectiveModel: route.modelId,
+    usage,
+    cost: usage
+      ? { kind: "unknown" as const, reason: CCC_NATIVE_CLI_OBSERVED_USAGE_COST_REASON }
+      : { kind: "unknown" as const, reason: CCC_NATIVE_CLI_NO_USAGE_TELEMETRY_REASON },
+    receiptSource: usage ? ("stream-usage" as const) : ("none" as const),
+  };
 }
 import {
   BranchConflictError,
@@ -10424,15 +10454,7 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
-          // Honest "this is what we launched" identity, not an independent
-          // confirmation — the CLI adapter has no usage/cost telemetry.
-          effectiveRoute: {
-            effectiveProvider: binding.route.providerId,
-            effectiveModel: binding.route.modelId,
-            usage: null,
-            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
-            receiptSource: "none" as const,
-          },
+          effectiveRoute: cccNativeCliEffectiveRouteFor(binding.route, receipt.usage),
         })), {
           permitScope: heldScope,
           observation,
@@ -10652,15 +10674,7 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
-          // Honest "this is what we launched" identity, not an independent
-          // confirmation — the CLI adapter has no usage/cost telemetry.
-          effectiveRoute: {
-            effectiveProvider: nativeCliBinding.route.providerId,
-            effectiveModel: nativeCliBinding.route.modelId,
-            usage: null,
-            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
-            receiptSource: "none" as const,
-          },
+          effectiveRoute: cccNativeCliEffectiveRouteFor(nativeCliBinding.route, receipt.usage),
         })), {
           permitScope: nativeCliPermitScope,
           observation,
