@@ -205,33 +205,43 @@ jobs:
       # the userland way instead. bwrap CANNOT be provisioned on this lane at
       # all — it needs privileged setup — so the bwrap-only suites stay red here
       # until PR-B gives them an explicit named skip.
-      - name: Setup Python for the proof adapter
-        uses: actions/setup-python@v5
+      # Why uv and not actions/setup-python: the setup-python Linux build is a
+      # shared-libpython interpreter that only starts when LD_LIBRARY_PATH
+      # points at its lib/ (the action exports that variable for later steps).
+      # The proof adapter (templates/ccc-python-proof-adapter/verify_wrapper.py,
+      # closed_runner_environment) deliberately re-spawns sys.executable with a
+      # closed environment that carries no LD_LIBRARY_PATH, so every report
+      # command died with exit 127 in run 34671894956 ("report command exited
+      # nonzero (127)", 12 adapter tests). A uv-managed CPython is
+      # self-contained (rpath-relative), so the closed re-spawn works. Same
+      # mechanism the Darwin lane uses (#86); no root needed on either.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.12"
+          version: "0.12.0"
           # No cloud cache on a self-hosted runner: the restore/save round trip
           # costs more than the install it would avoid.
-          cache: ""
-        env:
-          # The python-versions install script ignores RUNNER_TOOL_CACHE and
-          # defaults to a hosted-runner path (/Users/runner or
-          # /opt/hostedtoolcache) unless this is set. Point it at this runner's
-          # own tool cache so a self-hosted runner never tries to mkdir outside
-          # its root (first Darwin run failed with "mkdir: /Users/runner:
-          # Permission denied").
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
+          enable-cache: false
 
       # ccc-python-proof-adapter spawns the interpreter with PYTHONNOUSERSITE=1
       # and no PYTHONPATH, so a `--user` install is invisible to it. Install
-      # into this interpreter's own site-packages and prove the import works
-      # through `python3` (the name the adapter actually resolves).
-      - name: Install pytest into the setup-python interpreter
+      # pytest into the venv's own site-packages and prove the import works
+      # through `python3` (the name the adapter actually resolves) with the
+      # same closed environment the adapter uses.
+      - name: Provision Python 3.12 and pytest with uv
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check pytest==8.4.2
-          python3 -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
+          uv --version
+          uv python install 3.12
+          uv venv --python 3.12 "$RUNNER_TEMP/proof-venv"
+          uv pip install --python "$RUNNER_TEMP/proof-venv/bin/python" pytest==8.4.2
+          echo "$RUNNER_TEMP/proof-venv/bin" >> "$GITHUB_PATH"
+          env -i PYTHONNOUSERSITE=1 "$RUNNER_TEMP/proof-venv/bin/python3" -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
         env:
-          PYTHONNOUSERSITE: "1"
+          # Persist the managed interpreter in this runner's tool cache so
+          # repeat runs skip the download; keep uv's own cache per run.
+          UV_PYTHON_INSTALL_DIR: ${{ runner.tool_cache }}/uv-python
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
 
       # Same Go Task provisioning the test-slow job uses (npm prefix into
       # RUNNER_TEMP, bin appended to GITHUB_PATH). Verifier/proof suites resolve
