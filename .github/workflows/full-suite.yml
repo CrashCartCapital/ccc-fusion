@@ -212,6 +212,14 @@ jobs:
           # No cloud cache on a self-hosted runner: the restore/save round trip
           # costs more than the install it would avoid.
           cache: ""
+        env:
+          # The python-versions install script ignores RUNNER_TOOL_CACHE and
+          # defaults to a hosted-runner path (/Users/runner or
+          # /opt/hostedtoolcache) unless this is set. Point it at this runner's
+          # own tool cache so a self-hosted runner never tries to mkdir outside
+          # its root (first Darwin run failed with "mkdir: /Users/runner:
+          # Permission denied").
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
 
       # ccc-python-proof-adapter spawns the interpreter with PYTHONNOUSERSITE=1
       # and no PYTHONPATH, so a `--user` install is invisible to it. Install
@@ -568,6 +576,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: ""
+        env:
+          # See the shard step: without this the macOS installer targets
+          # /Users/runner and fails on a self-hosted runner.
+          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
 
       - name: Install pytest into the setup-python interpreter
         run: |
