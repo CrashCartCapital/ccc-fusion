@@ -49,3 +49,16 @@ export {
   renderCccPrdOperatorContextMarkdown,
 } from "./operator-context.js";
 export type { CccPrdOperatorContext } from "./operator-context.js";
+export {
+  CCC_PRD_OSS_REUSE_EVALUATOR_VERSION,
+  evaluateCccPrdOssReuseAdmission,
+  recordCccPrdOssReferenceLearning,
+  selectCccPrdOssPackage,
+} from "./oss-reuse-admission.js";
+export type {
+  CccPrdOssCandidateDiagnostic,
+  CccPrdOssPackageSelection,
+  CccPrdOssReferenceLearning,
+  CccPrdOssReuseDecisionKind,
+  CccPrdOssReuseRecommendation,
+} from "./oss-reuse-admission.js";
