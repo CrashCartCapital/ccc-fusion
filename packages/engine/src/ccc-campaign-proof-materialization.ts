@@ -84,6 +84,11 @@ const MACH_O_MAGICS = new Set([
   0xcafebabf,
   0xbfbafeca,
 ]);
+// ELF's first four bytes are the literal ASCII/octet sequence 0x7f 'E' 'L' 'F',
+// not a numeric magic subject to target-architecture endianness (that field
+// comes later, at offset 5), so a single big-endian read is exact on every
+// linux architecture.
+const ELF_MAGIC = 0x7f454c46;
 
 export type CccSemanticProofMaterializationInput = {
   repositoryRoot: string;
@@ -1183,6 +1188,29 @@ async function isDarwinMachOFile(path: string): Promise<boolean> {
   return MACH_O_MAGICS.has(bytes.readUInt32BE(0)) || MACH_O_MAGICS.has(bytes.readUInt32LE(0));
 }
 
+// Pure, filesystem-free classifier: true when `bytes` open a native platform
+// executable that a `--version` probe must run directly rather than hand to
+// sealed Node as a script -- a Mach-O binary on darwin, or an ELF binary on
+// linux (the sealed proof host on Linux CI is Node's own ELF binary, and
+// `node <elf> --version` fails with a JS parse error on the ELF magic).
+// Exported standalone so both platforms' magic-byte handling is unit-testable
+// from either host, independent of `process.platform`.
+export function isNativeExecutableBytes(bytes: Buffer, platform: NodeJS.Platform): boolean {
+  if (bytes.length < 4) return false;
+  if (platform === "darwin") {
+    return MACH_O_MAGICS.has(bytes.readUInt32BE(0)) || MACH_O_MAGICS.has(bytes.readUInt32LE(0));
+  }
+  if (platform === "linux") {
+    return bytes.readUInt32BE(0) === ELF_MAGIC;
+  }
+  return false;
+}
+
+async function isNativeExecutableFile(path: string): Promise<boolean> {
+  const bytes = await readFile(path);
+  return isNativeExecutableBytes(bytes, process.platform);
+}
+
 async function inspectDarwinLinkedLibraries(path: string): Promise<string | undefined> {
   try {
     const { stdout } = await execFile("/usr/bin/otool", ["-L", path], {
@@ -1616,8 +1644,8 @@ async function sealedProofHostIdentity(
   id: string,
 ): Promise<CccPrdProofExecutionToolchain["proofHost"]> {
   const observed = await inspectExecutableBytes(proofHostPath);
-  const isMachOProofHost = await isDarwinMachOFile(observed.canonicalPath);
-  const version = isMachOProofHost
+  const isNativeProofHost = await isNativeExecutableFile(observed.canonicalPath);
+  const version = isNativeProofHost
     ? await inspectExecutableVersion(observed.canonicalPath, EXECUTABLE_VERSION_ARGS)
     : await (async (): Promise<Pick<CccPrdExecutableIdentity, "version" | "versionOutputSha256">> => {
       const { stdout, stderr } = await runExecutableVersionProbe(
