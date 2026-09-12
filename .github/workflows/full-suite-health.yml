@@ -1,0 +1,49 @@
+name: Full Suite health
+
+# .archive/full-suite-red-diagnosis-20260911.md: Full Suite (non-blocking) has
+# been red since 2026-08-11 with zero alerting anywhere in the repo — no
+# notify/webhook/issue step in any workflow, and the quarantine ratchet's
+# ledger (flakes only, not real bugs, by its own written policy) had been
+# empty since 2026-08-31. This workflow is the heartbeat: it runs the ledger's
+# own strict deadline check, then scripts/full-suite-health.mjs, which reads
+# the last 10 full-suite.yml runs on main via the GitHub API and opens or
+# updates ONE tracking issue on a red streak or a lane that silently stopped
+# executing (engine-slow, the Darwin proof lane). It never touches
+# full-suite.yml itself and it is never a merge gate.
+
+on:
+  schedule:
+    # Daily ~06:53 America/Los_Angeles (PDT). Offset from surface-system's
+    # existing "17 12 * * *" (05:17 PT) daily job so the two repos' scheduled
+    # runs land at different times rather than both firing on the hour.
+    - cron: "53 13 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+# FN-4863: Opt JavaScript actions into Node 24 ahead of GitHub's forced cutover on 2026-06-02.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  full-suite-health:
+    name: Full Suite health
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Quarantine ledger deadline check (strict)
+        run: pnpm check:quarantine-ledger --strict
+
+      - name: Full Suite health report
+        run: node scripts/full-suite-health.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
