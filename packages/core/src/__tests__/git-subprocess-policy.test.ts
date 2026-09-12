@@ -85,13 +85,16 @@ describe("test git subprocess policy", () => {
     expect(directoryRefusal).toContain(`workerRoot=${context.workerRoot}`);
     expect(directoryRefusal).toContain(outside);
 
-    // The exact shape the Linux shards hit: an in-worker -C target with a
-    // hardening -c option that the allowlist does not name.
+    // core.fsmonitor=false and core.hooksPath=<null device> are now allowlisted
+    // (production hardening in ccc-campaign-local-git.ts runGitRaw, among
+    // others, passes them unconditionally -- see the dedicated allowlist tests
+    // below). A hardening -c option the allowlist still does not name, such as
+    // a mismatched boolean, is the shape that must keep refusing.
     const configRefusal = (() => {
       try {
         resolveTrustedTestGitFile(
           TRUSTED_GIT,
-          ["-c", "core.fsmonitor=false", "-C", context.cwd, "rev-parse", "--is-inside-work-tree"],
+          ["-c", "core.fsmonitor=true", "-C", context.cwd, "rev-parse", "--is-inside-work-tree"],
           context,
         );
         throw new Error("expected a refusal");
@@ -101,7 +104,7 @@ describe("test git subprocess policy", () => {
     })();
 
     expect(configRefusal).toContain("rule=config-option-not-allowlisted");
-    expect(configRefusal).toContain("core.fsmonitor=false");
+    expect(configRefusal).toContain("core.fsmonitor=true");
 
     const envRefusal = (() => {
       try {
@@ -117,6 +120,93 @@ describe("test git subprocess policy", () => {
 
     expect(envRefusal).toContain("rule=git-path-env-outside-worker-root");
     expect(envRefusal).toContain("GIT_WORK_TREE");
+  });
+
+  it("allows the git-worker-root hardening config production Git wrappers pass unconditionally", () => {
+    const context = policyContext();
+    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+
+    // ccc-campaign-local-git.ts runGitRaw, ccc-campaign-required-commit.ts and
+    // ccc-campaign-join-base.ts all pass core.fsmonitor=false and
+    // core.hooksPath=<null device> on every invocation as containment-neutral
+    // hardening (disable the fsmonitor daemon; disable hooks by pointing
+    // hooksPath at the null device). runGitRaw additionally passes
+    // core.untrackedCache=false on `ls-files --others` invocations. On Linux
+    // CI this policy refused all of them with
+    // rule=config-option-not-allowlisted -- the guard only trips there
+    // because wellKnownGitBinaryPaths never treats a macOS developer git
+    // binary as "trusted", so the strict branch was Linux-only.
+    expect(resolveTrustedTestGitFile(
+      TRUSTED_GIT,
+      [
+        "-c", "core.fsmonitor=false",
+        "-c", `core.hooksPath=${nullDevice}`,
+        "-c", "core.untrackedCache=false",
+        "-C", context.cwd, "ls-files", "--others",
+      ],
+      context,
+    )).toBe(TRUSTED_GIT);
+
+    // Each option is accepted independently of the others and regardless of
+    // ordering, matching how the production call sites order them
+    // differently from one another.
+    expect(resolveTrustedTestGitFile(
+      TRUSTED_GIT,
+      ["-c", `core.hooksPath=${nullDevice}`, "-c", "core.fsmonitor=false", "-C", context.cwd, "status", "--short"],
+      context,
+    )).toBe(TRUSTED_GIT);
+    expect(resolveTrustedTestGitFile(
+      TRUSTED_GIT,
+      ["-c", "core.fsmonitor=false", "-C", context.cwd, "status", "--short"],
+      context,
+    )).toBe(TRUSTED_GIT);
+    expect(resolveTrustedTestGitFile(
+      TRUSTED_GIT,
+      ["-c", `core.hooksPath=${nullDevice}`, "-C", context.cwd, "status", "--short"],
+      context,
+    )).toBe(TRUSTED_GIT);
+    expect(resolveTrustedTestGitFile(
+      TRUSTED_GIT,
+      ["-c", "core.untrackedCache=false", "-C", context.cwd, "ls-files", "--others"],
+      context,
+    )).toBe(TRUSTED_GIT);
+  });
+
+  it("keeps refusing hardening-shaped -c options the allowlist does not name exactly", () => {
+    const context = policyContext();
+    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+    const wrongHooksPath = "/somewhere/else";
+
+    const refusalFor = (config: string): string => {
+      try {
+        resolveTrustedTestGitFile(TRUSTED_GIT, ["-c", config, "-C", context.cwd, "status"], context);
+        throw new Error(`expected a refusal for -c ${config}`);
+      } catch (error) {
+        return (error as Error).message;
+      }
+    };
+
+    // A hooksPath value that is not the platform null device stays refused --
+    // hooks execute arbitrary code, so the allowlist matches the exact device
+    // path rather than any core.hooksPath value.
+    expect(refusalFor(`core.hooksPath=${wrongHooksPath}`)).toContain("rule=config-option-not-allowlisted");
+    expect(refusalFor(`core.hooksPath=${wrongHooksPath}`)).toContain(`core.hooksPath=${wrongHooksPath}`);
+
+    // A mismatched boolean stays refused -- the allowlist matches the exact
+    // value "false", not the bare option name.
+    expect(refusalFor("core.fsmonitor=true")).toContain("rule=config-option-not-allowlisted");
+    expect(refusalFor("core.fsmonitor=true")).toContain("core.fsmonitor=true");
+    expect(refusalFor("core.untrackedCache=true")).toContain("rule=config-option-not-allowlisted");
+    expect(refusalFor("core.untrackedCache=true")).toContain("core.untrackedCache=true");
+
+    // An unrelated -c option is unaffected by this allowlist addition.
+    expect(refusalFor("core.editor=vim")).toContain("rule=config-option-not-allowlisted");
+
+    // Exact-value matching, not prefix matching: a value that merely starts
+    // with an allowlisted value must not slip through.
+    expect(refusalFor("core.fsmonitor=false-ish")).toContain("rule=config-option-not-allowlisted");
+    expect(refusalFor(`core.hooksPath=${nullDevice}-ish`)).toContain("rule=config-option-not-allowlisted");
+    expect(refusalFor("core.untrackedCache=false-ish")).toContain("rule=config-option-not-allowlisted");
   });
 
   it("does not bypass the ambient git guard for an outside cwd or target", () => {
