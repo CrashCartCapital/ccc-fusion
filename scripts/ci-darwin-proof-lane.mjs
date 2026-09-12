@@ -53,6 +53,7 @@ export const DARWIN_PROOF_LANE_SUITES = Object.freeze([
       "src/__tests__/ccc-campaign-ready-verifier.real-git.test.ts",
       "src/__tests__/ccc-gate2-usefulness-probe.test.ts",
       "src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts",
+      "src/__tests__/ccc-golden-evidence-ledger-campaign.real-pg.test.ts",
       "src/__tests__/ccc-campaign-required-commit.real-git.test.ts",
       "src/__tests__/ccc-python-proof-adapter.test.ts",
     ]),
