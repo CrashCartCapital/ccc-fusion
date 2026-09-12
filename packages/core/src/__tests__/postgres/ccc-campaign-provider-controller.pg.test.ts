@@ -49,7 +49,11 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     const source = rehashCccPrdImportTestBundle({
       ...initial,
       targetRepository: options.baseCommit ? { ...initial.targetRepository, baseCommit: options.baseCommit } : initial.targetRepository,
-      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      // 10 minutes, not 60s: CI run 34671894956 (shard 4, 2026-09-12) hit
+      // "CCC campaign approval ACTION-LIVE-EXECUTION is outside its not-before or expiry
+      // window" from this exact fixture() -- a 60s deadline was not a safe margin under a
+      // contended, single-CPU CI Postgres shared across parallel shards.
+      bounds: { maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1 },
       tasks: initial.tasks.map((task, index) => protectedTaskIndexes.has(index) ? { ...task, protectedActionIds: [...(options.taskProtectedActionIds ?? ["ACTION-LIVE-EXECUTION"])] } : task),
       protectedActions,
     });
@@ -554,7 +558,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       const initial = createCccPrdImportTestBundle(h.rootDir(), suffix);
       const source = rehashCccPrdImportTestBundle({
         ...initial,
-        bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+        bounds: { maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1 },
         tasks: initial.tasks.map((task, index) => index === 0 ? { ...task, protectedActionIds: [...protectedActionIds] } : task),
         protectedActions: [{
           id: "ACTION-LIVE-EXECUTION",

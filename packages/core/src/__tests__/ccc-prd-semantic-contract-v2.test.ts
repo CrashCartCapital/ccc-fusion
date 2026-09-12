@@ -419,6 +419,6 @@ describe("CCC PRD semantic contract v2", () => {
     expect(createCccPrdImportTestBundle(
       "/tmp/ccc-v1-byte-stability",
       "v1-byte-stability",
-    ).bundleHash).toBe("1a360a2bd771fbf2e6cd3ef2556666f9919fe3b07bc2e90bc2f0b8a4fdca1980");
+    ).bundleHash).toBe("cb7e58449671518fed73af44ffdd6db509bedea261b846b404ab560085d1f70c");
   });
 });

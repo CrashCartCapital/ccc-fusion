@@ -239,7 +239,12 @@ export function createCccPrdImportTestBundle(
       { id: auditId, entityType: "run_audit", entityId: auditId, operation: "create", target: targetRoot },
     ],
     protectedActions: [],
-    bounds: { maxRequests: 1, maxDurationMs: 1_000, maxConcurrency: 1 },
+    // 10 minutes: long enough that a slow, contended CI Postgres (shared 1 CPU across
+    // parallel shards) cannot let the campaign deadline pass between fixture import and
+    // a subsequent claim. A 1-second default flaked in CI (run 34671894956) even though
+    // the actual failing test's own local override used 60s -- see the parallel widening
+    // of that override below in ccc-campaign-provider-controller.pg.test.ts.
+    bounds: { maxRequests: 1, maxDurationMs: 600_000, maxConcurrency: 1 },
     admittedWriteRoots: [{ path: targetRoot, purpose: "disposable test target" }],
     targetRepository: { path: targetRoot, baseCommit: CCC_PRD_TEST_BASE },
     nonGoals: ["No live providers."],
