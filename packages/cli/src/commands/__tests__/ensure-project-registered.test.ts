@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CentralCore, readProjectIdentity } from "@fusion/core";
@@ -159,6 +159,80 @@ describe("ensureCwdProjectRegistered", () => {
       expect.stringContaining("[serve] Failed to auto-register current project: boom"),
     );
     expect(readProjectIdentity(cwd)).toBeNull();
+
+    await central.close();
+  });
+
+  /*
+   * FNXC:FusionSourceCheckoutGuard 2026-09-06 (worktree-sweep incident): a
+   * `serve` process launched without `cd`-ing into its target repo runs from
+   * the Fusion source checkout's own cwd, which was never registered, so
+   * this auto-registered it as project "ccc-fusion" — giving that repo a
+   * second, DB-empty ProjectEngine whose maintenance swept unrelated real
+   * git worktrees as "idle" (see worktree-sweep-guard fix in worktree-pool.ts
+   * for the other half). This refusal closes the fix's second half: never
+   * auto-register the engine's own source checkout as a project.
+   */
+  it("refuses to auto-register the Fusion source checkout itself and does not write any files", async () => {
+    const globalDir = makeTempDir("fn-4266-global-");
+    const cwd = makeTempDir("fn-4266-fusion-source-");
+    mkdirSync(join(cwd, "packages", "engine"), { recursive: true });
+    writeFileSync(
+      join(cwd, "packages", "engine", "package.json"),
+      JSON.stringify({ name: "@fusion/engine", version: "0.0.0" }),
+      "utf-8",
+    );
+
+    const central = new CentralCore(globalDir);
+    await central.init();
+
+    const ensureSpy = vi.spyOn(central, "ensureProjectForPath");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await ensureCwdProjectRegistered({
+      cwd,
+      central,
+      logPrefix: "serve",
+      autoRegister: true,
+    });
+
+    expect(result).toBeNull();
+    expect(ensureSpy).not.toHaveBeenCalled();
+    expect(existsSync(join(cwd, ".fusion"))).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/\[serve\].*Refus.*Fusion source checkout/i),
+    );
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/cd|--project/i));
+
+    await central.close();
+  });
+
+  it("still registers an explicitly pre-registered project even if it looks like the Fusion source checkout", async () => {
+    const globalDir = makeTempDir("fn-4266-global-");
+    const cwd = makeTempDir("fn-4266-fusion-source-explicit-");
+    mkdirSync(join(cwd, "packages", "engine"), { recursive: true });
+    writeFileSync(
+      join(cwd, "packages", "engine", "package.json"),
+      JSON.stringify({ name: "@fusion/engine", version: "0.0.0" }),
+      "utf-8",
+    );
+
+    const central = new CentralCore(globalDir);
+    await central.init();
+    const existing = await central.registerProject({
+      name: "ccc-fusion-dev",
+      path: cwd,
+      isolationMode: "in-process",
+    });
+
+    const result = await ensureCwdProjectRegistered({
+      cwd,
+      central,
+      logPrefix: "serve",
+      autoRegister: true,
+    });
+
+    expect(result?.id).toBe(existing.id);
 
     await central.close();
   });

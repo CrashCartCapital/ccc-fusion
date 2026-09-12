@@ -1867,6 +1867,11 @@ describe("Worktree pool restart with recycleWorktrees=true", () => {
     store.listTasks.mockResolvedValue([
       makeTask("FN-100", "in-progress", { worktree: "/root/.worktrees/swift-falcon" }),
       makeTask("FN-101", "done", { worktree: "/root/.worktrees/calm-river" }),
+      // Since the worktree-sweep incident fix, an unbound worktree with zero
+      // durable Fusion task record is treated as foreign and left out of the
+      // pool rather than warm-loaded — bind bold-eagle to a done task so it
+      // still demonstrates "idle but Fusion-owned, therefore poolable".
+      makeTask("FN-102", "archived", { worktree: "/root/.worktrees/bold-eagle" }),
     ]);
 
     // Simulate startup rehydration
@@ -1876,7 +1881,7 @@ describe("Worktree pool restart with recycleWorktrees=true", () => {
 
     // swift-falcon → in-progress, not idle
     // calm-river → done, idle
-    // bold-eagle → unassigned, idle
+    // bold-eagle → archived (Fusion-owned), idle
     expect(pool.size).toBe(2);
     expect(pool.has("/root/.worktrees/calm-river")).toBe(true);
     expect(pool.has("/root/.worktrees/bold-eagle")).toBe(true);
@@ -1891,7 +1896,12 @@ describe("Worktree pool restart with recycleWorktrees=true", () => {
     mockRegisteredWorktrees("/root", ["idle-wt"]);
 
     const store = createMockStore();
-    store.listTasks.mockResolvedValue([]);
+    // Durable-ownership record for idle-wt (see the worktree-sweep incident
+    // fix comment above) — otherwise scanIdleWorktrees treats it as foreign
+    // and it never enters the pool for the executor to acquire below.
+    store.listTasks.mockResolvedValue([
+      makeTask("FN-109", "done", { worktree: "/root/.worktrees/idle-wt" }),
+    ]);
     store.getSettings.mockResolvedValue({
       ...DEFAULT_SETTINGS,
       mergeIntegrationWorktree: "cwd-main" as const,
@@ -1944,6 +1954,9 @@ describe("Worktree pool restart with recycleWorktrees=true", () => {
     const store = createMockStore();
     store.listTasks.mockResolvedValue([
       makeTask("KB-120", "in-progress", { worktree: "/root/.worktrees/active-wt" }),
+      // Durable-ownership record for idle-wt (see the worktree-sweep incident
+      // fix comment above).
+      makeTask("FN-143", "done", { worktree: "/root/.worktrees/idle-wt" }),
     ]);
 
     const pool = new WorktreePool();
@@ -1987,7 +2000,14 @@ describe("Worktree cleanup on restart with recycleWorktrees=false", () => {
     mockRegisteredWorktrees("/root", ["orphan-1", "orphan-2"]);
 
     const store = createMockStore();
-    store.listTasks.mockResolvedValue([]);
+    // Since the worktree-sweep incident fix, a worktree with zero durable
+    // Fusion task record (any column) is left alone rather than reclaimed —
+    // bind each orphan to a done task so this still exercises "idle but
+    // Fusion-owned, therefore reclaimable".
+    store.listTasks.mockResolvedValue([
+      makeTask("FN-140", "done", { worktree: "/root/.worktrees/orphan-1" }),
+      makeTask("FN-141", "done", { worktree: "/root/.worktrees/orphan-2" }),
+    ]);
 
     const cleaned = await cleanupOrphanedWorktrees("/root", store);
 
@@ -2009,6 +2029,9 @@ describe("Worktree cleanup on restart with recycleWorktrees=false", () => {
     const store = createMockStore();
     store.listTasks.mockResolvedValue([
       makeTask("KB-130", "in-progress", { worktree: "/root/.worktrees/active-wt" }),
+      // Durable-ownership record for the otherwise-unbound orphan (see the
+      // worktree-sweep incident fix comment above).
+      makeTask("FN-142", "done", { worktree: "/root/.worktrees/orphan-wt" }),
     ]);
 
     const cleaned = await cleanupOrphanedWorktrees("/root", store);
