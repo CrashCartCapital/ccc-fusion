@@ -5,7 +5,6 @@ import {
   afterAll,
   beforeAll,
   expect,
-  it,
   vi,
 } from "vitest";
 import {
@@ -14,6 +13,7 @@ import {
   __resetWorkflowExtensionRegistryForTests,
   queryRunAuditEvents,
 } from "@fusion/core";
+import { itConfinedVerifierHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
@@ -47,6 +47,14 @@ import {
 } from "./helpers/ccc-golden-evidence-ledger-campaign-support.js";
 import { replayContractProof } from "./helpers/ccc-golden-evidence-ledger-campaign-diagnostics.js";
 
+// All three tests below drive the campaign to its final integrated proof
+// node, which enforces `inspectVerifierConfinementReadiness()`
+// (packages/engine/src/run-verification-tool.ts) before it will run —
+// Darwin sandbox-exec or a trusted Linux bubblewrap. A host with neither
+// gets `CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE` refusals instead of
+// the expected holds, so this suite needs the same shared gate the engine's
+// other confined-verifier suites use, layered on top of its Postgres
+// requirement.
 pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () => {
   const h = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_golden_three_task",
@@ -108,7 +116,7 @@ pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () 
     await h.afterAll();
   });
 
-  it("imports the exact three-task packet with native dependency custody", async () => {
+  itConfinedVerifierHost("imports the exact three-task packet with native dependency custody", async () => {
     const common = [
       lifecycle.frozenRoot,
       lifecycle.manifestPath,
@@ -143,7 +151,7 @@ pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () 
     }
   });
 
-  it("starts the real runtime and reaches the sealed live-execution hold", async () => {
+  itConfinedVerifierHost("starts the real runtime and reaches the sealed live-execution hold", async () => {
     __resetWorkflowExtensionRegistryForTests();
     await bootstrapCccCampaignProofAdmissionHost({ builtRootPath: cliDistRoot });
     central = new CentralCore(h.globalDir(), { asyncLayer: h.layer() });
@@ -198,7 +206,7 @@ pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () 
     expect(readProviderEvents(fixture.markerPath)).toEqual([]);
   });
 
-  it("runs the exact three-task campaign to its durable unlanded merge hold", { timeout: 120_000 }, async () => {
+  itConfinedVerifierHost("runs the exact three-task campaign to its durable unlanded merge hold", { timeout: 120_000 }, async () => {
     const confirmation = firstHold.liveExecutionAuthorizationConfirmation!;
     const approved = await runProductCommand([
       "approve-execution",

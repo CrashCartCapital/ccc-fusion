@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { itConfinedVerifierHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import * as readyModule from "../ccc-campaign-ready.js";
 
 const {
@@ -108,7 +109,14 @@ afterEach(async () => {
 });
 
 describeIfTools("CCC campaign readiness repair-feedback envelope", () => {
-  it("reports observed bytes captured before the verifier ran, even when the verifier command mutates the shadow candidate", async () => {
+  // Only this test needs itConfinedVerifierHost: it asserts a real numeric
+  // feedback.exitCode captured from the sealed verifier actually running, so
+  // on a host with no confinement backend (Darwin sandbox-exec or a trusted
+  // Linux bwrap) the shadow verifier never runs and exitCode is undefined.
+  // The sibling malformed-JSON test below asserts only that a parse issue was
+  // recorded, which happens the same way whether the verifier produced
+  // genuinely malformed output or never ran at all, so it needs no extra gate.
+  itConfinedVerifierHost("reports observed bytes captured before the verifier ran, even when the verifier command mutates the shadow candidate", async () => {
     const root = await baseFixture();
     const payload = proofEvidencePayload();
     expect(payload.length).toBeGreaterThan(2_200);

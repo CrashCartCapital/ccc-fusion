@@ -4,12 +4,21 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { itConfinedVerifierHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import * as readyModule from "../ccc-campaign-ready.js";
 
 const execFile = promisify(execFileCallback);
 const hasGit = spawnSync("git", ["--version"], { stdio: "pipe" }).status === 0;
 const hasTask = spawnSync("task", ["--version"], { stdio: "pipe" }).status === 0;
 const describeIfTools = hasGit && hasTask ? describe : describe.skip;
+// The three tests below actually run the sealed verifier to a `ready: true`
+// (or a second, later `ready: true` before its refusal branch) outcome, which
+// requires `runVerificationCommand` to confine the process — Darwin
+// sandbox-exec or a trusted Linux bubblewrap. Everything else in this file
+// refuses before the sealed verifier ever runs (foreign paths, ignored
+// residue, missing write roots, task-identity mismatch) or never calls it at
+// all (fingerprint-only assertions), so only these three need the extra gate
+// on top of the file's git+Task requirement.
 const roots: string[] = [];
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -93,7 +102,7 @@ afterEach(async () => {
 });
 
 describeIfTools("CCC campaign readiness shadow verifier", () => {
-  it("verifies the candidate in a disposable shadow without polluting the source worktree", async () => {
+  itConfinedVerifierHost("verifies the candidate in a disposable shadow without polluting the source worktree", async () => {
     const { root, campaign } = await fixture();
     const verifyCandidate = (readyModule as any).verifyCccCampaignReadyCandidate;
 
@@ -117,7 +126,7 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
     await expect(readFile(join(root, "verifier-side-effect.txt"), "utf8")).rejects.toThrow();
   });
 
-  it.sequential("verifies headlessly when checkout requires an interactive Git safety prompt", async () => {
+  itConfinedVerifierHost.sequential("verifies headlessly when checkout requires an interactive Git safety prompt", async () => {
     const { root, campaign } = await fixture();
     const guardRoot = await mkdtemp(join(tmpdir(), "fusion-headless-git-guard-"));
     roots.push(guardRoot);
@@ -220,7 +229,7 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
     expect(result.summary).toContain("ignored-foreign");
   });
 
-  it("accepts controller-initialized ignored paths but refuses later residue inside the same root", async () => {
+  itConfinedVerifierHost("accepts controller-initialized ignored paths but refuses later residue inside the same root", async () => {
     const { root, campaign } = await fixture();
     await mkdir(join(root, "node_modules"));
     await writeFile(join(root, "node_modules", "controller-installed.js"), "module.exports = true;\n");
