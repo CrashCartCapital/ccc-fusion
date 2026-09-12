@@ -893,7 +893,17 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     expectNoForbiddenEffects(forbidden);
   });
 
-  it("recovers exact checked-out landing materialization without replaying an uncertain filesystem effect", async () => {
+  // Per-test budget, not a hang cover: this case runs three sequential
+  // runAiMerge attempts (two fault-injected retries plus the real merge), and
+  // every landing checkpoint re-derives the local-git identity through
+  // ~20 sequential git plumbing calls (inspect/recheck + two
+  // assertCleanGitSample passes), so one run forks ~1,050 git children and
+  // measures 24-26 s on an idle M5 Max (sibling single-merge case: ~550
+  // forks, 17 s). On the Linux shard containers it crosses the 30 s package
+  // default (runs 34674911970 and 34697602185, every git child exited 0, the
+  // last one simply still in flight). Reducing the per-checkpoint re-inspection
+  // is the real lever and is tracked as separate product work.
+  it("recovers exact checked-out landing materialization without replaying an uncertain filesystem effect", { timeout: 120_000 }, async () => {
     const fixture = await importedMergeFixture("checked-out-materialization-recovery", {
       targetCheckout: "checked-out",
     });
