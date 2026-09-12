@@ -61,7 +61,14 @@ jobs:
         run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
 
       # Versioned key forces one honest cold build after this topology change.
-      # Exact-match only: partial or stale dist is worse than a clean miss.
+      # The primary key is unique per run and the restore prefix still carries the
+      # full source hash, so a match can never be a stale or partial dist. The
+      # per-run suffix exists because actions/cache reserves a key while a save
+      # is uploading and keeps that reservation if the upload dies mid-flight
+      # (observed 2026-09-12 after a network cut: every later run saw "Unable to
+      # reserve cache ... another job may be creating this cache", the save was
+      # skipped with a warning, and every downstream job failed on cache miss).
+      # A fresh key per run cannot collide with a dead reservation.
       - name: Restore built dist artifacts
         id: dist-cache
         uses: actions/cache/restore@v4
@@ -77,14 +84,16 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-
 
       - name: Assert restored cache is complete
-        if: steps.dist-cache.outputs.cache-hit == 'true'
+        if: steps.dist-cache.outputs.cache-matched-key != ''
         run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present
 
       - name: Seed artifact hash-cache on cache hit
-        if: steps.dist-cache.outputs.cache-hit == 'true'
+        if: steps.dist-cache.outputs.cache-matched-key != ''
         run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
 
       - name: Build or validate test artifacts
@@ -96,7 +105,7 @@ jobs:
         run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present
 
       - name: Save built dist artifacts
-        if: steps.dist-cache.outputs.cache-hit != 'true'
+        if: steps.dist-cache.outputs.cache-matched-key == ''
         uses: actions/cache/save@v4
         with:
           path: |
@@ -110,7 +119,7 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-${{ github.run_id }}
 
   test-shards:
     name: Test shard ${{ matrix.shard }}/4
@@ -186,7 +195,9 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-
           fail-on-cache-miss: true
 
       - name: Assert restored artifacts are complete
@@ -327,7 +338,9 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-
           fail-on-cache-miss: true
 
       - name: Assert restored artifacts are complete
@@ -429,7 +442,9 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}-
           fail-on-cache-miss: true
 
       - name: Assert restored artifacts are complete
