@@ -11,6 +11,11 @@ name: Full Suite (non-blocking)
 on:
   push:
     branches: [main]
+  # Manual re-dispatch. This tier is push-to-main-only, so a workflow-only fix
+  # to it could otherwise only be exercised by landing an unrelated commit.
+  # workflow_dispatch lets a maintainer re-run the tier against a known SHA and
+  # re-count the failure buckets without polluting main's history.
+  workflow_dispatch:
 
 # Key the concurrency group by SHA, not ref: on push to main the ref is
 # always refs/heads/main, so a ref-keyed group with cancel-in-progress would
@@ -194,6 +199,41 @@ jobs:
       - name: Seed artifact hash-cache
         run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
 
+      # The `ccc-fusion` shard containers run with no-new-privileges: there is
+      # no sudo, so `apt-get` is not an option here (only the `ccc-fusion-bwrap`
+      # lane used by test-slow has it). Provision the two missing interpreters
+      # the userland way instead. bwrap CANNOT be provisioned on this lane at
+      # all — it needs privileged setup — so the bwrap-only suites stay red here
+      # until PR-B gives them an explicit named skip.
+      - name: Setup Python for the proof adapter
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # No cloud cache on a self-hosted runner: the restore/save round trip
+          # costs more than the install it would avoid.
+          cache: ""
+
+      # ccc-python-proof-adapter spawns the interpreter with PYTHONNOUSERSITE=1
+      # and no PYTHONPATH, so a `--user` install is invisible to it. Install
+      # into this interpreter's own site-packages and prove the import works
+      # through `python3` (the name the adapter actually resolves).
+      - name: Install pytest into the setup-python interpreter
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check pytest==8.4.2
+          python3 -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
+        env:
+          PYTHONNOUSERSITE: "1"
+
+      # Same Go Task provisioning the test-slow job uses (npm prefix into
+      # RUNNER_TEMP, bin appended to GITHUB_PATH). Verifier/proof suites resolve
+      # `task` from PATH; without it they fail for a toolchain reason.
+      - name: Install Go Task
+        run: |
+          npm install -g --prefix "$RUNNER_TEMP/go-task" @go-task/cli@3.52.0
+          echo "$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin/task" --version
+
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
         env:
@@ -222,7 +262,13 @@ jobs:
             packages/*/.timings/timings-*.json
             plugins/*/.timings/timings-*.json
             plugins/examples/*/.timings/timings-*.json
-          if-no-files-found: ignore
+          # upload-artifact v4.4.0+ excludes dot-prefixed files and directories
+          # by default, and `.timings` is exactly that — so every run since has
+          # uploaded nothing. `if-no-files-found: ignore` is what kept it silent
+          # for months while the committed timing snapshot went stale; `warn`
+          # makes the next empty upload visible in the log.
+          include-hidden-files: true
+          if-no-files-found: warn
           retention-days: 14
 
   # The dashboard quality gate used to enumerate its test files by hand, so any
@@ -433,8 +479,170 @@ jobs:
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
+      # engine-slow is a later step in the same job as product-route, so a red
+      # product-route silently SKIPPED it — it has run once in a month, and
+      # seven real-git merger files have had zero execution since 2026-08-11.
+      # Gate on the PostgreSQL route instead of the preceding test step: this
+      # lane genuinely cannot run without a reachable database, but it must not
+      # inherit product-route's pass/fail. `continue-on-error` on product-route
+      # would achieve the same un-skipping by destroying the product-route
+      # signal, so it is deliberately NOT used. The ${{ }} wrapper is required —
+      # a bare `!cancelled() && ...` is a plain string and always truthy.
       - name: Run engine-slow with non-empty-execution assertion
+        if: ${{ !cancelled() && steps.postgres-route.outcome == 'success' }}
         run: node scripts/assert-engine-slow-nonempty.mjs
         env:
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Why this job exists.
+  #
+  # The CCC semantic-v2 proof sandbox has exactly ONE backend: macOS
+  # `sandbox-exec`. packages/engine/src/ccc-campaign-proof-sandbox.ts returns
+  # CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE on every non-Darwin platform, and no
+  # Linux backend has been built. Every runner in the Linux fleet therefore
+  # fails these suites for a platform reason, not a product reason — 50 of the
+  # 203 shard failures in the 2026-09-11 diagnosis, including the repo's only
+  # end-to-end product vertical slice.
+  #
+  # Silently skipping them on Linux was rejected by both outside reviews: it
+  # would make the tier deceptively green while deleting that slice's only
+  # coverage. So the suites keep failing loudly on Linux (PR-B turns that into
+  # an explicit named NOT RUN) and this native macOS lane on the M2 Max is
+  # where they actually execute.
+  #
+  # It deliberately does NOT `needs: prepare-test-artifacts`: that job publishes
+  # its dist corpus into a Linux/ARM64-keyed actions/cache on a different host
+  # with a different Docker VM, so there is nothing here to consume. This lane
+  # builds its own dist and provisions its own PostgreSQL. Per the M2 runner
+  # standard, caches stay on the host (a local pnpm store, a pinned toolchain
+  # directory) rather than round-tripping through actions/cache.
+  # ─────────────────────────────────────────────────────────────────────────
+  darwin-proof-lane:
+    name: Darwin proof lane (M2 native)
+    runs-on: [self-hosted, macOS, ARM64, ccc-fusion-darwin-proof-v1, m2max-ccc-fusion-macos-arm64-1]
+    # No `needs`: independent host, independent build, independent database.
+    # Still refuse to start once the run has been cancelled.
+    if: ${{ !cancelled() }}
+    # Real-git + sandbox-exec suites plus a cold dist build on a native host.
+    # Same backstop rationale as the other heavyweight jobs: no CI job should be
+    # able to run to GitHub's 6h default.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Real-git suites need full history (merge-base against main,
+          # case-variant ref checks); shallow clones break them silently.
+          fetch-depth: 0
+          # This is a long-lived native runner, not a disposable container.
+          # Do not leave the job token in the checkout's git config.
+          persist-credentials: false
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+        with:
+          # skip-install also selects the setup-node variant with the pnpm
+          # cloud cache disabled. This host keeps its store on local disk.
+          skip-install: "true"
+
+      - name: Install dependencies with the host-local pnpm store
+        run: pnpm install --frozen-lockfile
+        env:
+          npm_config_store_dir: /Users/ryanpappal/ci/caches/ccc-fusion/pnpm-store
+
+      # Go Task is pinned on the host at a versioned path rather than installed
+      # per run. Several proof/verifier suites resolve `task` from PATH.
+      - name: Put the pinned Go Task toolchain on PATH
+        run: |
+          set -euo pipefail
+          echo "/Users/ryanpappal/ci/toolchains/task/3.52.0" >> "$GITHUB_PATH"
+          /Users/ryanpappal/ci/toolchains/task/3.52.0/task --version
+
+      # Same contract as the shard lane: the python proof adapter runs the
+      # interpreter with PYTHONNOUSERSITE=1, so pytest must live in this
+      # interpreter's own site-packages.
+      - name: Setup Python for the proof adapter
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: ""
+
+      - name: Install pytest into the setup-python interpreter
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check pytest==8.4.2
+          python3 -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
+        env:
+          PYTHONNOUSERSITE: "1"
+
+      - name: Build test artifacts
+        run: node scripts/ensure-test-artifacts.mjs
+
+      - name: Assert prepared artifacts are complete
+        run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present
+
+      # A disposable cluster under RUNNER_TEMP, torn down in the always() step
+      # at the bottom. NEVER port 5432: a live production PostgreSQL 17 runs
+      # there on this host and must not be touched. The port is taken from the
+      # kernel's ephemeral range and re-checked below.
+      - name: Start a disposable PostgreSQL
+        id: pg
+        run: |
+          set -euo pipefail
+
+          PGBIN=/opt/homebrew/opt/postgresql@16/bin
+          "$PGBIN/initdb" -D "$RUNNER_TEMP/pg" -U postgres -A trust --no-locale -E UTF8
+
+          PORT="$(node -e 'const s=require("net").createServer(); s.listen(0,"127.0.0.1",()=>{const p=s.address().port; s.close(()=>console.log(p));});')"
+          if [ -z "$PORT" ] || [ "$PORT" = "5432" ]; then
+            echo "refusing to use port '$PORT' (5432 is the live production server)" >&2
+            exit 1
+          fi
+          echo "disposable PostgreSQL port: $PORT"
+
+          # TCP-only. A Unix socket under $RUNNER_TEMP would put the socket
+          # path near (or over) the 103-byte sun_path limit — verified locally:
+          # "Unix-domain socket path ... is too long (maximum 103 bytes)" then
+          # "FATAL: could not create any Unix-domain sockets". Nothing here
+          # needs the socket: the tests connect to 127.0.0.1 over TCP,
+          # pg_isready is given -h, and pg_ctl stop addresses the data dir.
+          "$PGBIN/pg_ctl" -D "$RUNNER_TEMP/pg" \
+            -o "-p $PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=" \
+            -l "$RUNNER_TEMP/pg.log" start
+
+          for _ in $(seq 1 30); do
+            if "$PGBIN/pg_isready" -h 127.0.0.1 -p "$PORT" -U postgres >/dev/null 2>&1; then
+              echo "port=$PORT" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "disposable PostgreSQL never became ready; server log follows" >&2
+          cat "$RUNNER_TEMP/pg.log" >&2 || true
+          exit 1
+
+      - name: Run serialized product-route acceptance
+        run: pnpm --filter @fusion/engine test:product-route
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ steps.pg.outputs.port }}"
+          PGPASSWORD: "postgres"
+
+      # The Darwin-only proof suites, with a zero-executed assertion so a
+      # glob/rename drift cannot make this lane deceptively green.
+      - name: Run the Darwin-only proof suites
+        if: ${{ !cancelled() && steps.pg.outcome == 'success' }}
+        run: node scripts/ci-darwin-proof-lane.mjs
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ steps.pg.outputs.port }}"
+          PGPASSWORD: "postgres"
+
+      - name: Stop the disposable PostgreSQL
+        if: always()
+        run: |
+          PGBIN=/opt/homebrew/opt/postgresql@16/bin
+          if [ -d "$RUNNER_TEMP/pg" ]; then
+            "$PGBIN/pg_ctl" -D "$RUNNER_TEMP/pg" -m fast stop || true
+          fi
