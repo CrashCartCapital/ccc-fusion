@@ -1211,14 +1211,32 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     const prepareSave = (prepareJob.steps ?? []).find(
       (step: any) => step.uses === "actions/cache/save@v4",
     );
+    // The primary key is unique per run so a save can never collide with a
+    // reservation left behind by an upload that died mid-flight (observed
+    // 2026-09-12: one interrupted save wedged every later run at the same
+    // source hash with "Unable to reserve cache"). Stale dist stays impossible
+    // because the only restore prefix still pins the full source hash: the
+    // prefix must be exactly the primary key minus its run-id suffix.
+    const sourceHashKey =
+      "fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}";
+    const perRunKey = `${sourceHashKey}-\${{ github.run_id }}`;
+    const hashPinnedPrefix = `${sourceHashKey}-`;
     for (const cacheStep of [prepareRestore, prepareSave]) {
       expect(cacheStep).toBeDefined();
       expect(cacheStep.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
-      expect(cacheStep.with?.key).toContain("fusion-dist-v2-");
-      expect(cacheStep.with?.["restore-keys"]).toBeUndefined();
+      expect(cacheStep.with?.key).toBe(perRunKey);
       expect(cacheStep.with?.path).not.toContain("node_modules");
     }
+    expect(prepareRestore.with?.["restore-keys"].trim()).toBe(hashPinnedPrefix);
+    expect(prepareSave.with?.["restore-keys"]).toBeUndefined();
     expect(prepareSave.with?.key).toBe(prepareRestore.with?.key);
+    // cache-hit only reports an exact primary-key hit; a prefix hit must still
+    // skip the rebuild and the redundant save, so the gates read cache-matched-key.
+    expect(prepareSave.if).toBe("steps.dist-cache.outputs.cache-matched-key == ''");
+    for (const stepName of ["Assert restored cache is complete", "Seed artifact hash-cache on cache hit"]) {
+      const step = (prepareJob.steps ?? []).find((candidate: any) => candidate.name === stepName);
+      expect(step?.if).toBe("steps.dist-cache.outputs.cache-matched-key != ''");
+    }
 
     for (const jobName of ["test-shards", "test-inventory-guard", "test-slow"]) {
       const job = workflow.jobs?.[jobName];
@@ -1231,6 +1249,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       );
       expect(restore?.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
       expect(restore?.with?.key).toBe(prepareRestore.with?.key);
+      expect(restore?.with?.["restore-keys"].trim()).toBe(hashPinnedPrefix);
       expect(restore?.with?.["fail-on-cache-miss"]).toBe(true);
 
       const assertIndex = steps.findIndex(
