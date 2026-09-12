@@ -980,6 +980,21 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
 
   it("routes every post-merge job to the dedicated local Fusion runners", () => {
     for (const [jobName, job] of Object.entries(workflow.jobs ?? {}) as [string, any][]) {
+      // darwin-proof-lane is the one deliberate exception to the Linux fleet.
+      // The CCC semantic-v2 proof sandbox has exactly one backend -- macOS
+      // `sandbox-exec` -- so those suites can only execute on the native M2 Max
+      // runner. Pin its exact label set rather than skipping the job, so a
+      // typo or a fleet rename still fails this guard.
+      if (jobName === "darwin-proof-lane") {
+        expect(job?.["runs-on"]).toEqual([
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "ccc-fusion-darwin-proof-v1",
+          "m2max-ccc-fusion-macos-arm64-1",
+        ]);
+        continue;
+      }
       // test-slow runs the verifier-confinement readiness probe and the
       // serialized product acceptance, so it needs the bwrap-capable lane.
       expect(job?.["runs-on"]).toEqual([
@@ -1168,11 +1183,24 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     const prepareJob = workflow.jobs?.["prepare-test-artifacts"];
     expect(prepareJob).toBeDefined();
 
-    const allSteps = Object.values(workflow.jobs ?? {}).flatMap(
-      (job: any) => job?.steps ?? [],
-    ) as any[];
+    // "Build once, then fan out" is a claim about the Linux fleet, which shares
+    // one Linux/ARM64-keyed actions/cache. darwin-proof-lane runs on a
+    // different host with a different toolchain and cannot consume that cache,
+    // so it necessarily builds its own dist. Exclude it from the shared count
+    // and assert its single build separately, so the exemption stays explicit
+    // and still bounded to exactly one build over there too.
+    const sharedFleetSteps = Object.entries(workflow.jobs ?? {})
+      .filter(([jobName]) => jobName !== "darwin-proof-lane")
+      .flatMap(([, job]: [string, any]) => job?.steps ?? []) as any[];
     expect(
-      allSteps.filter(
+      sharedFleetSteps.filter(
+        (step: any) => step.run === "node scripts/ensure-test-artifacts.mjs",
+      ),
+    ).toHaveLength(1);
+
+    const darwinSteps = (workflow.jobs?.["darwin-proof-lane"]?.steps ?? []) as any[];
+    expect(
+      darwinSteps.filter(
         (step: any) => step.run === "node scripts/ensure-test-artifacts.mjs",
       ),
     ).toHaveLength(1);
@@ -1235,6 +1263,36 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     }
 
     expect(workflow.jobs?.["line-count-audit"]?.needs).toBeUndefined();
+  });
+
+  it("keeps the Darwin proof lane independent of the Linux artifact cache", () => {
+    // The two exemptions above (a macOS runner label set, and a second
+    // ensure-test-artifacts build) are only sound while this lane is genuinely
+    // independent: its own host, no `needs` on the Linux prepare job, and no
+    // attempt to restore a Linux/ARM64-keyed cache it can never hit. If it
+    // ever grows one of those, it belongs back under the shared fleet rules
+    // and this test is the thing that says so.
+    const darwinJob = workflow.jobs?.["darwin-proof-lane"];
+    expect(darwinJob).toBeDefined();
+    expect(darwinJob.needs).toBeUndefined();
+
+    const steps = (darwinJob.steps ?? []) as any[];
+    expect(
+      steps.some(
+        (step: any) =>
+          typeof step.uses === "string" && step.uses.startsWith("actions/cache"),
+      ),
+    ).toBe(false);
+
+    // It still has to prove its self-built dist corpus is complete before it
+    // runs anything, exactly like every cache-restoring consumer does.
+    expect(
+      steps.filter(
+        (step: any) =>
+          step.run ===
+          "node scripts/ensure-test-artifacts.mjs --assert-artifacts-present",
+      ),
+    ).toHaveLength(1);
   });
 
   it("runs the line-count audit without installing or remotely caching the workspace", () => {
