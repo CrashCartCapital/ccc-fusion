@@ -570,24 +570,26 @@ jobs:
 
       # Same contract as the shard lane: the python proof adapter runs the
       # interpreter with PYTHONNOUSERSITE=1, so pytest must live in this
-      # interpreter's own site-packages.
-      - name: Setup Python for the proof adapter
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: ""
-        env:
-          # See the shard step: without this the macOS installer targets
-          # /Users/runner and fails on a self-hosted runner.
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
-
-      - name: Install pytest into the setup-python interpreter
+      # interpreter's own site-packages. actions/setup-python cannot be used
+      # here: its macOS install script runs `sudo installer -pkg ... -target /`
+      # and this native runner has no passwordless sudo (both attempts died
+      # with "mkdir: /Users/runner: Permission denied", runs 34665660027 and
+      # 34671894956). uv on the host installs a managed CPython under a
+      # host-local cache instead, no root needed, and the venv's python3 is
+      # what the adapter resolves from PATH.
+      - name: Provision Python 3.12 and pytest with uv
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check pytest==8.4.2
-          python3 -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
+          UV=/opt/homebrew/bin/uv
+          "$UV" --version
+          "$UV" python install 3.12
+          "$UV" venv --python 3.12 "$RUNNER_TEMP/proof-venv"
+          "$UV" pip install --python "$RUNNER_TEMP/proof-venv/bin/python" pytest==8.4.2
+          echo "$RUNNER_TEMP/proof-venv/bin" >> "$GITHUB_PATH"
+          PYTHONNOUSERSITE=1 "$RUNNER_TEMP/proof-venv/bin/python3" -c 'import pytest, sys; print("pytest", pytest.__version__, "on", sys.executable)'
         env:
-          PYTHONNOUSERSITE: "1"
+          UV_PYTHON_INSTALL_DIR: /Users/ryanpappal/ci/caches/ccc-fusion/uv-python
+          UV_CACHE_DIR: /Users/ryanpappal/ci/caches/ccc-fusion/uv
 
       - name: Build test artifacts
         run: node scripts/ensure-test-artifacts.mjs
