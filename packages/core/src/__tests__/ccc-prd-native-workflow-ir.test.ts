@@ -323,7 +323,7 @@ describe("RED-S5-task-gate-release", () => {
     );
     const digest = createHash("sha256").update(canonicalCccPrdJson(ir)).digest("hex");
 
-    expect(digest).toBe("38572f08bd3c4d11246998cbbd3c88c7af490454225fdcc5bd4110ee8ed7b427");
+    expect(digest).toBe("871249211949dd6ef12ec3634389541ad6880cb1d47c786c85cab61284f3d496");
     expect(ir.nodes.some((node) => node.config?.cccProofGate === true)).toBe(false);
     expect(ir.nodes.some((node) => node.config?.cccProofPhase !== undefined)).toBe(false);
   });

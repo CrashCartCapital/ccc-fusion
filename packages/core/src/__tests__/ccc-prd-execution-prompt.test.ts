@@ -207,7 +207,7 @@ describe("CCC PRD sealed coding prompt", () => {
     const sealed = buildCccPrdTaskExecutionPrompt(bundle, bundle.tasks[0]!, route);
 
     expect(sealed.schema).toBe("ccc-prd.execution-prompt.v1");
-    expect(sealed.sha256).toBe("786d9293f5174b812a27ca36b06dea7a223bfae1f81efb3f9f88b6e4fd2bd578");
+    expect(sealed.sha256).toBe("8e3397eca8a6149b71ba324bc10b1494e566f4e1b69644d238c047f7bb2a638c");
   });
 
   it("carries requirement, acceptance, proof, document, path, non-goal, and protected-action facts that are absent from task.description", () => {

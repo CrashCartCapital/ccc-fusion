@@ -420,7 +420,15 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     const { source, imported } = await importAdmittedProduct(
       "product-status-live",
       "product-status-live",
-      withLiveExecutionAction,
+      // This test later pg_sleep()s in real wall-clock time until just past the
+      // campaign deadline (below) to prove expiry uses the database clock, not the
+      // app clock. Pin an explicit 1s window here -- the same value the shared
+      // fixture default used to carry implicitly -- so that deliberate sleep stays
+      // fast regardless of the shared default (see ccc-prd-import-fixture.ts).
+      (bundle) => rehashCccPrdImportTestBundle({
+        ...withLiveExecutionAction(bundle),
+        bounds: { ...bundle.bounds, maxDurationMs: 1_000 },
+      }),
     );
     const codingTaskId = await nativeTaskIdForImport(
       imported.importId,
