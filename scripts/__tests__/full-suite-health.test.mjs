@@ -9,9 +9,11 @@ import {
   ENGINE_SLOW_STEP_NAME,
   RED_STREAK_ALERT_THRESHOLD,
   buildIssueTitle,
+  collectKnownNames,
   computeLaneExecution,
   computeRedStreak,
   computeTimingsStaleness,
+  findLatestExecutionRow,
   findUnmirroredExcludes,
   jobExecuted,
   main,
@@ -120,6 +122,61 @@ test("computeLaneExecution reports both lanes together", () => {
     { name: DARWIN_LANE_JOB_NAME, conclusion: "skipped" },
   ];
   assert.deepEqual(computeLaneExecution(jobs), { engineSlowExecuted: true, darwinLaneExecuted: false });
+});
+
+// ---------------------------------------------------------------------------
+// collectKnownNames
+// ---------------------------------------------------------------------------
+
+test("collectKnownNames collects job and step names seen anywhere across runs, regardless of conclusion", () => {
+  const jobsByRun = [
+    [{ name: "Product route + engine slow", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] }],
+    [{ name: DARWIN_LANE_JOB_NAME, conclusion: "skipped" }],
+  ];
+  const { jobNames, stepNames } = collectKnownNames(jobsByRun);
+  assert.ok(jobNames.has(DARWIN_LANE_JOB_NAME));
+  assert.ok(stepNames.has(ENGINE_SLOW_STEP_NAME));
+});
+
+test("collectKnownNames does not invent a name that never appeared in any fetched job list", () => {
+  const jobsByRun = [[{ name: "test-shards", steps: [] }]];
+  const { jobNames } = collectKnownNames(jobsByRun);
+  assert.equal(jobNames.has(DARWIN_LANE_JOB_NAME), false);
+});
+
+test("collectKnownNames on no runs at all returns empty sets", () => {
+  const { jobNames, stepNames } = collectKnownNames([]);
+  assert.equal(jobNames.size, 0);
+  assert.equal(stepNames.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// findLatestExecutionRow
+// ---------------------------------------------------------------------------
+
+test("findLatestExecutionRow skips a cancelled latest run and falls back to the prior decisive run", () => {
+  const rows = [
+    { run: { id: 2, conclusion: "cancelled" }, jobsFetchFailed: false, engineSlowExecuted: false, darwinLaneExecuted: false },
+    { run: { id: 1, conclusion: "success" }, jobsFetchFailed: false, engineSlowExecuted: true, darwinLaneExecuted: true },
+  ];
+  assert.equal(findLatestExecutionRow(rows), rows[1]);
+});
+
+test("findLatestExecutionRow skips a row whose job-list fetch failed", () => {
+  const rows = [
+    { run: { id: 2, conclusion: "failure" }, jobsFetchFailed: true, engineSlowExecuted: false, darwinLaneExecuted: false },
+    { run: { id: 1, conclusion: "success" }, jobsFetchFailed: false, engineSlowExecuted: true, darwinLaneExecuted: true },
+  ];
+  assert.equal(findLatestExecutionRow(rows), rows[1]);
+});
+
+test("findLatestExecutionRow returns null when no row is decisive", () => {
+  const rows = [{ run: { id: 1, conclusion: "cancelled" }, jobsFetchFailed: false }];
+  assert.equal(findLatestExecutionRow(rows), null);
+});
+
+test("findLatestExecutionRow returns null on an empty list", () => {
+  assert.equal(findLatestExecutionRow([]), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -406,7 +463,7 @@ test("main() updates the existing labeled issue instead of creating a second one
   }
 });
 
-test("main() alerts when the latest completed run's darwin lane did not execute, even with no red streak", async () => {
+test("main() alerts when the darwin lane job is present but did not execute on the latest run, even with no red streak", async () => {
   const rootDir = tempRoot();
   try {
     writeLedger(rootDir, []);
@@ -416,7 +473,11 @@ test("main() alerts when the latest completed run's darwin lane did not execute,
     const github = fakeGithub({
       runs: [{ id: 1, status: "completed", conclusion: "success", createdAt: "2026-09-11T00:00:00Z", url: "u1" }],
       jobsByRunId: {
-        1: [{ name: "Product route + engine slow", conclusion: "success", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] }],
+        1: [
+          { name: "Product route + engine slow", conclusion: "success", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] },
+          // Present (so the lane is "known" to exist) but skipped, not executed.
+          { name: DARWIN_LANE_JOB_NAME, conclusion: "skipped" },
+        ],
       },
     });
 
@@ -425,6 +486,117 @@ test("main() alerts when the latest completed run's darwin lane did not execute,
     assert.equal(code, 1);
     assert.equal(github.calls.createIssue.length, 1);
     assert.match(github.calls.createIssue[0].title, /darwin lane not executing/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("main() does not alert on the darwin lane when its job has never appeared in the run-history window (not yet landed)", async () => {
+  const rootDir = tempRoot();
+  try {
+    writeLedger(rootDir, []);
+    writeTimings(rootDir, { capturedAt: new Date().toISOString() });
+    const stdout = captureStream();
+    const stderr = captureStream();
+    const github = fakeGithub({
+      runs: [{ id: 1, status: "completed", conclusion: "success", createdAt: "2026-09-11T00:00:00Z", url: "u1" }],
+      jobsByRunId: {
+        // The Darwin lane job name never appears anywhere in the fetched
+        // jobs -- this is the pre-PR-A state on main today. It must read as
+        // "unknown, not yet landed", never as a false "not executing" alert.
+        1: [{ name: "Product route + engine slow", conclusion: "success", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] }],
+      },
+    });
+
+    const code = await main({ rootDir, stdout: stdout.stream, stderr: stderr.stream, now: new Date(), github });
+
+    assert.equal(code, 0);
+    assert.equal(github.calls.createIssue.length, 0);
+    assert.equal(github.calls.updateIssue.length, 0);
+    assert.match(stdout.text, /healthy/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("main() does not false-alert when the newest completed run was cancelled -- it evaluates lane execution against the prior real run", async () => {
+  const rootDir = tempRoot();
+  try {
+    writeLedger(rootDir, []);
+    writeTimings(rootDir, { capturedAt: new Date().toISOString() });
+    const stdout = captureStream();
+    const stderr = captureStream();
+    const github = fakeGithub({
+      runs: [
+        { id: 2, status: "completed", conclusion: "cancelled", createdAt: "2026-09-11T00:00:00Z", url: "u2" },
+        { id: 1, status: "completed", conclusion: "success", createdAt: "2026-09-10T00:00:00Z", url: "u1" },
+      ],
+      jobsByRunId: {
+        // Cancelled run: both lanes read as skipped/cancelled purely because
+        // the run was cancelled, not because either lane stopped executing.
+        2: [
+          { name: "Product route + engine slow", conclusion: "cancelled", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "cancelled" }] },
+          { name: DARWIN_LANE_JOB_NAME, conclusion: "cancelled" },
+        ],
+        1: [
+          { name: "Product route + engine slow", conclusion: "success", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] },
+          { name: DARWIN_LANE_JOB_NAME, conclusion: "success" },
+        ],
+      },
+    });
+
+    const code = await main({ rootDir, stdout: stdout.stream, stderr: stderr.stream, now: new Date(), github });
+
+    assert.equal(code, 0);
+    assert.equal(github.calls.createIssue.length, 0);
+    assert.match(stdout.text, /healthy/);
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("main() does not false-alert when the newest run's job-list fetch fails -- it falls back to the prior successfully-fetched run", async () => {
+  const rootDir = tempRoot();
+  try {
+    writeLedger(rootDir, []);
+    writeTimings(rootDir, { capturedAt: new Date().toISOString() });
+    const stdout = captureStream();
+    const stderr = captureStream();
+    const runs = [
+      { id: 2, status: "completed", conclusion: "failure", createdAt: "2026-09-11T00:00:00Z", url: "u2" },
+      { id: 1, status: "completed", conclusion: "success", createdAt: "2026-09-10T00:00:00Z", url: "u1" },
+    ];
+    const github = {
+      calls: { createIssue: [], updateIssue: [] },
+      async listWorkflowRuns() {
+        return runs;
+      },
+      async listJobsForRun(runId) {
+        if (runId === 2) throw new Error("simulated GitHub API 502");
+        return [
+          { name: "Product route + engine slow", conclusion: "success", steps: [{ name: ENGINE_SLOW_STEP_NAME, conclusion: "success" }] },
+          { name: DARWIN_LANE_JOB_NAME, conclusion: "success" },
+        ];
+      },
+      async ensureLabel() {},
+      async findHealthIssue() {
+        return null;
+      },
+      async createIssue(args) {
+        this.calls.createIssue.push(args);
+        return { number: 101, url: "https://github.com/example/example/issues/101" };
+      },
+      async updateIssue(number, args) {
+        this.calls.updateIssue.push({ number, ...args });
+      },
+    };
+
+    const code = await main({ rootDir, stdout: stdout.stream, stderr: stderr.stream, now: new Date(), github });
+
+    assert.equal(code, 0);
+    assert.equal(github.calls.createIssue.length, 0);
+    assert.match(stderr.text, /failed to list jobs for run 2/);
+    assert.match(stdout.text, /healthy/);
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

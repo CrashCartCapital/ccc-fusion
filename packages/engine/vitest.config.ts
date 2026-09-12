@@ -91,7 +91,7 @@ export default defineConfig({
           FNXC:EngineTests 2026-07-08-06:20:
           FN-7670 prototyped extending this same lever to the @fusion/engine
           RELATIVE-import production graph (`../merger.js`, `../hold-release.js`,
-          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that the 18 gate
+          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that the 16 gate
           files reach directly — NOT the barrel above, which stays untouched per
           the paragraph above regardless. It built a fully working, coverage-
           parity-preserving, mock-safe bundle (171 first-party files → 35 output
@@ -142,7 +142,7 @@ export default defineConfig({
           /*
           FNXC:EngineTests 2026-07-08-04:50:
           FN-7669: prepend the gate-bundle builder to this project's globalSetup so
-          the @fusion/core bundle above is rebuilt before any of the 18 forks spawn
+          the @fusion/core bundle above is rebuilt before any of the 16 forks spawn
           and resolve the alias. REBUILD-EVERY-RUN is the invalidation model — the
           builder's own esbuild dependency graph (not a hand list) determines what
           gets bundled, and because it reruns on every gate invocation there is no

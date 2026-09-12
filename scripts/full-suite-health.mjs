@@ -34,8 +34,11 @@ export const DEFAULT_REPO_SLUG = "CrashCartCapital/ccc-fusion";
 // full-suite.yml. The Darwin lane job does not exist on main yet (it lands with
 // PR-A / full-suite-workflow-dispatch, plan work package W0-darwin); this constant
 // records the job `name:` the plan commits to. If PR-A ships a different display
-// name, update this constant in the same PR — otherwise this health check will
-// (correctly, if confusingly) keep reporting the lane as "not executing" forever.
+// name, update this constant in the same PR. Until a job/step by this exact name
+// has actually been observed at least once in the run-history lookback window
+// (see `collectKnownNames`), `main()` treats the lane as "not yet landed" rather
+// than "not executing" and never alerts on it — so this constant naming a lane
+// that doesn't exist yet cannot produce a guaranteed false alert on every run.
 export const ENGINE_SLOW_STEP_NAME = "Run engine-slow with non-empty-execution assertion";
 export const DARWIN_LANE_JOB_NAME = "Darwin proof lane (M2 native)";
 
@@ -131,6 +134,61 @@ export function computeLaneExecution(jobs) {
     engineSlowExecuted: stepExecuted(jobs, ENGINE_SLOW_STEP_NAME),
     darwinLaneExecuted: jobExecuted(jobs, DARWIN_LANE_JOB_NAME),
   };
+}
+
+/**
+ * Collect every job name and step name that appears anywhere across a set of
+ * fetched job lists, regardless of conclusion (present-but-skipped counts as
+ * "seen"; entirely absent does not). This is how `main()` tells "this lane
+ * doesn't exist in the workflow yet, or was renamed/removed" (never seen at
+ * all across the lookback window) apart from "this lane exists but isn't
+ * executing right now" (seen, just not currently running) — a lane that
+ * hasn't landed yet, or whose name no longer matches, can then never produce
+ * a guaranteed false "not executing" alert; see `jobExecuted`/`stepExecuted`,
+ * which both collapse "absent" and "present but skipped" into the same
+ * `false`, and DARWIN_LANE_JOB_NAME's own doc comment above.
+ *
+ * @param {Array<Array<{ name: string, steps?: Array<{ name: string }> }>>} jobsByRun one fetched job list per run
+ * @returns {{ jobNames: Set<string>, stepNames: Set<string> }}
+ */
+export function collectKnownNames(jobsByRun) {
+  const jobNames = new Set();
+  const stepNames = new Set();
+  for (const jobs of jobsByRun ?? []) {
+    for (const job of jobs ?? []) {
+      if (job?.name) jobNames.add(job.name);
+      for (const step of job?.steps ?? []) {
+        if (step?.name) stepNames.add(step.name);
+      }
+    }
+  }
+  return { jobNames, stepNames };
+}
+
+/**
+ * The most recent lane-execution row worth alerting on: the newest run whose
+ * OWN job-list fetch succeeded and whose conclusion is decisive
+ * (`success`/`failure` — the same two conclusions `computeRedStreak` treats
+ * as decisive; everything else, including `cancelled`, is inconclusive
+ * there for the same reason it is here). GitHub Actions reports a cancelled
+ * run's `status` as `"completed"` too, so without this a cancelled-latest-run
+ * would read both lanes as "not executing" purely because cancelled jobs
+ * read as skipped/cancelled, not because either lane actually stopped
+ * running. A row whose `listJobsForRun` call failed is skipped the same
+ * way: an API/setup failure must never be conflated with a real "not
+ * executing" finding (see `main`'s own exit-code contract).
+ *
+ * @param {Array<{ run: { conclusion: string|null }, jobsFetchFailed: boolean }>} laneRows newest-first
+ * @returns {object|null}
+ */
+export function findLatestExecutionRow(laneRows) {
+  for (const row of laneRows ?? []) {
+    if (row.jobsFetchFailed) continue;
+    if (row.run.conclusion === "success" || row.run.conclusion === "failure") {
+      return row;
+    }
+  }
+  return null;
 }
 
 /**
@@ -421,8 +479,17 @@ export function readVitestConfigSources(rootDir) {
 
 function formatRunRow(row) {
   const run = row.run;
-  const engine = run.status === "completed" ? (row.engineSlowExecuted ? "ran" : "DID NOT RUN") : "n/a";
-  const darwin = run.status === "completed" ? (row.darwinLaneExecuted ? "ran" : "DID NOT RUN") : "n/a";
+  const unknown = run.status === "completed" && row.jobsFetchFailed;
+  const engine = unknown
+    ? "unknown (job fetch failed)"
+    : run.status === "completed"
+      ? (row.engineSlowExecuted ? "ran" : "DID NOT RUN")
+      : "n/a";
+  const darwin = unknown
+    ? "unknown (job fetch failed)"
+    : run.status === "completed"
+      ? (row.darwinLaneExecuted ? "ran" : "DID NOT RUN")
+      : "n/a";
   return `- ${run.createdAt ?? "unknown-date"}  run ${run.id}  ${run.conclusion ?? run.status}  engine-slow=${engine}  darwin-lane=${darwin}  ${run.url ?? ""}`;
 }
 
@@ -629,16 +696,23 @@ export async function main(options = {}) {
   const redStreak = computeRedStreak(completedRuns);
 
   const laneRows = [];
+  const jobsByRun = [];
   for (const run of completedRuns) {
     let jobs = [];
+    let jobsFetchFailed = false;
     try {
       jobs = await github.listJobsForRun(run.id);
     } catch (error) {
+      jobsFetchFailed = true;
       stderr.write(`[full-suite-health] failed to list jobs for run ${run.id}: ${error.message}\n`);
     }
-    laneRows.push({ run, ...computeLaneExecution(jobs) });
+    jobsByRun.push(jobs);
+    laneRows.push({ run, jobsFetchFailed, ...computeLaneExecution(jobs) });
   }
-  const latestRow = laneRows[0] ?? null;
+  const latestRow = findLatestExecutionRow(laneRows);
+  const { jobNames: knownJobNames, stepNames: knownStepNames } = collectKnownNames(jobsByRun);
+  const engineSlowLaneKnown = knownStepNames.has(ENGINE_SLOW_STEP_NAME);
+  const darwinLaneKnown = knownJobNames.has(DARWIN_LANE_JOB_NAME);
 
   const timingsStaleness = computeTimingsStaleness(readTimingsSnapshot(rootDir), now);
   const ledgerFiles = readLedgerFiles(rootDir);
@@ -648,8 +722,11 @@ export async function main(options = {}) {
 
   const alertReasons = [];
   if (redStreak >= RED_STREAK_ALERT_THRESHOLD) alertReasons.push(`red streak ${redStreak}`);
-  if (latestRow && !latestRow.engineSlowExecuted) alertReasons.push("engine-slow lane not executing");
-  if (latestRow && !latestRow.darwinLaneExecuted) alertReasons.push("darwin lane not executing");
+  // Gated on "has this job/step ever been observed in the lookback window at
+  // all" so a lane that hasn't landed yet (Darwin, pre-PR-A) or was renamed
+  // reads as "unknown, say nothing" rather than a guaranteed false alert.
+  if (latestRow && engineSlowLaneKnown && !latestRow.engineSlowExecuted) alertReasons.push("engine-slow lane not executing");
+  if (latestRow && darwinLaneKnown && !latestRow.darwinLaneExecuted) alertReasons.push("darwin lane not executing");
 
   if (alertReasons.length === 0) {
     stdout.write("[full-suite-health] healthy: no red-streak or lane-execution alert condition met.\n");

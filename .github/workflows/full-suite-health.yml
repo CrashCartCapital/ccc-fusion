@@ -10,6 +10,14 @@ name: Full Suite health
 # updates ONE tracking issue on a red streak or a lane that silently stopped
 # executing (engine-slow, the Darwin proof lane). It never touches
 # full-suite.yml itself and it is never a merge gate.
+#
+# The quarantine ledger step runs with `continue-on-error: true` and the
+# health-report step runs with `if: always()` so a strict ledger-deadline
+# breach (near/expired quarantine) can never silently abort the job before
+# the heartbeat itself ever executes — that would reproduce the exact
+# "silent gap" failure class this workflow exists to close. The final step
+# re-asserts the ledger step's own pass/fail signal (after the heartbeat has
+# already run) so a real deadline breach still fails the workflow.
 
 on:
   schedule:
@@ -41,9 +49,18 @@ jobs:
         uses: ./.github/actions/setup-node-pnpm
 
       - name: Quarantine ledger deadline check (strict)
+        id: quarantine_ledger
+        continue-on-error: true
         run: pnpm check:quarantine-ledger --strict
 
       - name: Full Suite health report
+        if: always()
         run: node scripts/full-suite-health.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if the quarantine ledger deadline check failed
+        if: always() && steps.quarantine_ledger.outcome == 'failure'
+        run: |
+          echo "Quarantine ledger deadline check failed (see the step above) — failing the job now that the heartbeat has run." >&2
+          exit 1
