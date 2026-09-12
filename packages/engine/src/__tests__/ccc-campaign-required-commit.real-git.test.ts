@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { itProofHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
+import { itConfinedVerifierHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import type {
   CccCampaignProductExecutionRoute,
   CccCampaignTaskContext,
@@ -170,6 +170,34 @@ function node(shape: ExecutorShape): WorkflowIrNode {
   };
 }
 
+/*
+Why 20 of the cases below sit on `itConfinedVerifierHost`, and where they are
+actually covered.
+
+`enforceCccCampaignRequiredCommitAfterNode` calls `verifyCccCampaignReadyCandidate`
+(ccc-campaign-required-commit.ts), which runs the sealed verifier through
+`runVerificationCommand` (ccc-campaign-ready.ts). On Linux that refuses outright
+without bubblewrap at a trusted system path -- "bubblewrap is required for
+verifier confinement on Linux" (run-verification-tool.ts). So those cases need a
+confinement backend, and only a backend: the fixture's sealed proof command is
+`node -e "process.exit(0)"`, with no Taskfile target anywhere in the closure,
+which is why the gate is the Task-free one.
+
+Coverage today, stated plainly rather than assumed: this file is in the
+`engine-default` Vitest project (packages/engine/vitest.config.ts), and
+engine-default runs only in full-suite.yml's `test-shards` job on the plain
+`[self-hosted, linux, ARM64, ccc-fusion]` lane, which has no bubblewrap. The one
+bwrap-equipped lane, `ccc-fusion-bwrap`, runs the pr-checks Gate job and
+full-suite's `test-slow` job (engine-slow + engine-product-route only). So in CI
+these 20 cases skip on every lane that exists, and the coverage they do get is a
+Darwin developer host. That is a real gap, not a platform inevitability -- but
+moving this file onto the bwrap lane is blocked first: the test git containment
+policy (packages/core/src/__test-utils__/git-subprocess-policy.ts) still refuses
+`-c core.fsmonitor=false` / `-c core.hooksPath=<null-device>`, which production
+code passes unconditionally, so on Linux they would swap a skip for a
+`rule=config-option-not-allowlisted` failure. Close that allowlist gap first,
+then give this file a bwrap-capable project.
+*/
 describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 }, () => {
   const scratchRoots: string[] = [];
 
@@ -276,7 +304,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
-  itProofHost.each<ExecutorShape>(["model", "cli-agent"])(
+  itConfinedVerifierHost.each<ExecutorShape>(["model", "cli-agent"])(
     "creates the %s campaign commit from one admitted dirty source change",
     async (shape) => {
       const h = await fixture(shape);
@@ -312,7 +340,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
-  itProofHost("reuses an exact controller-verified fingerprint without rerunning the sealed verifier", async () => {
+  itConfinedVerifierHost("reuses an exact controller-verified fingerprint without rerunning the sealed verifier", async () => {
     const h = await fixture();
     await writeFile(
       join(h.worktree, "src", "task-0", "result.txt"),
@@ -358,7 +386,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "rev-parse", "HEAD")).not.toBe(h.baseCommit);
   });
 
-  itProofHost.each<[
+  itConfinedVerifierHost.each<[
     string,
     (handoff: CccCampaignReadyCommitHandoff) => CccCampaignReadyCommitHandoff,
   ]>([
@@ -612,7 +640,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
   });
 
-  itProofHost("refuses an admitted mutation that lands after readiness proof but before staging", async () => {
+  itConfinedVerifierHost("refuses an admitted mutation that lands after readiness proof but before staging", async () => {
     const h = await fixture();
     const candidatePath = join(h.worktree, "src", "task-0", "result.txt");
     await writeFile(candidatePath, "verified bytes\n", "utf8");
@@ -631,7 +659,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
   });
 
-  itProofHost("does not run target-repository hooks while creating the controller-owned commit", async () => {
+  itConfinedVerifierHost("does not run target-repository hooks while creating the controller-owned commit", async () => {
     const h = await fixture();
     const hookMarker = join(h.rootDir, "pre-commit-hook-ran");
     const commonGitDir = await git(h.worktree, "rev-parse", "--git-common-dir");
@@ -923,7 +951,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     );
   }
 
-  itProofHost("commits a chained successor's dirty change when its worktree starts at the predecessor's tip", async () => {
+  itConfinedVerifierHost("commits a chained successor's dirty change when its worktree starts at the predecessor's tip", async () => {
     const h = await chainFixture();
     await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
 
@@ -1197,7 +1225,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     );
   }
 
-  itProofHost("commits a join successor's dirty change when its worktree starts at the merged join base", async () => {
+  itConfinedVerifierHost("commits a join successor's dirty change when its worktree starts at the merged join base", async () => {
     const h = await joinFixture();
     await writeFile(join(h.worktreeD, "src", "task-d", "result.txt"), "d\n", "utf8");
 
@@ -1286,7 +1314,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     });
   });
 
-  itProofHost("keeps imported-lineage entry-task commit creation identical", async () => {
+  itConfinedVerifierHost("keeps imported-lineage entry-task commit creation identical", async () => {
     const h = await fixture();
     h.task.lineageId = `ccc-prd:${CHAIN_IMPORT_ID}:${h.task.id}`;
     await writeFile(
@@ -1313,7 +1341,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
    * required-commit seam is the fallback the CLI-agent path lands on, because a
    * cli-agent node never produces a verified-candidate handoff.
    */
-  itProofHost.each<ExecutorShape>(["model", "cli-agent"])(
+  itConfinedVerifierHost.each<ExecutorShape>(["model", "cli-agent"])(
     "commits a %s candidate that carries the controller's own ignored ownership marker",
     async (shape) => {
       const h = await fixture(shape);

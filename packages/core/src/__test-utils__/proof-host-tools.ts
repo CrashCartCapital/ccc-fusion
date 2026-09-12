@@ -22,6 +22,20 @@
  *     `run-verification-tool.ts`). The semantic-proof sandbox specifically has
  *     no Linux backend at all, so it gets its own stricter Darwin-only gate.
  *
+ * Confinement and the Task runner are two separate capabilities and the gates
+ * keep them separate. A suite whose sealed proof command is plain `node` needs
+ * `itConfinedVerifierHost` (backend only); a suite that materialises or executes
+ * a Taskfile target needs `itRequiresTask` as well, which is why
+ * `itSemanticProofHost` — whose suites all embed `TASK_BIN` — demands both.
+ * Folding Task into the confinement gate would skip suites for a capability
+ * they never use.
+ *
+ * Skip reasons state the missing capability and how to supply it, and nothing
+ * else. They deliberately make no claim about which CI lane covers the suite:
+ * this module cannot see the caller's Vitest project, so any such claim is
+ * unverifiable from here and drifts silently when lanes change. Where a suite
+ * is covered is recorded at the gate site, next to the tests it applies to.
+ *
  * Every inspection takes an injectable probe (platform, `exists`, PATH lookup,
  * env) so the unit test can state a verdict for a host it is not running on.
  */
@@ -45,17 +59,17 @@ export const DARWIN_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
  */
 export const TRUSTED_LINUX_SANDBOX_PATHS = ["/usr/bin/bwrap", "/bin/bwrap"] as const;
 
-const PROOF_HOST_NOT_RUN_REASON =
-  "NOT RUN: requires a trusted proof host (darwin sandbox-exec or linux bwrap); "
-  + "covered by full-suite darwin-proof-lane";
+const CONFINED_VERIFIER_NOT_RUN_REASON =
+  `NOT RUN: requires a verifier confinement backend (darwin ${DARWIN_SANDBOX_EXEC_PATH}, or linux `
+  + `bubblewrap at ${TRUSTED_LINUX_SANDBOX_PATHS.join(" or ")}); install bubblewrap to enable it `
+  + "on Linux";
 
 const SEMANTIC_PROOF_HOST_NOT_RUN_REASON =
-  "NOT RUN: requires the Darwin semantic-proof sandbox (sandbox-exec), which has no Linux "
-  + "backend; covered by full-suite darwin-proof-lane";
+  `NOT RUN: requires the Darwin semantic-proof sandbox (${DARWIN_SANDBOX_EXEC_PATH}), which has no `
+  + "Linux backend; only a Darwin host can run it";
 
 const TASK_NOT_RUN_REASON =
-  `NOT RUN: requires the Task runner (set ${FUSION_TASK_BIN_ENV} or put \`task\` on PATH); `
-  + "covered by full-suite darwin-proof-lane";
+  `NOT RUN: requires the Task runner (set ${FUSION_TASK_BIN_ENV} or put \`task\` on PATH)`;
 
 const PYTHON3_NOT_RUN_REASON =
   "NOT RUN: requires an executable python3 on PATH; install python3 in the test environment";
@@ -187,12 +201,19 @@ export function inspectPython3(probe: HostProbe = {}): HostCapability {
   return { available: true, path: resolved, reason: `python3: ${resolved}` };
 }
 
-function detectConfinementBackend(probe: HostProbe): ProofHostBackend | null {
+function detectConfinementBackend(
+  probe: HostProbe,
+): { backend: ProofHostBackend; path: string } | null {
   const exists = probeExists(probe);
   const platform = probePlatform(probe);
-  if (platform === "darwin") return exists(DARWIN_SANDBOX_EXEC_PATH) ? "sandbox-exec" : null;
+  if (platform === "darwin") {
+    return exists(DARWIN_SANDBOX_EXEC_PATH)
+      ? { backend: "sandbox-exec", path: DARWIN_SANDBOX_EXEC_PATH }
+      : null;
+  }
   if (platform === "linux") {
-    return TRUSTED_LINUX_SANDBOX_PATHS.some((path) => exists(path)) ? "bubblewrap" : null;
+    const bwrap = TRUSTED_LINUX_SANDBOX_PATHS.find((path) => exists(path));
+    return bwrap ? { backend: "bubblewrap", path: bwrap } : null;
   }
   return null;
 }
@@ -208,27 +229,29 @@ function backendDetail(probe: HostProbe): string {
 
 /**
  * A host that can confine a verifier: Darwin `sandbox-exec` or Linux bubblewrap
- * at a trusted system path, plus a resolvable Task runner.
+ * at a trusted system path.
+ *
+ * Confinement only — deliberately no Task requirement. The suites on this gate
+ * reach `runVerificationCommand` (via `verifyCccCampaignReadyCandidate`), which
+ * refuses on Linux without bubblewrap, but their sealed proof command is plain
+ * `node`. `path` is the confinement binary, not a Task runner; a suite that also
+ * needs Task stacks `itRequiresTask` or uses `itSemanticProofHost`.
  */
-export function inspectProofHost(probe: HostProbe = {}): ProofHostInspection {
-  const backend = detectConfinementBackend(probe);
-  if (!backend) {
+export function inspectConfinedVerifierHost(probe: HostProbe = {}): ProofHostInspection {
+  const detected = detectConfinementBackend(probe);
+  if (!detected) {
     return {
       available: false,
       backend: null,
       path: null,
-      reason: `${PROOF_HOST_NOT_RUN_REASON} [${backendDetail(probe)}]`,
+      reason: `${CONFINED_VERIFIER_NOT_RUN_REASON} [${backendDetail(probe)}]`,
     };
-  }
-  const task = inspectTaskRunner(probe);
-  if (!task.available) {
-    return { available: false, backend: null, path: null, reason: task.reason };
   }
   return {
     available: true,
-    backend,
-    path: task.path,
-    reason: `proof host ready (${backend}, task=${task.path})`,
+    backend: detected.backend,
+    path: detected.path,
+    reason: `verifier confinement ready (${detected.backend} at ${detected.path})`,
   };
 }
 
@@ -266,34 +289,32 @@ export function inspectSemanticProofHost(probe: HostProbe = {}): ProofHostInspec
  * Live host verdicts. Evaluated once per test-file module instance.
  *
  * The Task and python3 probes shell out, so the live verdicts are computed once
- * and the proof-host verdicts reuse the memoised Task result rather than
- * re-running `which` for each gate.
+ * and the semantic-proof verdict reuses the memoised Task result rather than
+ * re-running `which`. The confinement verdict is pure filesystem work and needs
+ * no Task probe at all.
  * ------------------------------------------------------------------------- */
 
 const TASK_RUNNER = inspectTaskRunner();
 const PYTHON3 = inspectPython3();
+const CONFINED_VERIFIER_HOST = inspectConfinedVerifierHost();
 
-function liveProofHost(semanticOnly: boolean): ProofHostInspection {
-  const backend = semanticOnly
-    ? (process.platform === "darwin" && existsSync(DARWIN_SANDBOX_EXEC_PATH) ? "sandbox-exec" as const : null)
-    : detectConfinementBackend({});
-  if (!backend) {
-    const probe: HostProbe = {};
-    return semanticOnly ? inspectSemanticProofHost(probe) : inspectProofHost(probe);
+function liveSemanticProofHost(): ProofHostInspection {
+  if (process.platform !== "darwin" || !existsSync(DARWIN_SANDBOX_EXEC_PATH)) {
+    // Refuses on the platform check, so this never re-probes the Task runner.
+    return inspectSemanticProofHost({});
   }
   if (!TASK_RUNNER.available) {
     return { available: false, backend: null, path: null, reason: TASK_RUNNER.reason };
   }
   return {
     available: true,
-    backend,
+    backend: "sandbox-exec",
     path: TASK_RUNNER.path,
-    reason: `${semanticOnly ? "semantic proof host" : "proof host"} ready (${backend}, task=${TASK_RUNNER.path})`,
+    reason: `semantic proof host ready (sandbox-exec, task=${TASK_RUNNER.path})`,
   };
 }
 
-const PROOF_HOST = liveProofHost(false);
-const SEMANTIC_PROOF_HOST = liveProofHost(true);
+const SEMANTIC_PROOF_HOST = liveSemanticProofHost();
 
 /**
  * Resolved Task runner path. Always a string so a suite that only embeds the
@@ -311,8 +332,8 @@ export function hasPython3(probe?: HostProbe): boolean {
   return probe ? inspectPython3(probe).available : PYTHON3.available;
 }
 
-export function hasProofHost(probe?: HostProbe): boolean {
-  return probe ? inspectProofHost(probe).available : PROOF_HOST.available;
+export function hasConfinedVerifierHost(probe?: HostProbe): boolean {
+  return probe ? inspectConfinedVerifierHost(probe).available : CONFINED_VERIFIER_HOST.available;
 }
 
 export function hasSemanticProofHost(probe?: HostProbe): boolean {
@@ -325,7 +346,7 @@ export function hasSemanticProofHost(probe?: HostProbe): boolean {
  * this once. Only unmet capabilities are listed; a fully equipped host is silent.
  */
 function announceMissingCapabilities(): void {
-  const missing = [TASK_RUNNER, PYTHON3, PROOF_HOST, SEMANTIC_PROOF_HOST]
+  const missing = [TASK_RUNNER, PYTHON3, CONFINED_VERIFIER_HOST, SEMANTIC_PROOF_HOST]
     .filter((capability) => !capability.available)
     .map((capability) => `  - ${capability.reason}`);
   if (missing.length === 0) return;
@@ -340,16 +361,17 @@ announceMissingCapabilities();
 
 /* ------------------------------------------------------------------------- *
  * Gates. `it.skip` / `describe.skip` (never a no-op) so Vitest still registers
- * the suite: a file with zero registered tests is a Vitest failure, and the
- * macOS proof lane asserts a non-zero executed count.
+ * the suite: a file with zero registered tests is a Vitest failure, and
+ * `scripts/assert-engine-slow-nonempty.mjs` (full-suite's test-slow job) fails
+ * the lane on a zero executed count.
  * ------------------------------------------------------------------------- */
 
-/** Runs only on a host with a trusted confinement backend and a Task runner. */
-export const describeProofHost: typeof vitestDescribe = PROOF_HOST.available
+/** Runs only on a host with a trusted confinement backend. No Task requirement. */
+export const describeConfinedVerifierHost: typeof vitestDescribe = CONFINED_VERIFIER_HOST.available
   ? vitestDescribe
   : (vitestDescribe.skip as typeof vitestDescribe);
 
-export const itProofHost: typeof vitestIt = PROOF_HOST.available
+export const itConfinedVerifierHost: typeof vitestIt = CONFINED_VERIFIER_HOST.available
   ? vitestIt
   : (vitestIt.skip as typeof vitestIt);
 
@@ -382,7 +404,7 @@ export const itRequiresPython3: typeof vitestIt = PYTHON3.available
 
 /** The exact reason strings, for suites that want to assert or log them. */
 export const proofHostSkipReasons = {
-  proofHost: PROOF_HOST.reason,
+  confinedVerifierHost: CONFINED_VERIFIER_HOST.reason,
   semanticProofHost: SEMANTIC_PROOF_HOST.reason,
   task: TASK_RUNNER.reason,
   python3: PYTHON3.reason,
