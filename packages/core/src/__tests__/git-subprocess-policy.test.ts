@@ -61,6 +61,64 @@ describe("test git subprocess policy", () => {
     ], context)).toBe(TRUSTED_GIT);
   });
 
+  it("names the rule that fired, plus the full invocation context, when it refuses", () => {
+    const context = policyContext();
+    const outside = dirname(context.workerRoot);
+
+    // A refusal that only says "outside the worker root" cannot be triaged:
+    // eight distinct conditions share the throw, and the message never showed
+    // which one fired, what the resolved offending value was, or what the
+    // worker root actually is. CI run 34617605454 produced 74 of these.
+    const directoryRefusal = (() => {
+      try {
+        resolveTrustedTestGitFile(TRUSTED_GIT, ["-C", outside, "status"], context);
+        throw new Error("expected a refusal");
+      } catch (error) {
+        return (error as Error).message;
+      }
+    })();
+
+    expect(directoryRefusal).toContain("rule=path-option-outside-worker-root");
+    expect(directoryRefusal).toContain(`executable=${TRUSTED_GIT}`);
+    expect(directoryRefusal).toContain("args=-C ");
+    expect(directoryRefusal).toContain(`cwd=${context.cwd}`);
+    expect(directoryRefusal).toContain(`workerRoot=${context.workerRoot}`);
+    expect(directoryRefusal).toContain(outside);
+
+    // The exact shape the Linux shards hit: an in-worker -C target with a
+    // hardening -c option that the allowlist does not name.
+    const configRefusal = (() => {
+      try {
+        resolveTrustedTestGitFile(
+          TRUSTED_GIT,
+          ["-c", "core.fsmonitor=false", "-C", context.cwd, "rev-parse", "--is-inside-work-tree"],
+          context,
+        );
+        throw new Error("expected a refusal");
+      } catch (error) {
+        return (error as Error).message;
+      }
+    })();
+
+    expect(configRefusal).toContain("rule=config-option-not-allowlisted");
+    expect(configRefusal).toContain("core.fsmonitor=false");
+
+    const envRefusal = (() => {
+      try {
+        resolveTrustedTestGitFile(TRUSTED_GIT, ["status"], {
+          ...context,
+          env: { ...process.env, GIT_WORK_TREE: outside },
+        });
+        throw new Error("expected a refusal");
+      } catch (error) {
+        return (error as Error).message;
+      }
+    })();
+
+    expect(envRefusal).toContain("rule=git-path-env-outside-worker-root");
+    expect(envRefusal).toContain("GIT_WORK_TREE");
+  });
+
   it("does not bypass the ambient git guard for an outside cwd or target", () => {
     const context = policyContext();
     const outside = dirname(context.workerRoot);

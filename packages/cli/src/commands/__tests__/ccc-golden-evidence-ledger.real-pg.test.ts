@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +7,7 @@ import {
   expect,
   it,
 } from "vitest";
+import { itSemanticProofHost } from "../../../../core/src/__test-utils__/proof-host-tools.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
@@ -38,14 +38,10 @@ type CommandJson = {
 // (sandbox-exec, Darwin-only today; see
 // docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md). The tests that
 // depend on a successful real import can only pass on a host with that
-// backend, mirroring the same itSemanticHost gate the engine's own real
-// end-to-end proof tests use, rather than faking readiness via DI and
+// backend, so they use the shared itSemanticProofHost gate the engine's own
+// real end-to-end proof tests use, rather than faking readiness via DI and
 // letting the real sandbox spawn fail differently underneath.
-const itSemanticHost = process.platform === "darwin"
-  && existsSync("/usr/bin/sandbox-exec")
-  && existsSync("/opt/homebrew/bin/task")
-  ? it
-  : it.skip;
+const itSemanticHost = itSemanticProofHost;
 
 async function prepareLifecycle(root: string): Promise<PreparedLifecycle> {
   const module = await import("../../../../../scripts/lib/ccc-golden-packet-lifecycle.mjs") as {

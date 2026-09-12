@@ -5,6 +5,11 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  TASK_BIN,
+  itRequiresTask,
+  itSemanticProofHost,
+} from "../../../core/src/__test-utils__/proof-host-tools.js";
+import {
   buildCccSemanticProofDarwinProfile,
   inspectCccSemanticProofSandboxReadiness,
   isCccSemanticProofSandboxReady,
@@ -53,7 +58,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it("RED-R1-python-semantic-v2-sandbox: exposes only sealed Python runtime files and denies their original roots", async () => {
+  itRequiresTask("RED-R1-python-semantic-v2-sandbox: exposes only sealed Python runtime files and denies their original roots", async () => {
     const root = await fixtureRoot();
     const proofRoot = join(root, "proof");
     const scratchRoot = join(root, "scratch");
@@ -76,7 +81,7 @@ describe("CCC semantic-proof sandbox", () => {
     const profile = await buildCccSemanticProofDarwinProfile({
       proofRoot,
       scratchRoot,
-      taskExecutable: "/opt/homebrew/bin/task",
+      taskExecutable: TASK_BIN,
       nodeExecutable: process.execPath,
       deniedReadRoots: [originalRuntimeRoot],
       pythonExecutable,
@@ -88,7 +93,7 @@ describe("CCC semantic-proof sandbox", () => {
     expect(profile).toContain(`(deny file-read* (subpath "${realpathSync(originalRuntimeRoot)}"))`);
   });
 
-  it("RED-S5-darwin-proof-sandbox: grants only proof reads and scratch writes while denying repositories and network", async () => {
+  itRequiresTask("RED-S5-darwin-proof-sandbox: grants only proof reads and scratch writes while denying repositories and network", async () => {
     const root = await fixtureRoot();
     const proofRoot = join(root, "proof");
     const scratchRoot = join(root, "scratch");
@@ -104,7 +109,7 @@ describe("CCC semantic-proof sandbox", () => {
     const profile = await buildCccSemanticProofDarwinProfile({
       proofRoot,
       scratchRoot,
-      taskExecutable: "/opt/homebrew/bin/task",
+      taskExecutable: TASK_BIN,
       nodeExecutable: process.execPath,
       deniedReadRoots: [targetRepository, engineRepository],
     });
@@ -119,7 +124,7 @@ describe("CCC semantic-proof sandbox", () => {
     expect(profile).toContain(realpathSync(engineRepository));
   });
 
-  it("RED-G2-node-loopback-profile: grants only one controller-selected IPv4 loopback port", async () => {
+  itRequiresTask("RED-G2-node-loopback-profile: grants only one controller-selected IPv4 loopback port", async () => {
     const root = await fixtureRoot();
     const proofRoot = join(root, "proof");
     const scratchRoot = join(root, "scratch");
@@ -129,7 +134,7 @@ describe("CCC semantic-proof sandbox", () => {
     const profile = await buildCccSemanticProofDarwinProfile({
       proofRoot,
       scratchRoot,
-      taskExecutable: "/opt/homebrew/bin/task",
+      taskExecutable: TASK_BIN,
       nodeExecutable: process.execPath,
       deniedReadRoots: [deniedRoot],
       loopbackPort: 43_219,
@@ -146,14 +151,14 @@ describe("CCC semantic-proof sandbox", () => {
     await expect(buildCccSemanticProofDarwinProfile({
       proofRoot,
       scratchRoot,
-      taskExecutable: "/opt/homebrew/bin/task",
+      taskExecutable: TASK_BIN,
       nodeExecutable: process.execPath,
       deniedReadRoots: [deniedRoot],
       loopbackPort: 4_040,
     } as never)).rejects.toThrow(/loopback.*4040|4040.*reserved/iu);
   });
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-G2-node-loopback-profile: injects its controller port and permits a self-contained loopback exchange",
     async () => {
       const root = await fixtureRoot();
@@ -217,11 +222,11 @@ describe("CCC semantic-proof sandbox", () => {
       const result = await runCccSemanticProofSandboxedProcess({
         proofRoot,
         scratchRoot,
-        taskExecutable: "/opt/homebrew/bin/task",
+        taskExecutable: TASK_BIN,
         nodeExecutable: process.execPath,
         deniedReadRoots: [deniedRoot],
         loopbackPort,
-        executable: "/opt/homebrew/bin/task",
+        executable: TASK_BIN,
         args: ["loopback"],
         timeoutMs: 10_000,
         maxOutputBytes: 16_384,
@@ -239,7 +244,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-S5-darwin-proof-sandbox: functionally denies original-repository reads and proof-root writes",
     async () => {
       const root = await fixtureRoot();
@@ -302,7 +307,7 @@ describe("CCC semantic-proof sandbox", () => {
         result = await runCccSemanticProofSandboxedProcess({
           proofRoot,
           scratchRoot,
-          taskExecutable: "/opt/homebrew/bin/task",
+          taskExecutable: TASK_BIN,
           nodeExecutable: process.execPath,
           deniedReadRoots: [targetRepository, engineRepository],
           executable: process.execPath,
@@ -344,7 +349,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-S5-controller-environment: passes only validated controller proof identity variables",
     async () => {
       const root = await fixtureRoot();
@@ -370,7 +375,7 @@ describe("CCC semantic-proof sandbox", () => {
         const result = await runCccSemanticProofSandboxedProcess({
           proofRoot,
           scratchRoot,
-          taskExecutable: "/opt/homebrew/bin/task",
+          taskExecutable: TASK_BIN,
           nodeExecutable: process.execPath,
           deniedReadRoots: [deniedRoot],
           executable: process.execPath,
@@ -452,7 +457,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-S5-real-task-toolchain: runs the admitted Task target with only the sealed Node and controller identity",
     async () => {
       const root = await fixtureRoot();
@@ -477,10 +482,10 @@ describe("CCC semantic-proof sandbox", () => {
       const result = await runCccSemanticProofSandboxedProcess({
         proofRoot,
         scratchRoot,
-        taskExecutable: "/opt/homebrew/bin/task",
+        taskExecutable: TASK_BIN,
         nodeExecutable: process.execPath,
         deniedReadRoots: [deniedRoot],
-        executable: "/opt/homebrew/bin/task",
+        executable: TASK_BIN,
         args: ["--taskfile", "Taskfile.yml", "verify:probe"],
         proofEnvironment: {
           CCC_PROOF_ID: "PROOF-task-probe",
@@ -500,7 +505,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-GOLDEN-nested-node: an admitted Node verifier can execute the same sealed Node",
     async () => {
       const root = await fixtureRoot();
@@ -520,7 +525,7 @@ describe("CCC semantic-proof sandbox", () => {
       const result = await runCccSemanticProofSandboxedProcess({
         proofRoot,
         scratchRoot,
-        taskExecutable: "/opt/homebrew/bin/task",
+        taskExecutable: TASK_BIN,
         nodeExecutable: process.execPath,
         deniedReadRoots: [deniedRoot],
         executable: process.execPath,
@@ -534,7 +539,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-S5-evidence-exactness: refuses bounded output overflow instead of truncating semantic evidence",
     async () => {
       const root = await fixtureRoot();
@@ -550,7 +555,7 @@ describe("CCC semantic-proof sandbox", () => {
       const result = await runCccSemanticProofSandboxedProcess({
         proofRoot,
         scratchRoot,
-        taskExecutable: "/opt/homebrew/bin/task",
+        taskExecutable: TASK_BIN,
         nodeExecutable: process.execPath,
         deniedReadRoots: [deniedRoot],
         executable: process.execPath,
@@ -564,7 +569,7 @@ describe("CCC semantic-proof sandbox", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")(
+  itSemanticProofHost(
     "RED-S5-undeclared-helper: a sealed harness cannot import an undeclared helper from the denied target repository",
     async () => {
       const root = await fixtureRoot();
@@ -596,7 +601,7 @@ describe("CCC semantic-proof sandbox", () => {
       const result = await runCccSemanticProofSandboxedProcess({
         proofRoot,
         scratchRoot,
-        taskExecutable: "/opt/homebrew/bin/task",
+        taskExecutable: TASK_BIN,
         nodeExecutable: process.execPath,
         deniedReadRoots: [targetRepository, engineRepository],
         executable: process.execPath,
