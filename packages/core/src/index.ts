@@ -189,6 +189,7 @@ export {
   type ResolvedAgentMemoryInclusionMode,
 } from "./agent-memory-mode.js";
 export type { TaskReviewData, TaskReviewSummary, TaskReviewItem } from "./types.js";
+export * from "./ccc-model-capability-profile.js";
 /* FNXC:TaskVerificationRequest 2026-07-30-00:00: FN-8296 makes the persisted verification read model available to dashboard task and Command Center surfaces without exporting a subprocess runner. */
 export type { TaskVerificationRequest, TaskVerificationResultSummary, TaskVerificationStatus, TaskVerificationProfile } from "./types.js";
 export type {
