@@ -926,6 +926,34 @@ pgTest("CCC campaign live-execution approval", () => {
     const fixture = await importFixture("runner-gate");
     const task = await h.store().getTask(fixture.firstTaskId);
     if (!task) throw new Error("missing imported live-execution task");
+    // The fixed executionFence below (leaseOwner "runner-gate-owner", attempt 1)
+    // asserts a live claim on the imported work item, not just a shape match:
+    // assertLiveWorkItemFence requires a real workflow_work_items row in state
+    // "running" with that exact leaseOwner/attempt/runId before it stops
+    // refusing. A freshly imported work item starts "held" with no lease, so it
+    // has to be advanced here the same way the sibling "sealed-parent" test does
+    // it, via the same compare-and-swap transition the real runtime uses.
+    const leasedWorkItem = await h.store().transitionWorkflowWorkItem(
+      fixture.workItem.id,
+      "running",
+      {
+        expectedState: fixture.workItem.state,
+        expectedAttempt: fixture.workItem.attempt,
+        expectedLeaseOwner: fixture.workItem.leaseOwner,
+        attempt: 1,
+        leaseOwner: "runner-gate-owner",
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      },
+    );
+    expect(leasedWorkItem).toMatchObject({
+      id: fixture.workItem.id,
+      taskId: fixture.firstTaskId,
+      runId: fixture.workItem.runId,
+      state: "running",
+      attempt: 1,
+      leaseOwner: "runner-gate-owner",
+      leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+    });
     const node: WorkflowIrNode = {
       id: "ccc-live-execution-node",
       kind: "prompt",
@@ -960,6 +988,15 @@ pgTest("CCC campaign live-execution approval", () => {
       }),
     });
     const executor = new TaskExecutor(h.store(), fixture.rootDir);
+    // A rejected/failed provider turn still runs the required-commit custody
+    // check, which refuses unless the task already has a real, registered
+    // isolated worktree (assertRegisteredIsolatedWorktree). Provision one the
+    // same way the production runtime does before dispatching a coding node.
+    await executor.createAuthoritativeWorkflowNodePreparation({} as Settings)(
+      node,
+      task,
+      { requiresWorktree: true },
+    );
     const providerEffect = vi.spyOn(
       executor as never,
       "runGraphCustomNode" as never,
