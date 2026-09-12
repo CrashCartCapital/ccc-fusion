@@ -333,7 +333,7 @@ export class InProcessRuntime
    * explicit wakeup cannot launch the same durable candidate before its first
    * claim has reached PostgreSQL.
    */
-  private readonly campaignWorkflowContinuationsInFlight = new Set<string>();
+  private readonly campaignWorkflowContinuationsInFlight = new Map<string, Promise<unknown>>();
   private cccCampaignProofBootstrapPromise?: Promise<void>;
   private cccCampaignProofBootstrapError?: Error;
   private cccCampaignWorkflowRuntime?: WorkflowTaskRuntime;
@@ -2270,8 +2270,7 @@ export class InProcessRuntime
             );
             continue;
           }
-          this.campaignWorkflowContinuationsInFlight.add(processingKey);
-          void processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
+          const continuation = processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
             leaseOwner: this.campaignWorkflowLeaseOwner(),
             leaseDurationMs: 10 * 60_000,
             kinds: [resolved.item.kind],
@@ -2289,6 +2288,8 @@ export class InProcessRuntime
               releaseExecution();
               this.campaignWorkflowContinuationsInFlight.delete(processingKey);
             });
+          // The fence owns the promise; the `.catch` above is its only handler.
+          this.campaignWorkflowContinuationsInFlight.set(processingKey, continuation);
           continue;
         }
         void this.executor.execute(resolved.task).catch((error) => {
@@ -2297,6 +2298,28 @@ export class InProcessRuntime
       }
     } finally {
       this.workflowContinuationDrainActive = false;
+    }
+  }
+
+  /**
+   * FNXC:WorkflowScheduling 2026-09-12:
+   * Await every campaign continuation this runtime has already dispatched.
+   *
+   * `drainWorkflowContinuations` only *launches* campaign processing: it
+   * resolves as soon as the bounded due-item scan has handed each candidate to
+   * `processDueWorkflowWorkItem`, whose own tail keeps writing after the work
+   * item reaches a terminal state (sealed-authorization close-out, run-audit
+   * rows, task-log diagnostics). A caller that needs the campaign's database
+   * work quiescent — not merely its terminal state observable — must await
+   * this, otherwise those writes race whatever the caller does next. The
+   * recurring 2s processor deliberately does not await it; a live engine wants
+   * the next scan to overlap in-flight campaign work.
+   */
+  async settleWorkflowContinuations(): Promise<void> {
+    // A settling continuation can enqueue a follow-up before this resolves, so
+    // re-read the fence until it is empty rather than snapshotting once.
+    while (this.campaignWorkflowContinuationsInFlight.size > 0) {
+      await Promise.allSettled([...this.campaignWorkflowContinuationsInFlight.values()]);
     }
   }
 

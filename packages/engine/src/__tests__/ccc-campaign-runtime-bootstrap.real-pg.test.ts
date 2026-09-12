@@ -71,6 +71,29 @@ type RuntimeHarness = InProcessRuntime & {
   drainWorkflowContinuations: () => Promise<void>;
 };
 
+/*
+FNXC:CCCCampaignRuntimeBootstrap 2026-09-12:
+Every runtime this file builds shares ONE PostgreSQL database with every other
+test in its describe block, and the shared harness wipes that database with a
+single `TRUNCATE ... CASCADE` in beforeEach. A campaign continuation dispatched
+by `drainWorkflowContinuations` outlives the test body — its tail still closes
+sealed authorizations, inserts run-audit rows, and writes task-log diagnostics
+after the work item's terminal state becomes observable. Left running, that tail
+holds row locks on project.ccc_prd_imports / project.tasks while the next test's
+TRUNCATE takes AccessExclusiveLock table by table, and the two lock orders
+deadlock (40P01). Register each runtime here and settle it in afterEach so no
+campaign work is ever in flight when the next TRUNCATE starts — including after
+a failed assertion, which returns from the body with the tail still running.
+*/
+const liveRuntimes: RuntimeHarness[] = [];
+
+async function settleLiveRuntimes(): Promise<void> {
+  const runtimes = liveRuntimes.splice(0, liveRuntimes.length);
+  for (const runtime of runtimes) {
+    await runtime.settleWorkflowContinuations();
+  }
+}
+
 const ENGINE_DIST_ROOT = fileURLToPath(new URL("../../dist/", import.meta.url));
 const execFile = promisify(execFileCallback);
 const providerWorker = Object.freeze({
@@ -133,6 +156,7 @@ function runtimeWithStore(
   runtime.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
     builtRootPath: ENGINE_DIST_ROOT,
   }).then(() => undefined);
+  liveRuntimes.push(runtime);
   return runtime;
 }
 
@@ -367,7 +391,10 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
 
   beforeAll(h.beforeAll);
   beforeEach(h.beforeEach);
-  afterEach(h.afterEach);
+  afterEach(async () => {
+    await settleLiveRuntimes();
+    await h.afterEach();
+  });
   afterAll(h.afterAll);
 
   it("Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor", async () => {
@@ -520,6 +547,20 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       async () => prepareNodeExecution.mock.calls.length,
       (calls) => calls === 1,
       "authoritative coding-node preparation",
+    );
+    /*
+    FNXC:CCCCampaignRuntimeBootstrap 2026-09-12:
+    Preparation and the provider effect are two separate awaits inside the same
+    dispatched continuation, so observing the first says nothing about the
+    second. Synchronize on the provider effect too — asserting its call count
+    straight off the preparation signal failed here roughly one run in five and
+    returned from the body mid-campaign, which is exactly the state that used to
+    deadlock the next test's TRUNCATE.
+    */
+    await waitFor(
+      async () => implementNode.mock.calls.length,
+      (calls) => calls === 1,
+      "authoritative coding-node provider effect",
     );
 
     expect(runtime.executor.createAuthoritativeWorkflowNodePreparation).toHaveBeenCalledTimes(1);
@@ -1233,7 +1274,10 @@ pgTest("Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC 
 
   beforeAll(h.beforeAll);
   beforeEach(h.beforeEach);
-  afterEach(h.afterEach);
+  afterEach(async () => {
+    await settleLiveRuntimes();
+    await h.afterEach();
+  });
   afterAll(h.afterAll);
 
   it("keeps Todo/userPaused and no workflow task work across a fresh store restart", async () => {
