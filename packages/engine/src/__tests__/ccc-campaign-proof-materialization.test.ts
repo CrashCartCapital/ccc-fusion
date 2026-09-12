@@ -1055,7 +1055,11 @@ describe("CCC semantic-proof admission and materialization", () => {
 
   itRequiresTask("preserves ESM proof-host version identity after sealing outside its package", async () => {
     const fixture = await createGitFixture();
-    const outputRoot = await mkdtemp("/private/tmp/ccc-semantic-proof-output-");
+    // Canonical (symlink-free) so the sealed paths compare cleanly on macOS,
+    // where tmpdir() lives under a /var -> /private/var symlink. Never a
+    // hardcoded /private/tmp: that directory does not exist on the Linux shard
+    // runners and the test then fails in mkdtemp before proving anything.
+    const outputRoot = await realpath(await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-")));
     const hostPackageRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-esm-host-"));
     roots.push(outputRoot, hostPackageRoot);
     const proofHostPath = join(hostPackageRoot, "proof-host.js");
