@@ -1,10 +1,10 @@
 /*
 FNXC:EngineTests 2026-07-08-03:00:
-FN-7667: the `engine-core` merge-gate vitest project (18 curated gate files,
+FN-7667: the `engine-core` merge-gate vitest project (16 curated gate files,
 one OS-forked process each per `pool:"forks"`) previously aliased
 `@fusion/core` to the FULL package barrel (`index.ts`). Every gate fork
 independently transformed+imported the entire barrel graph even though the
-18 gate files never reach most of it — organic barrel growth (new feature
+16 gate files never reach most of it — organic barrel growth (new feature
 re-exports) silently inflated `pnpm test:gate` /
 `pnpm --filter @fusion/engine test:core` wall-time for every gate file, not
 just tests that exercise the new code (FN-7666 bisected this: 10 new core
@@ -16,9 +16,9 @@ statements for the 10 modules added to the barrel since that baseline
 (builtin-coding-ideas-workflow-ir, git-cli-status, gitlab-issue-analytics,
 gitlab-tracking, planner-confirmation, planner-intervention,
 planner-overseer-events, planner-overseer-state, planner-recovery,
-plugins/bundled-plugin-install) — none of which the 18 curated engine-core
+plugins/bundled-plugin-install) — none of which the 16 curated engine-core
 gate files exercise (verified by tracing the full relative-import closure of
-those 18 files; see the task's `docs` document for the trace + rationale).
+those 16 files; see the task's `docs` document for the trace + rationale).
 It is wired up via a project-scoped `resolve.alias` in
 `packages/engine/vitest.config.ts`'s `engine-core` project ONLY — every other
 vitest project (`engine-default`, `engine-reliability`, `engine-slow`) keeps

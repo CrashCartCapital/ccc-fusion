@@ -71,7 +71,7 @@ export default defineConfig({
           bundle, see scripts/build-engine-core-gate-bundle.mjs for the full repro)
           instead of directly at index.gate.ts's source. FN-7668 profiled the
           gate's dominant wall-time cost as vitest/Vite SSR's import-phase — each
-          of the 18 pool:"forks" processes independently re-resolving+evaluating
+          of the 16 pool:"forks" processes independently re-resolving+evaluating
           the ~430-file barrel closure with zero cross-fork sharing. esbuild-
           bundling the index.gate.ts closure (220 first-party files, the
           @fusion/core slice of that ~430) into one file
@@ -81,8 +81,8 @@ export default defineConfig({
           fork. See the task's docs document for the full A/B measurement,
           coverage-parity proof, and land/no-land rationale.
           @fusion/engine is deliberately left on the full barrel, unbundled: none
-          of the 18 curated gate files import "@fusion/engine" at all (verified by
-          grep across all 18 files), so bundling it would be zero-benefit
+          of the 16 curated gate files import "@fusion/engine" at all (verified by
+          grep across all 16 files), so bundling it would be zero-benefit
           churn/risk — and it would additionally risk double-registering or
           dead-locking the core↔engine circular-import DI
           (`void import("@fusion/core").then(setCreateFnAgent...)` in
