@@ -71,6 +71,7 @@ export const DARWIN_PROOF_LANE_SUITES = Object.freeze([
     project: null,
     files: Object.freeze([
       "src/commands/__tests__/ccc-golden-evidence-ledger.real-pg.test.ts",
+      "src/commands/__tests__/prd-built-cli-authoring.test.ts",
     ]),
   }),
 ]);

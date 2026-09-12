@@ -40,7 +40,8 @@
  * env) so the unit test can state a verdict for a host it is not running on.
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { basename } from "node:path";
 import { describe as vitestDescribe, it as vitestIt } from "vitest";
 
 /** Operator/CI override naming the exact Task runner to use. */
@@ -74,6 +75,11 @@ const TASK_NOT_RUN_REASON =
 const PYTHON3_NOT_RUN_REASON =
   "NOT RUN: requires an executable python3 on PATH; install python3 in the test environment";
 
+const VERSIONED_PYTHON3_NOT_RUN_REASON =
+  "NOT RUN: requires a python3 on PATH whose canonical (realpath) form is a versioned "
+  + "pythonX.Y binary; a shim or wrapper (for example a pyenv shim) that does not resolve to a "
+  + "versioned interpreter cannot build these fixtures";
+
 export interface HostProbe {
   /** Defaults to `process.env`. */
   env?: NodeJS.ProcessEnv;
@@ -83,6 +89,8 @@ export interface HostProbe {
   exists?: (path: string) => boolean;
   /** Defaults to a real `which`/`where` lookup. Returns an absolute path or null. */
   which?: (name: string) => string | null;
+  /** Defaults to `node:fs` `realpathSync`. */
+  realpath?: (path: string) => string;
 }
 
 export type ProofHostBackend = "sandbox-exec" | "bubblewrap";
@@ -109,6 +117,10 @@ function probePlatform(probe: HostProbe): NodeJS.Platform {
 
 function probeExists(probe: HostProbe): (path: string) => boolean {
   return probe.exists ?? existsSync;
+}
+
+function probeRealpath(probe: HostProbe): (path: string) => string {
+  return probe.realpath ?? realpathSync;
 }
 
 /**
@@ -199,6 +211,60 @@ export function inspectPython3(probe: HostProbe = {}): HostCapability {
     }
   }
   return { available: true, path: resolved, reason: `python3: ${resolved}` };
+}
+
+export interface VersionedPython3 {
+  /** The PATH-resolved python3 launcher, before following symlinks. */
+  launcherPath: string;
+  /** `realpathSync(launcherPath)`: the canonical, symlink-resolved interpreter. */
+  canonicalPath: string;
+  /** The `X.Y` version parsed from the canonical basename (`pythonX.Y`). */
+  version: string;
+}
+
+/**
+ * A subset of hosts with an executable python3: one whose canonical
+ * (realpath-resolved) form is a versioned `pythonX.Y` binary. Fixtures that
+ * build a fake `.venv` around a real interpreter (matching it by version, e.g.
+ * `lib/python3.12/site-packages`) need this, not just any executable on PATH.
+ * A version manager shim (pyenv, asdf, ...) is real and executable but does
+ * not resolve to a versioned binary, so `resolvePython3Binary` alone is not
+ * enough for those fixtures.
+ */
+export function resolveVersionedPython3Binary(probe: HostProbe = {}): VersionedPython3 | null {
+  const launcherPath = resolvePython3Binary(probe);
+  if (!launcherPath) return null;
+  const realpath = probeRealpath(probe);
+  let canonicalPath: string;
+  try {
+    canonicalPath = realpath(launcherPath);
+  } catch {
+    return null;
+  }
+  const version = basename(canonicalPath).match(/^python(\d+\.\d+)$/u)?.[1];
+  if (!version) return null;
+  return { launcherPath, canonicalPath, version };
+}
+
+export function inspectVersionedPython3(probe: HostProbe = {}): HostCapability {
+  const resolved = resolveVersionedPython3Binary(probe);
+  if (resolved) {
+    return {
+      available: true,
+      path: resolved.launcherPath,
+      reason: `versioned python3: ${resolved.launcherPath} -> ${resolved.canonicalPath} `
+        + `(python${resolved.version})`,
+    };
+  }
+  const python3 = inspectPython3(probe);
+  const detail = python3.available
+    ? `${python3.path} does not resolve (realpath) to a versioned pythonX.Y binary`
+    : "no python3 on PATH";
+  return {
+    available: false,
+    path: null,
+    reason: `${VERSIONED_PYTHON3_NOT_RUN_REASON} [${detail}]`,
+  };
 }
 
 function detectConfinementBackend(
@@ -296,6 +362,7 @@ export function inspectSemanticProofHost(probe: HostProbe = {}): ProofHostInspec
 
 const TASK_RUNNER = inspectTaskRunner();
 const PYTHON3 = inspectPython3();
+const VERSIONED_PYTHON3 = inspectVersionedPython3();
 const CONFINED_VERIFIER_HOST = inspectConfinedVerifierHost();
 
 function liveSemanticProofHost(): ProofHostInspection {
@@ -346,7 +413,7 @@ export function hasSemanticProofHost(probe?: HostProbe): boolean {
  * this once. Only unmet capabilities are listed; a fully equipped host is silent.
  */
 function announceMissingCapabilities(): void {
-  const missing = [TASK_RUNNER, PYTHON3, CONFINED_VERIFIER_HOST, SEMANTIC_PROOF_HOST]
+  const missing = [TASK_RUNNER, PYTHON3, VERSIONED_PYTHON3, CONFINED_VERIFIER_HOST, SEMANTIC_PROOF_HOST]
     .filter((capability) => !capability.available)
     .map((capability) => `  - ${capability.reason}`);
   if (missing.length === 0) return;
@@ -402,10 +469,26 @@ export const itRequiresPython3: typeof vitestIt = PYTHON3.available
   ? vitestIt
   : (vitestIt.skip as typeof vitestIt);
 
+/**
+ * Runs only when the PATH-resolved python3 also resolves (via realpath) to a
+ * versioned `pythonX.Y` binary. Strictly narrower than `hasPython3`/
+ * `itRequiresPython3`: a version-manager shim (pyenv, asdf, ...) satisfies the
+ * plain python3 gate but not this one, because it does not resolve to a
+ * versioned binary.
+ */
+export const describeRequiresVersionedPython3: typeof vitestDescribe = VERSIONED_PYTHON3.available
+  ? vitestDescribe
+  : (vitestDescribe.skip as typeof vitestDescribe);
+
+export const itRequiresVersionedPython3: typeof vitestIt = VERSIONED_PYTHON3.available
+  ? vitestIt
+  : (vitestIt.skip as typeof vitestIt);
+
 /** The exact reason strings, for suites that want to assert or log them. */
 export const proofHostSkipReasons = {
   confinedVerifierHost: CONFINED_VERIFIER_HOST.reason,
   semanticProofHost: SEMANTIC_PROOF_HOST.reason,
   task: TASK_RUNNER.reason,
   python3: PYTHON3.reason,
+  versionedPython3: VERSIONED_PYTHON3.reason,
 } as const;

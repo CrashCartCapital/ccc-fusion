@@ -14,10 +14,58 @@ import { basename, dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CCC_PRD_SEMANTIC_PROOF_HOST_ID } from "@fusion/core";
 import {
+  itRequiresPython3,
+  itRequiresVersionedPython3,
+  resolvePython3Binary,
+  resolveVersionedPython3Binary,
+} from "../../../../core/src/__test-utils__/proof-host-tools.js";
+import {
   resolveCccPrdSemanticProofToolchainPaths,
   resolveCccPrdTargetPythonPathRoots,
 } from "../ccc-semantic-proof-toolchain.js";
 import { repoRoot } from "./prd-built-cli-fixture.js";
+
+/**
+ * The host's real python3, resolved the same way the shared proof-host gate
+ * resolves it (PATH lookup, then a live `--version` probe). A hardcoded
+ * `/usr/bin/python3` or `/opt/homebrew/bin/python3` only exists on a
+ * Homebrew-managed Darwin host or a traditional Linux distro install; a
+ * uv-managed venv interpreter (as CI now provisions on Linux) resolves through
+ * a `python3` PATH entry instead, so tests that need "some real python3
+ * launcher" must resolve it the same way, not assume a fixed path per
+ * platform. Callers only reach this from an `itRequiresPython3`-gated test, so
+ * a null result here means the gate itself has a defect, not a missing host
+ * capability.
+ */
+function resolveTestPython3Launcher(): string {
+  const resolved = resolvePython3Binary();
+  if (!resolved) {
+    throw new Error(
+      "resolvePython3Binary() found no python3 on PATH; itRequiresPython3 should have skipped this test",
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Like `resolveTestPython3Launcher`, but for the target-venv fixtures below
+ * that build a fake `.venv` matched to the real interpreter's `X.Y` version
+ * (`lib/pythonX.Y/site-packages`). Those fixtures need a python3 whose
+ * canonical (realpath) form is a versioned `pythonX.Y` binary -- a
+ * version-manager shim (pyenv, asdf, ...) is real and on PATH but does not
+ * resolve to one, so plain PATH resolution is not enough here. Callers only
+ * reach this from an `itRequiresVersionedPython3`-gated test.
+ */
+function resolveTestVersionedPython3Launcher(): string {
+  const resolved = resolveVersionedPython3Binary();
+  if (!resolved) {
+    throw new Error(
+      "resolveVersionedPython3Binary() found no versioned python3 on PATH; "
+      + "itRequiresVersionedPython3 should have skipped this test",
+    );
+  }
+  return resolved.launcherPath;
+}
 
 describe("CCC semantic-proof CLI toolchain resolver", () => {
   it("RED-S5-dedicated-proof-host: binds a movable self-contained proof host and never the ambient test runner", () => {
@@ -57,23 +105,19 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
     })).toThrow(/Task executable is absent from PATH/u);
   });
 
-  it("RED-R1-python-semantic-v2-toolchain: admits an explicitly controller-selected python3 executable without ambient fallback", () => {
-    const pythonExecutablePath = process.platform === "darwin"
-      ? "/opt/homebrew/bin/python3"
-      : "/usr/bin/python3";
+  itRequiresPython3("RED-R1-python-semantic-v2-toolchain: admits an explicitly controller-selected python3 executable without ambient fallback", () => {
+    const pythonExecutablePath = resolveTestPython3Launcher();
     const resolved = resolveCccPrdSemanticProofToolchainPaths({ pythonExecutablePath } as any);
     expect(resolved.pythonExecutablePath).toBe(realpathSync(pythonExecutablePath));
   });
 
-  it("RED-R1-python-semantic-v2-pythonpath: forwards a canonical target .venv site-packages root", () => {
+  itRequiresPython3("RED-R1-python-semantic-v2-pythonpath: forwards a canonical target .venv site-packages root", () => {
     const isolatedRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-pythonpath-"));
     try {
       const sitePackagesRoot = join(isolatedRoot, ".venv", "lib", "python3.12", "site-packages");
       mkdirSync(sitePackagesRoot, { recursive: true });
       const canonicalSitePackagesRoot = realpathSync(sitePackagesRoot);
-      const pythonExecutablePath = process.platform === "darwin"
-        ? "/opt/homebrew/bin/python3"
-        : "/usr/bin/python3";
+      const pythonExecutablePath = resolveTestPython3Launcher();
       const resolved = resolveCccPrdSemanticProofToolchainPaths({
         pythonExecutablePath,
         pythonPathRoots: [canonicalSitePackagesRoot],
@@ -84,10 +128,10 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
     }
   });
 
-  it("RED-R1-python-semantic-v2-target-venv: resolves the active target interpreter and exactly one versioned site-packages root", () => {
+  itRequiresVersionedPython3("RED-R1-python-semantic-v2-target-venv: resolves the active target interpreter and exactly one versioned site-packages root", () => {
     const targetRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-target-venv-"));
     try {
-      const launcher = process.platform === "darwin" ? "/opt/homebrew/bin/python3" : "/usr/bin/python3";
+      const launcher = resolveTestVersionedPython3Launcher();
       const canonicalPython = realpathSync(launcher);
       const version = basename(canonicalPython).match(/^python(\d+\.\d+)$/u)?.[1];
       if (!version) throw new Error(`test launcher is not versioned: ${canonicalPython}`);
@@ -116,10 +160,10 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
     }
   });
 
-  it("RED-R1-python-semantic-v2-target-venv: admits a resolved uv-style home alias that matches the canonical interpreter home", () => {
+  itRequiresVersionedPython3("RED-R1-python-semantic-v2-target-venv: admits a resolved uv-style home alias that matches the canonical interpreter home", () => {
     const targetRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-target-venv-home-alias-"));
     try {
-      const launcher = process.platform === "darwin" ? "/opt/homebrew/bin/python3" : "/usr/bin/python3";
+      const launcher = resolveTestVersionedPython3Launcher();
       const canonicalPython = realpathSync(launcher);
       const version = basename(canonicalPython).match(/^python(\d+\.\d+)$/u)?.[1];
       if (!version) throw new Error(`test launcher is not versioned: ${canonicalPython}`);
@@ -149,11 +193,11 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
     }
   });
 
-  it("RED-R1-python-semantic-v2-target-venv: refuses absent, ambiguous, symlinked, and mismatched active roots", () => {
+  itRequiresVersionedPython3("RED-R1-python-semantic-v2-target-venv: refuses absent, ambiguous, symlinked, and mismatched active roots", () => {
     const makeTarget = (setup: (venvRoot: string, version: string, canonicalPython: string) => void) => {
       const targetRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-target-venv-invalid-"));
       const venvRoot = join(targetRoot, ".venv");
-      const launcher = process.platform === "darwin" ? "/opt/homebrew/bin/python3" : "/usr/bin/python3";
+      const launcher = resolveTestVersionedPython3Launcher();
       const canonicalPython = realpathSync(launcher);
       const version = basename(canonicalPython).match(/^python(\d+\.\d+)$/u)?.[1] ?? "3.12";
       mkdirSync(join(venvRoot, "bin"), { recursive: true });
