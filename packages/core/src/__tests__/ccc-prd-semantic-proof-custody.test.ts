@@ -16,8 +16,10 @@ import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   assertCccPrdSemanticProofV2Custody,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofExecutionToolchainSha256,
   computeCccPrdProofV2AdmissionDigests,
   hydrateCccPrdSemanticProofV2Custody,
+  type CccPrdLinkedRuntimeEntry,
   type CccPrdProofV2,
   type CccPrdSemanticProofToolchainPaths,
 } from "../ccc-prd/index.js";
@@ -247,7 +249,43 @@ describe("CCC PRD semantic-proof controller custody", () => {
       expect(hydratedWithoutAdmission!.executionToolchain.linkedRuntime).toEqual([]);
       return;
     }
-    expect(hydratedWithoutAdmission!.executionToolchain.linkedRuntime.length).toBeGreaterThan(1);
+    if (hydratedWithoutAdmission!.executionToolchain.linkedRuntime.length < 2) {
+      // A statically linked node -- such as the official actions/setup-node
+      // tarball the Darwin CI runner uses -- links no non-system libraries,
+      // so this host cannot supply two real Homebrew-linked entries to
+      // reorder (the fixture's task/proof-host stand-ins are not real
+      // Mach-O binaries either). Exercise the exact order-insensitive
+      // comparison assertCccPrdSemanticProofV2Custody relies on --
+      // computeCccPrdProofExecutionToolchainSha256's canonical sort of
+      // linkedRuntime -- directly against a synthetic two-entry manifest,
+      // rather than skip the property outright.
+      const syntheticEntry = (
+        loaderRole: CccPrdLinkedRuntimeEntry["loaderRole"],
+        suffix: string,
+      ): CccPrdLinkedRuntimeEntry => ({
+        platform: "darwin",
+        loaderRole,
+        loaderPath: `/opt/homebrew/opt/fixture-${suffix}/bin/loader`,
+        requestedPath: `@rpath/libfixture-${suffix}.dylib`,
+        canonicalPath: `/opt/homebrew/opt/fixture-${suffix}/lib/libfixture-${suffix}.dylib`,
+        sha256: sha256(`ccc-semantic-custody-synthetic-linked-runtime-${suffix}`),
+      });
+      const forward = [syntheticEntry("task", "a"), syntheticEntry("node", "b")];
+      const reversed = [...forward].reverse();
+      expect(reversed).not.toEqual(forward);
+      const forwardToolchain = {
+        ...hydratedWithoutAdmission!.executionToolchain,
+        linkedRuntime: forward,
+      };
+      const reversedToolchain = {
+        ...hydratedWithoutAdmission!.executionToolchain,
+        linkedRuntime: reversed,
+      };
+      expect(computeCccPrdProofExecutionToolchainSha256(reversedToolchain)).toBe(
+        computeCccPrdProofExecutionToolchainSha256(forwardToolchain),
+      );
+      return;
+    }
     const reordered = {
       ...hydratedWithoutAdmission!,
       executionToolchain: {
