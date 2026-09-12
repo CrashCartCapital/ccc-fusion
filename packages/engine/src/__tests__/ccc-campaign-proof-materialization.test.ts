@@ -507,8 +507,18 @@ describe("CCC semantic-proof admission and materialization", () => {
     );
     if (process.platform === "darwin") {
       const sealedNodeLib = resolve(dirname(materialized.sealedToolchain.nodeExecutable), "..", "lib");
-      expect(await readdir(sealedNodeLib))
-        .toEqual(expect.arrayContaining([expect.stringMatching(/^libnode\.\d+\.dylib$/u)]));
+      if (definition.executionToolchain.linkedRuntime.length === 0) {
+        // A statically linked node -- such as the official actions/setup-node
+        // tarball the Darwin CI runner uses -- links no non-system
+        // libraries, so the sealer has no linked-runtime entry to
+        // materialize and never creates a lib/ directory beside the sealed
+        // node binary. Assert that absence precisely rather than skipping.
+        expect(materialized.sealedExecutionToolchain.linkedRuntime).toEqual([]);
+        await expect(readdir(sealedNodeLib)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(await readdir(sealedNodeLib))
+          .toEqual(expect.arrayContaining([expect.stringMatching(/^libnode\.\d+\.dylib$/u)]));
+      }
     }
   });
 
