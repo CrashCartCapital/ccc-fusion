@@ -353,10 +353,110 @@ reviewable. New test ids never fail the diff.
 
 The `engine-slow` vitest project (`packages/engine/src/**/*.slow.test.ts`) holds the
 long real-git suites. It runs locally via `pnpm --filter @fusion/engine test:slow` and
-in CI via the `Engine slow tier` job in `full-suite.yml` (non-blocking, push to main), which uses
-`scripts/assert-engine-slow-nonempty.mjs` to **fail if zero tests executed** (so a glob
-or config drift that silently empties the tier breaks the run instead of passing vacuously).
-The CI job uses `fetch-depth: 0` because these tests run real git operations.
+in CI via the **`Run engine-slow with non-empty-execution assertion`** step, which lives inside the
+`test-slow` job (display name **`Product route + engine slow`**) in `full-suite.yml` — there is no
+separate "Engine slow tier" job. That step uses `scripts/assert-engine-slow-nonempty.mjs` to
+**fail if zero tests executed** (so a glob or config drift that silently empties the tier breaks
+the run instead of passing vacuously). The CI job uses `fetch-depth: 0` because these tests run
+real git operations.
+
+Engine-slow is a *later* step in the same job as the serialized product-route acceptance step, sharing
+one disposable PostgreSQL service; it only runs when the product-route step ahead of it did not fail
+or get cancelled, by design — see the job's own comments in `full-suite.yml` for the exact guard
+condition. This is deliberate, not a bug: both lanes contend for the same PostgreSQL fixture on one
+runner, so a broken product-route step means engine-slow's PG-backed reliability tests would be
+exercising a fixture already known to be in a bad state. The cost is that engine-slow's own execution
+silently rides on product-route staying green — which is exactly the failure mode
+`.archive/full-suite-red-diagnosis-20260911.md` found in the wild (engine-slow ran once in a month
+because product-route kept failing ahead of it). `scripts/full-suite-health.mjs` (see "Red-streak
+clock" below) checks this specific step's conclusion on every run precisely so that silent skip is
+never invisible again.
+
+## Darwin proof lane and NOT RUN semantics (non-blocking CI)
+
+`.archive/full-suite-red-diagnosis-20260911.md` found the biggest single failure cluster in the
+sharded suite is a platform gap, not a real regression: `ccc-campaign-proof-sandbox.ts`'s semantic-v2
+proof sandbox has no Linux confinement backend, and every `test-shards`/`test-slow` runner is Linux.
+The macOS-only proof suites are the repo's only end-to-end product vertical slice for that sandbox —
+silently skipping them on Linux would make the tier deceptively green, so the plan's resolution
+(`.archive/full-suite-restore-plan-20260911.md`) is a dedicated native macOS runner lane rather than a
+silent skip: a `darwin-proof-lane` job in `full-suite.yml` on
+`[self-hosted, macOS, ARM64, ccc-fusion-darwin-proof-v1, m2max-ccc-fusion-macos-arm64-1]` (see
+`docs/ci-runtime.md` for that host's full runtime record), building dist, standing up a disposable
+Homebrew PostgreSQL instance, then running `test:product-route` plus the Darwin-only suites via
+`scripts/ci-darwin-proof-lane.mjs`, which fails the job if zero Darwin-only tests actually executed —
+the same non-empty-execution discipline `assert-engine-slow-nonempty.mjs` already applies to
+engine-slow.
+
+**NOT RUN is an explicit, named state, never a silent pass.** On every Linux shard and on `test-slow`,
+Darwin-only and bwrap-only suites report a distinct "not run on this platform" reason rather than a
+green checkmark or a bare `skip`, so no CI viewer can mistake platform-unavailable for
+platform-verified. `scripts/full-suite-health.mjs` cross-checks this from the outside too: it reads
+whether the `Darwin proof lane` job actually executed (`conclusion` present and not `skipped`) on the
+most recent completed `full-suite.yml` run and raises the same tracking issue it uses for a red streak
+if that lane silently stops running — see "Red-streak clock" below.
+
+**The committed runner image is stale documentation, not the deployed one.** `.github/runner/Dockerfile`
+in this repo describes a `pca-gha-runner:2.336.0`-based image with `bubblewrap`, `docker.io`,
+`postgresql-client`, and a pinned Go Task binary. The image actually deployed to the `ccc-fusion` Linux
+shard lane is a *different* image — `ccc-fusion-gha-runner:2.336.0-phase4-signal3`, built from
+`~/ci/runner-build-fusion` on the M2 Max — with only `docker.io` and `postgresql-client-16` installed:
+no `sudo`, no `python3`, no `bwrap`, no Task. (Only the separate `ccc-fusion-bwrap` lane, used by the
+`test-slow`/gate jobs, has `sudo`+`bwrap`.) Do not use `.github/runner/Dockerfile` as evidence of what a
+`test-shards` job can do; verify against the live runner or `docs/ci-runtime.md` instead.
+
+## Full Suite (non-blocking) heartbeat
+
+`.archive/full-suite-red-diagnosis-20260911.md` found the non-blocking tier had **no alerting at
+all**: no notify/webhook/issue step in any of the 12 workflows, and the quarantine ratchet's ledger
+(which is explicitly flakes-only, not real-bug tracking, per its own written policy above) had been
+empty since 2026-08-31 while the tier stayed red for a month. `.github/workflows/full-suite-health.yml`
+(daily schedule plus `workflow_dispatch`) is the fix: it runs `pnpm check:quarantine-ledger --strict`
+and then `scripts/full-suite-health.mjs`, which reads the last 10 `full-suite.yml` runs on `main` via
+the GitHub API and prints a plain report covering the red streak, whether the engine-slow step and the
+Darwin proof lane job actually executed on the most recent completed run, `scripts/test-timings.json`
+staleness against the 30-day budget, and any `exclude` entry whose comment claims
+`Mirrored in scripts/lib/test-quarantine.json` with no matching ledger row (the same shape of bug the
+diagnosis found in `engine-slow`'s vitest config). It never edits `full-suite.yml`, never retries
+anything, and is never a merge gate — it can open or update **one** GitHub issue (found by the
+`full-suite-health` label, so its title can change state without spawning a duplicate) and it exits 1
+only for the two conditions the ledger check itself does not already cover: a red streak at or above 3,
+or a lane that didn't execute on the latest completed run. A GitHub API/setup failure exits 2, which is
+deliberately distinct from an actual health finding.
+
+### Red-streak clock
+
+This is a separate clock from the quarantine deletion ratchet above — that one tracks an individual
+flaky *test*; this one tracks the health of the *tier as a whole*. The owner is the operator, not an
+automated process: **3 consecutive red `full-suite.yml` runs on `main`** opens (or updates) the
+`full-suite-health`-labeled tracking issue automatically; **10 runs without a written, named cause**
+recorded somewhere durable (this ledger, a linked issue, or a dated note in this file) is the point at
+which continuing to let the tier run red without a decision stops being acceptable — land a fix, or
+explicitly record the decision to keep it red and why. A single red run, or an isolated cancelled run,
+is not a signal by itself (see "Nothing hangs and nothing times out" evidence in the diagnosis for why
+transient cancellation is not itself failure).
+
+### Reading Full Suite logs
+
+`gh run view --log-failed` **silently truncates.** It returned 768 of 3,044 real lines for one failing
+job during the 2026-09-11 diagnosis — enough to look like a real (if confusing) log, not like an error,
+which is what made "Full Suite hangs" look plausible for a while when the real cause was ordinary test
+failures with a truncated transcript. The engine logger also emits NUL bytes, and macOS's `grep` (BSD
+grep) silently drops any line containing one instead of erroring, which hid further matches even after
+downloading the full log.
+
+To read a Full Suite job's log completely and reliably:
+
+```bash
+gh api repos/CrashCartCapital/ccc-fusion/actions/jobs/<job-id>/logs --allow-escape-sequences > job.log
+rg -a "FAIL|Error|assert" job.log          # -a / grep -a: treat the NUL-containing log as text
+perl -pe 's/\e\[[0-9;]*[mK]//g' job.log > job.clean.log   # strip ANSI color codes for a plain read
+```
+
+Find `<job-id>` from `gh run view <run-id> --json jobs` or the Actions UI job URL. Before concluding a
+job "hung", compare its log's ending against a **passing** shard from the same run — a passing shard's
+log can end the same abrupt-looking way, which is itself the disproof of the timeout theory (see the
+diagnosis's "Nothing hangs and nothing times out" section).
 
 ## Quarantine ledger and the deletion ratchet
 
@@ -485,13 +585,30 @@ commensurably. Untimed packages are named in a logged warning.
 
 The snapshot carries `capturedAt`. If it is older than **30 days**, the planner prints a
 prominent warning and proceeds (balance degrades gracefully toward the file-count status
-quo, never below it) — it does **not** fail the build. Refresh is **manual/scheduled from
-the default branch only**: each CI shard uploads per-shard JSON timing artifacts (U1), and
-`node scripts/ci-test-shard.mjs --write-timings` merges them into the snapshot. Download the
-shard artifacts into `.timings/` first (the default lookup directory), or pass
-`--inputs-dir <path>` to point at wherever they were downloaded. A future
-scheduled job can gate on freshness via `node scripts/ci-test-shard.mjs --check-timings-staleness`,
-which exits non-zero when the snapshot is missing or older than the 30-day budget.
+quo, never below it) — it does **not** fail the build. Refresh **only from an all-green
+`full-suite.yml` run on `main`**: a refresh captured while shards were failing would bake stale or
+partial durations into the committed snapshot, and `--write-timings` **overwrites the snapshot
+wholesale** rather than merging incrementally, so a bad refresh cannot be repaired by re-running one
+shard.
+
+Each CI shard uploads its own per-shard JSON timing artifact (U1) with paths preserved
+relative to the workspace root — the single downloaded artifact bundle contains `.timings/timings-*.json`
+*and* `packages/*/.timings/timings-*.json` *and* `plugins/*/.timings/timings-*.json` side by side, because
+`discoverWorkspaceTimingFiles()` (`scripts/ci-test-shard.mjs`) looks for each package's own `.timings/`
+directory, not one central location. **Extract the downloaded artifact at the repo root**, not into a
+`.timings/` subdirectory — `.timings/` is only the workspace-root package's own timing directory, and
+`discoverTimingFiles()`'s directory scan is deliberately non-recursive, so nesting the whole artifact one
+level deeper under `.timings/` hides every `packages/*/.timings/` file from discovery. Then run:
+
+```bash
+node scripts/ci-test-shard.mjs --write-timings
+```
+
+with no `--inputs-dir` — that flag exists only to point at a *different* location than the
+already-workspace-rooted default, and passing it here would make the tool look in the wrong place. A
+future scheduled job can gate on freshness via `node scripts/ci-test-shard.mjs --check-timings-staleness`,
+which exits non-zero when the snapshot is missing or older than the 30-day budget; `scripts/full-suite-health.mjs`
+(see "Full Suite (non-blocking) heartbeat" above) reports the same staleness signal daily without gating anything.
 
 ## Weekly test velocity baseline
 

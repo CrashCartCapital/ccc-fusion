@@ -71,7 +71,7 @@ export default defineConfig({
           bundle, see scripts/build-engine-core-gate-bundle.mjs for the full repro)
           instead of directly at index.gate.ts's source. FN-7668 profiled the
           gate's dominant wall-time cost as vitest/Vite SSR's import-phase — each
-          of the 18 pool:"forks" processes independently re-resolving+evaluating
+          of the 16 pool:"forks" processes independently re-resolving+evaluating
           the ~430-file barrel closure with zero cross-fork sharing. esbuild-
           bundling the index.gate.ts closure (220 first-party files, the
           @fusion/core slice of that ~430) into one file
@@ -81,8 +81,8 @@ export default defineConfig({
           fork. See the task's docs document for the full A/B measurement,
           coverage-parity proof, and land/no-land rationale.
           @fusion/engine is deliberately left on the full barrel, unbundled: none
-          of the 18 curated gate files import "@fusion/engine" at all (verified by
-          grep across all 18 files), so bundling it would be zero-benefit
+          of the 16 curated gate files import "@fusion/engine" at all (verified by
+          grep across all 16 files), so bundling it would be zero-benefit
           churn/risk — and it would additionally risk double-registering or
           dead-locking the core↔engine circular-import DI
           (`void import("@fusion/core").then(setCreateFnAgent...)` in
@@ -91,7 +91,7 @@ export default defineConfig({
           FNXC:EngineTests 2026-07-08-06:20:
           FN-7670 prototyped extending this same lever to the @fusion/engine
           RELATIVE-import production graph (`../merger.js`, `../hold-release.js`,
-          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that the 18 gate
+          `../scheduler.js`, `../workflow-node-handlers.js`, ...) that the 16 gate
           files reach directly — NOT the barrel above, which stays untouched per
           the paragraph above regardless. It built a fully working, coverage-
           parity-preserving, mock-safe bundle (171 first-party files → 35 output
@@ -142,7 +142,7 @@ export default defineConfig({
           /*
           FNXC:EngineTests 2026-07-08-04:50:
           FN-7669: prepend the gate-bundle builder to this project's globalSetup so
-          the @fusion/core bundle above is rebuilt before any of the 18 forks spawn
+          the @fusion/core bundle above is rebuilt before any of the 16 forks spawn
           and resolve the alias. REBUILD-EVERY-RUN is the invalidation model — the
           builder's own esbuild dependency graph (not a hand list) determines what
           gets bundled, and because it reruns on every gate invocation there is no

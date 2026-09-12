@@ -79,6 +79,7 @@ Planner oversight (FN-7508 → FN-7583) is fully documented in Settings Referenc
 | [Sandbox Backends](./sandbox.md) | Pluggable sandbox backends for executor command isolation (bubblewrap, spawn-based) |
 | [Secrets](./secrets.md) | Encrypted secrets storage, per-secret access policies, scopes, and agent tool wiring |
 | [Testing](./testing.md) | Full testing lanes, worker fanout guidance, test taxonomy, and file organization |
+| [CI Runtime](./ci-runtime.md) | Self-hosted CI host/runner topology (Linux Colima lanes, native macOS Darwin proof lane), caches, toolchains, and recovery commands |
 | [Real iOS Safari Acceptance Surface](./ios-acceptance.md) | Provisioning runbook and harness usage for terminal verification gates on physical or cloud real-iOS Safari |
 | [Solutions Catalog](./solutions/) | Documented solutions to past problems (bugs, architecture patterns, best practices) organized by category |
 | [Localization Contributing Guide](./i18n-contributing.md) | Conventions for contributing translations, locale file structure, and i18n tooling |
