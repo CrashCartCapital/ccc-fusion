@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { itProofHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import type {
   CccCampaignProductExecutionRoute,
   CccCampaignTaskContext,
@@ -275,7 +276,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
-  it.each<ExecutorShape>(["model", "cli-agent"])(
+  itProofHost.each<ExecutorShape>(["model", "cli-agent"])(
     "creates the %s campaign commit from one admitted dirty source change",
     async (shape) => {
       const h = await fixture(shape);
@@ -311,7 +312,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
-  it("reuses an exact controller-verified fingerprint without rerunning the sealed verifier", async () => {
+  itProofHost("reuses an exact controller-verified fingerprint without rerunning the sealed verifier", async () => {
     const h = await fixture();
     await writeFile(
       join(h.worktree, "src", "task-0", "result.txt"),
@@ -357,7 +358,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "rev-parse", "HEAD")).not.toBe(h.baseCommit);
   });
 
-  it.each<[
+  itProofHost.each<[
     string,
     (handoff: CccCampaignReadyCommitHandoff) => CccCampaignReadyCommitHandoff,
   ]>([
@@ -611,7 +612,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
   });
 
-  it("refuses an admitted mutation that lands after readiness proof but before staging", async () => {
+  itProofHost("refuses an admitted mutation that lands after readiness proof but before staging", async () => {
     const h = await fixture();
     const candidatePath = join(h.worktree, "src", "task-0", "result.txt");
     await writeFile(candidatePath, "verified bytes\n", "utf8");
@@ -630,7 +631,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
   });
 
-  it("does not run target-repository hooks while creating the controller-owned commit", async () => {
+  itProofHost("does not run target-repository hooks while creating the controller-owned commit", async () => {
     const h = await fixture();
     const hookMarker = join(h.rootDir, "pre-commit-hook-ran");
     const commonGitDir = await git(h.worktree, "rev-parse", "--git-common-dir");
@@ -922,7 +923,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     );
   }
 
-  it("commits a chained successor's dirty change when its worktree starts at the predecessor's tip", async () => {
+  itProofHost("commits a chained successor's dirty change when its worktree starts at the predecessor's tip", async () => {
     const h = await chainFixture();
     await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
 
@@ -1196,7 +1197,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     );
   }
 
-  it("commits a join successor's dirty change when its worktree starts at the merged join base", async () => {
+  itProofHost("commits a join successor's dirty change when its worktree starts at the merged join base", async () => {
     const h = await joinFixture();
     await writeFile(join(h.worktreeD, "src", "task-d", "result.txt"), "d\n", "utf8");
 
@@ -1285,7 +1286,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     });
   });
 
-  it("keeps imported-lineage entry-task commit creation identical", async () => {
+  itProofHost("keeps imported-lineage entry-task commit creation identical", async () => {
     const h = await fixture();
     h.task.lineageId = `ccc-prd:${CHAIN_IMPORT_ID}:${h.task.id}`;
     await writeFile(
@@ -1312,7 +1313,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
    * required-commit seam is the fallback the CLI-agent path lands on, because a
    * cli-agent node never produces a verified-candidate handoff.
    */
-  it.each<ExecutorShape>(["model", "cli-agent"])(
+  itProofHost.each<ExecutorShape>(["model", "cli-agent"])(
     "commits a %s candidate that carries the controller's own ignored ownership marker",
     async (shape) => {
       const h = await fixture(shape);

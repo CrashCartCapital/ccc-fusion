@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { itSemanticProofHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -486,7 +487,11 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     });
   });
 
-  it("product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch", async () => {
+  // Reaches the real semantic-proof sandbox, so the terminal state it asserts
+  // (PROOF_EXECUTION_REFUSED: no isolated worktree) is only observable on a host
+  // with that backend. Elsewhere the campaign stops earlier at
+  // SEMANTIC_PROOF_SANDBOX_UNAVAILABLE, which is a platform verdict, not a bug.
+  itSemanticProofHost("product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch", async () => {
     const store = h.store();
     const campaign = await importCampaignFixture(h, "product-v2-preparation", true);
     await approveLiveExecutionFixture(h, campaign);

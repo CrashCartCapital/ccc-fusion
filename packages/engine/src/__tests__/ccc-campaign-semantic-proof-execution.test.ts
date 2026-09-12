@@ -1,6 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,6 +17,10 @@ import {
   type WorkflowIrNode,
 } from "@fusion/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  TASK_BIN,
+  itSemanticProofHost,
+} from "../../../core/src/__test-utils__/proof-host-tools.js";
 import {
   CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
@@ -42,11 +45,6 @@ import { PermanentError } from "../engine-errors.js";
 
 const execFile = promisify(execFileCallback);
 const scratchRoots: string[] = [];
-const itSemanticHost = process.platform === "darwin"
-  && existsSync("/usr/bin/sandbox-exec")
-  && existsSync("/opt/homebrew/bin/task")
-  ? it
-  : it.skip;
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -496,7 +494,7 @@ async function verifierClosureEntry(
 async function liveAdmittedProof(
   f: Awaited<ReturnType<typeof fixture>>,
 ): Promise<CccPrdProofV2> {
-  const taskPath = (await execFile("which", ["task"])).stdout.trim();
+  const taskPath = TASK_BIN;
   const [taskIdentity, nodeIdentity, taskRunner, harness] = await Promise.all([
     inspectCccSemanticProofExecutable(taskPath, ["--version"]),
     inspectCccSemanticProofExecutable(process.execPath, ["--version"]),
@@ -743,7 +741,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.settle).not.toHaveBeenCalled();
   });
 
-  it("RED-G2-node-loopback-dispatch: gives only an opted-in proof one controller-selected port", async () => {
+  itSemanticProofHost("RED-G2-node-loopback-dispatch: gives only an opted-in proof one controller-selected port", async () => {
     const original = await fixture();
     const proof = readmitProofDefinition(original.proof, {
       verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" } as never,
@@ -772,7 +770,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-G2-node-loopback-dispatch: keeps the default semantic proof network-denied", async () => {
+  itSemanticProofHost("RED-G2-node-loopback-dispatch: keeps the default semantic proof network-denied", async () => {
     const f = await fixture();
     const { handler, runSandbox } = semanticHandler(f);
 
@@ -793,7 +791,7 @@ describe("CCC semantic proof v2 execution", () => {
     ], "clauseId", ["AC-REQ-A", "AC-REQ-M", "AC-REQ-Z"])).toBe(true);
   });
 
-  it("RED-G2-final-envelope-order: canonicalizes validated result sets before settlement", async () => {
+  itSemanticProofHost("RED-G2-final-envelope-order: canonicalizes validated result sets before settlement", async () => {
     const original = await fixture();
     const proof = readmitProofDefinition(original.proof, {
       clauseIds: ["AC-REQ-A", "AC-REQ-M", "AC-REQ-Z"],
@@ -841,7 +839,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-R11-proof-preflight-concurrency: serializes sealed toolchain preparation across concurrent proof nodes", async () => {
+  itSemanticProofHost("RED-R11-proof-preflight-concurrency: serializes sealed toolchain preparation across concurrent proof nodes", async () => {
     const first = await fixture();
     const second = await fixture();
     let activePreparations = 0;
@@ -870,7 +868,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(maximumActivePreparations).toBe(1);
   });
 
-  it("RED-S5-task-delta proves a serial successor from full HEAD but binds only its own delta", async () => {
+  itSemanticProofHost("RED-S5-task-delta proves a serial successor from full HEAD but binds only its own delta", async () => {
     const f = await serialSuccessorFixture();
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
 
@@ -893,7 +891,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-S5-task-proof-custody refuses candidate inputs owned only by a sibling route", async () => {
+  itSemanticProofHost("RED-S5-task-proof-custody refuses candidate inputs owned only by a sibling route", async () => {
     const f = await fixture();
     const proof = readmitProofDefinition(f.proof, {
       candidateInputs: ["sibling/result.txt"],
@@ -940,7 +938,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(materializeSemanticProof).not.toHaveBeenCalled();
   });
 
-  it("allows candidate inputs owned by a transitive dependency route", async () => {
+  itSemanticProofHost("allows candidate inputs owned by a transitive dependency route", async () => {
     const f = await serialSuccessorFixture();
     const grandPredecessorId = "FN-grand-predecessor";
     const grandPredecessorSemanticTaskId = "TASK-grand-predecessor";
@@ -1020,7 +1018,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).toHaveBeenCalledTimes(1);
   });
 
-  it("RED-S5-controller-git-custody: proof execution refuses to spawn a fake git earlier on PATH", async () => {
+  itSemanticProofHost("RED-S5-controller-git-custody: proof execution refuses to spawn a fake git earlier on PATH", async () => {
     const f = await fixture();
     const fakeBin = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-fake-git-"));
     scratchRoots.push(fakeBin);
@@ -1052,7 +1050,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  it("RED-S5-task-delta proves a join successor from full integrated HEAD but binds only its own delta", async () => {
+  itSemanticProofHost("RED-S5-task-delta proves a join successor from full integrated HEAD but binds only its own delta", async () => {
     const f = await joinSuccessorFixture();
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
 
@@ -1081,7 +1079,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-S5-task-delta refuses a serial successor when predecessor custody is missing", async () => {
+  itSemanticProofHost("RED-S5-task-delta refuses a serial successor when predecessor custody is missing", async () => {
     const f = await serialSuccessorFixture();
     f.tasks.delete(f.predecessor.id);
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
@@ -1093,7 +1091,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-task-delta refuses a serial successor with unresolvable predecessor commit custody", async () => {
+  itSemanticProofHost("RED-S5-task-delta refuses a serial successor with unresolvable predecessor commit custody", async () => {
     const f = await serialSuccessorFixture();
     f.predecessor.worktree = join(f.repo, "..", "missing-predecessor-worktree");
     f.predecessor.branch = undefined;
@@ -1106,7 +1104,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-predecessor-custody refuses a serial predecessor rewound to the frozen base", async () => {
+  itSemanticProofHost("RED-S5-predecessor-custody refuses a serial predecessor rewound to the frozen base", async () => {
     const f = await serialSuccessorFixture();
     await rewindPredecessorToBase(f.repo, f.predecessor, f.baseCommit);
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
@@ -1118,7 +1116,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-predecessor-before-base refuses a serial predecessor rewound before the frozen base", async () => {
+  itSemanticProofHost("RED-S5-predecessor-before-base refuses a serial predecessor rewound before the frozen base", async () => {
     const f = await serialSuccessorFixture();
     await rewindPredecessorToBase(f.repo, f.predecessor, f.preBaseCommit);
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
@@ -1130,7 +1128,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-predecessor-custody refuses disagreeing live predecessor custody sources", async () => {
+  itSemanticProofHost("RED-S5-predecessor-custody refuses disagreeing live predecessor custody sources", async () => {
     const f = await serialSuccessorFixture();
     f.predecessor.mergeDetails = { commitSha: f.baseCommit };
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
@@ -1142,7 +1140,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("keeps durable branch fallback when the predecessor worktree was disposed", async () => {
+  itSemanticProofHost("keeps durable branch fallback when the predecessor worktree was disposed", async () => {
     const f = await serialSuccessorFixture();
     f.predecessor.worktree = join(f.repo, "..", "disposed-predecessor-worktree");
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
@@ -1154,7 +1152,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).toHaveBeenCalledTimes(1);
   });
 
-  it("RED-S5-task-delta refuses a join successor whose join base loses one predecessor", async () => {
+  itSemanticProofHost("RED-S5-task-delta refuses a join successor whose join base loses one predecessor", async () => {
     const f = await joinSuccessorFixture();
     await execFile("git", [
       "-C",
@@ -1173,7 +1171,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-predecessor-custody refuses a join predecessor rewound to the frozen base", async () => {
+  itSemanticProofHost("RED-S5-predecessor-custody refuses a join predecessor rewound to the frozen base", async () => {
     const f = await joinSuccessorFixture();
     const rewound = f.predecessors[1]!;
     await rewindPredecessorToBase(f.repo, rewound, f.baseCommit);
@@ -1186,7 +1184,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-predecessor-before-base refuses a join predecessor rewound before the frozen base", async () => {
+  itSemanticProofHost("RED-S5-predecessor-before-base refuses a join predecessor rewound before the frozen base", async () => {
     const f = await joinSuccessorFixture();
     const rewound = f.predecessors[1]!;
     await rewindPredecessorToBase(f.repo, rewound, f.preBaseCommit);
@@ -1199,7 +1197,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-task-delta refuses a successor that made no commit after its predecessor", async () => {
+  itSemanticProofHost("RED-S5-task-delta refuses a successor that made no commit after its predecessor", async () => {
     const f = await serialSuccessorFixture({ commitSuccessor: false });
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
 
@@ -1210,7 +1208,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
   });
 
-  it("runs a task-phase proof from the sealed commit and settles canonical passing evidence", async () => {
+  itSemanticProofHost("runs a task-phase proof from the sealed commit and settles canonical passing evidence", async () => {
     const f = await fixture();
     const admission = f.proof.admission!;
     const reserve = vi.fn(async () => ({
@@ -1309,7 +1307,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-S5-sealed-toolchain-wiring: preflights and launches with materialized sealed toolchain paths only", async () => {
+  itSemanticProofHost("RED-S5-sealed-toolchain-wiring: preflights and launches with materialized sealed toolchain paths only", async () => {
     const f = await fixture();
     const admission = f.proof.admission!;
     const originalTask = f.proof.executionToolchain.task.executablePath;
@@ -1384,7 +1382,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(originalNode).not.toBe(sealedNode);
   });
 
-  it("blocks downstream work when canonical task evidence reports a semantic failure", async () => {
+  itSemanticProofHost("blocks downstream work when canonical task evidence reports a semantic failure", async () => {
     const f = await fixture();
     const stdout = `${canonicalCccPrdJson(evidenceFor(f, false))}\n`;
     const { handler, attempts } = semanticHandler(f, {
@@ -1404,7 +1402,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("durably refuses malformed stdout instead of treating exit zero as proof", async () => {
+  itSemanticProofHost("durably refuses malformed stdout instead of treating exit zero as proof", async () => {
     const f = await fixture();
     const stdout = "{}\n";
     const { handler, attempts } = semanticHandler(f, {
@@ -1423,7 +1421,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("distinguishes stdout that is not JSON at all from JSON that is merely non-canonical", async () => {
+  itSemanticProofHost("distinguishes stdout that is not JSON at all from JSON that is merely non-canonical", async () => {
     // Regression for halt ten (docs/plans/2026-09-03-ccc-gate3-campaign-ledger.md,
     // 2026-09-06 ~04:50Z): a verifier that prints a human-readable summary
     // line instead of the JSON evidence contract exited zero and was refused
@@ -1448,7 +1446,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("keeps not-canonical-json for stdout that parses but is not the canonical byte form", async () => {
+  itSemanticProofHost("keeps not-canonical-json for stdout that parses but is not the canonical byte form", async () => {
     const f = await fixture();
     // Valid, parseable JSON on a single line, but with a trailing space the
     // canonical serializer would never emit: a successful parse that fails
@@ -1472,7 +1470,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("captures a proof-id mismatch as a warning instead of only malformed_output", async () => {
+  itSemanticProofHost("captures a proof-id mismatch as a warning instead of only malformed_output", async () => {
     const f = await fixture();
     const badEvidence = { ...evidenceFor(f, true), proofId: "PROOF-other-v2" };
     const stdout = `${canonicalCccPrdJson(badEvidence)}\n`;
@@ -1493,7 +1491,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("captures a clause-results ID set mismatch as a bounded warning", async () => {
+  itSemanticProofHost("captures a clause-results ID set mismatch as a bounded warning", async () => {
     const f = await fixture();
     const badEvidence = {
       ...evidenceFor(f, true),
@@ -1517,7 +1515,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("marks an entirely empty evidence payload as unexpected-keys", async () => {
+  itSemanticProofHost("marks an entirely empty evidence payload as unexpected-keys", async () => {
     const f = await fixture();
     const { handler, attempts } = semanticHandler(f, {
       runSandbox: async () => processResult("{}\n"),
@@ -1536,7 +1534,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("captures a passed-with-nonzero-exit warning without inventing evidence", async () => {
+  itSemanticProofHost("captures a passed-with-nonzero-exit warning without inventing evidence", async () => {
     const f = await fixture();
     const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))}\n`;
     const { handler, attempts } = semanticHandler(f, {
@@ -1556,7 +1554,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("names an aggregate/result inconsistency instead of a generic parse failure", async () => {
+  itSemanticProofHost("names an aggregate/result inconsistency instead of a generic parse failure", async () => {
     const f = await fixture();
     const evidence = evidenceFor(f, true) as unknown as { passed: boolean };
     // Every result passed, but the aggregate claims failure: identity is exact,
@@ -1580,7 +1578,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it.each([
+  itSemanticProofHost.each([
     ["timeout", { timedOut: true, killed: true }],
     ["killed", { killed: true }],
     ["no_output", {}],
@@ -1604,7 +1602,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("settles a post-preflight sandbox launch refusal without inventing evidence", async () => {
+  itSemanticProofHost("settles a post-preflight sandbox launch refusal without inventing evidence", async () => {
     const f = await fixture();
     const { handler, attempts } = semanticHandler(f, {
       runSandbox: async () => {
@@ -1625,7 +1623,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("RED-S5-temp-cleanup-symlink: does not chmod an external target through a scratch symlink", async () => {
+  itSemanticProofHost("RED-S5-temp-cleanup-symlink: does not chmod an external target through a scratch symlink", async () => {
     const f = await fixture();
     const admission = f.proof.admission!;
     const externalRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-external-"));
@@ -1662,7 +1660,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect((await lstat(externalTarget)).mode & 0o777).toBe(0o444);
   });
 
-  it("refuses sealed toolchain drift before reserving, beginning, or spawning", async () => {
+  itSemanticProofHost("refuses sealed toolchain drift before reserving, beginning, or spawning", async () => {
     const f = await fixture();
     const attempts = attemptApi();
     const { handler, runSandbox } = semanticHandler(f, {
@@ -1681,7 +1679,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.settle).not.toHaveBeenCalled();
   });
 
-  it("rechecks the app-clock deadline after persisted replay lookup and refuses before dispatch", async () => {
+  itSemanticProofHost("rechecks the app-clock deadline after persisted replay lookup and refuses before dispatch", async () => {
     const f = await fixture();
     const now = new Date("2026-08-13T08:00:00.000Z");
     vi.useFakeTimers();
@@ -1725,7 +1723,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  it("refreshes the verifier timeout after preflight instead of spending stale campaign time", async () => {
+  itSemanticProofHost("refreshes the verifier timeout after preflight instead of spending stale campaign time", async () => {
     const f = await fixture();
     const now = new Date("2026-08-13T08:00:00.000Z");
     vi.useFakeTimers();
@@ -1755,7 +1753,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  it("rechecks the campaign deadline after reservation and refuses before beginning dispatch", async () => {
+  itSemanticProofHost("rechecks the campaign deadline after reservation and refuses before beginning dispatch", async () => {
     const f = await fixture();
     const now = new Date("2026-08-13T08:00:00.000Z");
     vi.useFakeTimers();
@@ -1785,7 +1783,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  it("RED-S5-db-deadline translates a database-clock reservation refusal into a stable permanent campaign hold", async () => {
+  itSemanticProofHost("RED-S5-db-deadline translates a database-clock reservation refusal into a stable permanent campaign hold", async () => {
     const f = await fixture();
     const attempts = attemptApi();
     attempts.reserve.mockRejectedValueOnce(new CccCampaignProofAttemptLimitError(
@@ -1804,7 +1802,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.settle).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-db-deadline translates a database-clock begin refusal without stranding a false dispatched effect", async () => {
+  itSemanticProofHost("RED-S5-db-deadline translates a database-clock begin refusal without stranding a false dispatched effect", async () => {
     const f = await fixture();
     const attempts = attemptApi();
     attempts.begin.mockRejectedValueOnce(new CccCampaignProofAttemptLimitError(
@@ -1823,7 +1821,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.settle).not.toHaveBeenCalled();
   });
 
-  it("settles a dispatched proof after the deadline so its durable effect is not stranded", async () => {
+  itSemanticProofHost("settles a dispatched proof after the deadline so its durable effect is not stranded", async () => {
     const f = await fixture();
     const now = new Date("2026-08-13T08:00:00.000Z");
     vi.useFakeTimers();
@@ -1853,7 +1851,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  it("reserves the exact final-integrated phase for the final proof suite", async () => {
+  itSemanticProofHost("reserves the exact final-integrated phase for the final proof suite", async () => {
     const f = await fixture();
     const finalNode = {
       ...f.node,
@@ -1892,7 +1890,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  it("replays a committed terminal attempt without beginning or spawning again", async () => {
+  itSemanticProofHost("replays a committed terminal attempt without beginning or spawning again", async () => {
     const f = await fixture();
     const attempts = attemptApi();
     attempts.reserve.mockResolvedValueOnce({
@@ -1911,7 +1909,7 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.settle).not.toHaveBeenCalled();
   });
 
-  it("RED-S5-db-deadline replays an exact committed terminal receipt after campaign expiry", async () => {
+  itSemanticProofHost("RED-S5-db-deadline replays an exact committed terminal receipt after campaign expiry", async () => {
     const f = await fixture();
     const now = new Date("2026-08-13T08:00:00.000Z");
     vi.useFakeTimers();
@@ -1941,7 +1939,7 @@ describe("CCC semantic proof v2 execution", () => {
     }
   });
 
-  itSemanticHost("runs the real admitted Task and Node toolchain inside the semantic sandbox", async () => {
+  itSemanticProofHost("runs the real admitted Task and Node toolchain inside the semantic sandbox", async () => {
     const f = await fixture();
     const proof = await liveAdmittedProof(f);
     const campaign = { ...f.campaign, proofs: [proof] } as CccCampaignTaskContext;
@@ -1980,7 +1978,7 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
-  itSemanticHost("refuses a verifier closure owned by any campaign task before reservation", async () => {
+  itSemanticProofHost("refuses a verifier closure owned by any campaign task before reservation", async () => {
     const f = await fixture();
     const proof = await liveAdmittedProof(f);
     const currentRoutes = f.campaign.executionPolicy.routes;
@@ -2129,7 +2127,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     "",
   ].join("\n");
 
-  itSemanticHost(
+  itSemanticProofHost(
     "refuses a verifier that never emits the proof-evidence contract, naming the proof and the first stdout line",
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(NONCONFORMING_HARNESS);
@@ -2152,7 +2150,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     },
   );
 
-  itSemanticHost(
+  itSemanticProofHost(
     "passes a verifier that emits valid evidence even before any candidate exists",
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(CONFORMING_HARNESS);
@@ -2201,7 +2199,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     "",
   ].join("\n");
 
-  itSemanticHost(
+  itSemanticProofHost(
     "passes a verifier that refuses (exit 2, no stdout) only when src/ itself is absent, distinguishing that from a merely-missing candidate file",
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(DIRECTORY_AWARE_HARNESS);
@@ -2220,7 +2218,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
 // Dependency-injected: stubs materialize/verifyToolchain/inspectSandboxReadiness/
 // preflightSandbox/runSandbox, so these run on every platform and in CI with no
 // real sandbox-exec, task binary, or Python toolchain required -- unlike the
-// itSemanticHost-gated block above (kept for genuine end-to-end coverage), CI
+// itSemanticProofHost-gated block above (kept for genuine end-to-end coverage), CI
 // runs zero of these assertions today without this block.
 describe("CCC semantic proof verifier conformance preflight (dependency-injected)", () => {
   function stubReadySandbox() {

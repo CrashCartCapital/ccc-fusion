@@ -26,6 +26,11 @@ import {
 } from "@fusion/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  TASK_BIN,
+  hasTask,
+  itRequiresTask,
+} from "../../../core/src/__test-utils__/proof-host-tools.js";
+import {
   admitAndMaterializeCccSemanticProof,
   EXECUTABLE_PROBE_TIMEOUT_MS,
   inspectCccSemanticProofExecutable,
@@ -257,7 +262,7 @@ async function createPythonMaterializationFixture(
   const gitOid = async (path: string) => (
     await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
   ).stdout.trim();
-  const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+  const taskIdentity = await executableIdentity(TASK_BIN);
   const nodeIdentity = await executableIdentity(process.execPath);
   const pythonPath = join(toolRoot, "python3");
   await writeFile(pythonPath, "#!/bin/sh\nprintf 'Python 3.12.10\\n'\n", { mode: 0o755 });
@@ -345,7 +350,7 @@ const MACH_O_FIXTURE_MISSING_DEPENDENCY = "@rpath/ccc_fixture_missing.dylib";
 const darwinMachOFixtureRunnable = process.platform === "darwin"
   && existsSync("/usr/bin/clang")
   && existsSync("/usr/bin/otool")
-  && existsSync("/opt/homebrew/bin/task");
+  && hasTask();
 
 async function darwinInstallNameIds(machOPath: string): Promise<string[]> {
   const { stdout } = await execFile("/usr/bin/otool", ["-D", machOPath]);
@@ -416,7 +421,7 @@ afterEach(async () => {
 });
 
 describe("CCC semantic-proof admission and materialization", () => {
-  it("RED-S5-controller-git-custody: refuses to spawn a fake git earlier on PATH", async () => {
+  itRequiresTask("RED-S5-controller-git-custody: refuses to spawn a fake git earlier on PATH", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     const fakeBin = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-fake-git-"));
@@ -430,7 +435,7 @@ describe("CCC semantic-proof admission and materialization", () => {
       "",
     ].join("\n"));
     await chmod(join(fakeBin, "git"), 0o755);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -462,11 +467,11 @@ describe("CCC semantic-proof admission and materialization", () => {
     }
   });
 
-  it("RED-S5-closure-git-custody: materializes frozen verifier blobs and exact candidate commit bytes only", async () => {
+  itRequiresTask("RED-S5-closure-git-custody: materializes frozen verifier blobs and exact candidate commit bytes only", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
 
     const definition = proof({
@@ -507,7 +512,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     }
   });
 
-  it("RED-S5-runtime-candidate-set-order: materializes the exact candidate set independent of Task argv order", async () => {
+  itRequiresTask("RED-S5-runtime-candidate-set-order: materializes the exact candidate set independent of Task argv order", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
@@ -543,7 +548,7 @@ describe("CCC semantic-proof admission and materialization", () => {
       "git",
       ["-C", fixture.repository, "rev-parse", "HEAD"],
     )).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -606,7 +611,7 @@ describe("CCC semantic-proof admission and materialization", () => {
       "git",
       ["-C", fixture.repository, "rev-parse", `${baseCommit}:Taskfile.yml`],
     )).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -628,7 +633,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     return { fixture, baseCommit, definition };
   }
 
-  it("RED-L27-preflight-directory-closure: preflight materializes the missing candidate's parent directory chain, never the file", async () => {
+  itRequiresTask("RED-L27-preflight-directory-closure: preflight materializes the missing candidate's parent directory chain, never the file", async () => {
     const { fixture, baseCommit, definition } = await nestedMissingCandidateFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
@@ -648,7 +653,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     expect(existsSync(join(materialized.proofRoot, "src"))).toBe(true);
   });
 
-  it("RED-L27-preflight-directory-closure: a real attempt (allowMissingCandidates unset) still refuses a missing candidate outright", async () => {
+  itRequiresTask("RED-L27-preflight-directory-closure: a real attempt (allowMissingCandidates unset) still refuses a missing candidate outright", async () => {
     const { fixture, baseCommit, definition } = await nestedMissingCandidateFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
@@ -683,11 +688,11 @@ describe("CCC semantic-proof admission and materialization", () => {
       .toBe(join(root, "src", "qe_evidence"));
   });
 
-  it("RED-S5-closure-git-custody: refuses verifier closure inside a model-owned root", async () => {
+  itRequiresTask("RED-S5-closure-git-custody: refuses verifier closure inside a model-owned root", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -716,7 +721,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     })).rejects.toThrow("model-writeable");
   });
 
-  it("RED-S5-task-target-closure: refuses Task targets with undeclared dynamic or dependency behavior", async () => {
+  itRequiresTask("RED-S5-task-target-closure: refuses Task targets with undeclared dynamic or dependency behavior", async () => {
     const fixture = await createGitFixture();
     await writeFile(join(fixture.repository, "Taskfile.yml"), [
       "version: '3'",
@@ -733,7 +738,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     await execFile("git", ["-C", fixture.repository, "commit", "-m", "unsafe task target"]);
     const unsafeBase = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
     const taskOid = (await execFile("git", ["-C", fixture.repository, "rev-parse", `${unsafeBase}:Taskfile.yml`])).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -760,7 +765,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     })).rejects.toThrow(/includes|dependencies/u);
   });
 
-  it("RED-S5-task-target-closure: ignores unsafe behavior in an unselected verify target", async () => {
+  itRequiresTask("RED-S5-task-target-closure: ignores unsafe behavior in an unselected verify target", async () => {
     const fixture = await createGitFixture();
     await writeFile(join(fixture.repository, "Taskfile.yml"), [
       "version: '3'",
@@ -778,7 +783,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     await execFile("git", ["-C", fixture.repository, "commit", "-m", "unsafe unselected target"]);
     const unsafeBase = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
     const taskOid = (await execFile("git", ["-C", fixture.repository, "rev-parse", `${unsafeBase}:Taskfile.yml`])).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -914,7 +919,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({ ...fixture, taskIdentity, nodeIdentity });
     definition.executionToolchain.linkedRuntime = [{
@@ -941,7 +946,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
       task: taskIdentity,
@@ -1038,7 +1043,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     expect((await stat(sealedToolchain!.taskExecutable)).mode & 0o222).toBe(0);
   });
 
-  it("preserves ESM proof-host version identity after sealing outside its package", async () => {
+  itRequiresTask("preserves ESM proof-host version identity after sealing outside its package", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp("/private/tmp/ccc-semantic-proof-output-");
     const hostPackageRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-esm-host-"));
@@ -1054,7 +1059,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     );
     await chmod(proofHostPath, 0o755);
 
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const canonicalProofHost = await realpath(proofHostPath);
     const proofHostProbe = await execFile(
@@ -1120,7 +1125,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     )).resolves.toBeUndefined();
   });
 
-  it("RED-R1-python-semantic-v2-task-and-runtime: admits only the closure-owned Python adapter and seals every runtime category", async () => {
+  itRequiresTask("RED-R1-python-semantic-v2-task-and-runtime: admits only the closure-owned Python adapter and seals every runtime category", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-output-"));
     const toolRootRaw = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-runtime-"));
@@ -1146,7 +1151,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     const gitOid = async (path: string) => (
       await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
     ).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const pythonPath = join(toolRoot, "python3");
     await writeFile(pythonPath, "#!/bin/sh\nprintf 'Python 3.12.10\\n'\n", { mode: 0o755 });
@@ -1248,7 +1253,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     }
   });
 
-  it("RED-R1-taskfile-selected-target-python: validates only the selected strict Python target", async () => {
+  itRequiresTask("RED-R1-taskfile-selected-target-python: validates only the selected strict Python target", async () => {
     const {
       fixture,
       proofBaseCommit,
@@ -1281,7 +1286,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     });
   });
 
-  it("RED-R1-python-runtime-canonical-path: refuses a runtime file reached through a symlinked parent", async () => {
+  itRequiresTask("RED-R1-python-runtime-canonical-path: refuses a runtime file reached through a symlinked parent", async () => {
     const {
       fixture,
       proofBaseCommit,
@@ -1312,7 +1317,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     })).rejects.toThrow(/runtime path must be canonical|Python interpreter|Python runtime manifest/i);
   });
 
-  it("RED-R1-python-runtime-identity: refuses a same-byte replacement between path metadata and open", async () => {
+  itRequiresTask("RED-R1-python-runtime-identity: refuses a same-byte replacement between path metadata and open", async () => {
     const { definition, runtimeFiles } = await createPythonMaterializationFixture();
     const replacementPath = join(dirname(runtimeFiles.stdlib), "stdlib-replacement.py");
     await writeFile(replacementPath, await readFile(runtimeFiles.stdlib));
@@ -1405,7 +1410,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     runRealPythonSealSmoke
       && process.platform === "darwin"
       && existsSync("/usr/bin/sandbox-exec")
-      && existsSync("/opt/homebrew/bin/task"),
+      && hasTask(),
   )("RED-R1-python-semantic-v2-real-sealed-smoke: runs the real sealed Python interpreter with sealed PYTHONHOME/PYTHONPATH", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-python-real-proof-output-"));
@@ -1544,7 +1549,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     const gitOid = async (path: string) => (
       await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
     ).stdout.trim();
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -2216,7 +2221,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
     roots.push(outputRoot);
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const definition = proof({
       ...fixture,
@@ -2288,7 +2293,7 @@ describe("CCC semantic-proof admission and materialization", () => {
 
   const realCPythonSealRunnable = relativeInstallNameCPython !== undefined
     && process.platform === "darwin"
-    && existsSync("/opt/homebrew/bin/task");
+    && hasTask();
 
   // Copies the discovered interpreter and its libpython into a throwaway tree so
   // the seal never touches the operator's live toolchain. `dylibDirectoryName`
@@ -2385,7 +2390,7 @@ describe("CCC semantic-proof admission and materialization", () => {
       ? (await walkFiles(stdlibRoot)).filter((path) => !path.startsWith(`${extensionModuleRoot}/`))
       : [];
 
-    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const taskIdentity = await executableIdentity(TASK_BIN);
     const nodeIdentity = await executableIdentity(process.execPath);
     const pythonIdentity = await executableIdentity(interpreterPath);
     const definition = proof({

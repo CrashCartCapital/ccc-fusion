@@ -7,6 +7,12 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  describeRequiresPython3,
+  itRequiresPython3,
+  proofHostSkipReasons,
+  resolvePython3Binary,
+} from "../__test-utils__/proof-host-tools.js";
+import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   assertCccPrdSemanticProofV2Custody,
   computeCccPrdProofDefinitionSha256,
@@ -139,7 +145,10 @@ async function controllerPython312Path(): Promise<string> {
     .sort()
     .map((name) => join(uvPythonRoot, name, "bin/python3.12"))
     .find((path) => existsSync(path));
-  return isolated ?? (await execFile("which", ["python3"])).stdout.trim();
+  const onPath = resolvePython3Binary();
+  if (isolated) return isolated;
+  if (!onPath) throw new Error(proofHostSkipReasons.python3);
+  return onPath;
 }
 
 describe("CCC PRD semantic-proof controller custody", () => {
@@ -271,7 +280,10 @@ describe("CCC PRD semantic-proof controller custody", () => {
     })).resolves.toBeUndefined();
   });
 
-  describe("prepared Python runtime custody", () => {
+  // Every fixture in this block resolves the host interpreter with
+  // `which python3`; a runner without python3 fails at fixture setup rather
+  // than proving anything about custody, so it skips with a named reason.
+  describeRequiresPython3("prepared Python runtime custody", () => {
     let state: Awaited<ReturnType<typeof fixture>>;
     let baseCommit: string;
     let requestedPythonPath: string;
@@ -306,7 +318,9 @@ describe("CCC PRD semantic-proof controller custody", () => {
       baseCommit = (await execFile("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim();
       const pythonRoot = await mkdtemp(join(tmpdir(), "ccc-python-runtime-"));
       roots.push(pythonRoot);
-      requestedPythonPath = (await execFile("which", ["python3"])).stdout.trim();
+      const resolvedPython3 = resolvePython3Binary();
+      if (!resolvedPython3) throw new Error(proofHostSkipReasons.python3);
+      requestedPythonPath = resolvedPython3;
       const resolvedPythonProbe = await execFile(
         requestedPythonPath,
         ["-c", "import os,sys; print(os.path.realpath(sys.executable))"],
@@ -470,7 +484,7 @@ describe("CCC PRD semantic-proof controller custody", () => {
     });
   });
 
-  it("RED-R1-python-discovery-controller-pythonpath: rejects invalid roots and exercises real discovery in its integration lane", async () => {
+  itRequiresPython3("RED-R1-python-discovery-controller-pythonpath: rejects invalid roots and exercises real discovery in its integration lane", async () => {
     const state = await fixture({
       taskCommand: "python3 verify/python_adapter.py --target fixtures/python-target",
     });
