@@ -265,6 +265,9 @@ export function inspectTrustedTestGitContainment(
     if (token === "-c") {
       const config = args[index + 1] ?? "";
       if (config !== "core.quotePath=false"
+        && config !== "core.fsmonitor=false"
+        && config !== "core.untrackedCache=false"
+        && config !== `core.hooksPath=${nullDevice}`
         && !config.startsWith("user.name=")
         && !config.startsWith("user.email=")) {
         return refuse("config-option-not-allowlisted", `-c ${config}`);
