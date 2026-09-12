@@ -32,6 +32,7 @@ import {
   resolveGlobalDirForHome,
   type CccPrdProductStatus,
 } from "@fusion/core";
+import { itSemanticProofHost } from "../../../core/src/__test-utils__/proof-host-tools.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
@@ -886,7 +887,13 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
     },
   );
 
-  it("takes a frozen packet through CLI admission, real runtime coding, executed proof, and exact human landing approval", async () => {
+  // The it.each refusal cases above stop at PRD-shape validation
+  // (CCC_PRD_IMPORT_INTENT_CARDINALITY / CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED)
+  // before authoring ever reaches a platform check, so they need no extra
+  // gate. This full end-to-end test authors a real semantic-v2 packet, which
+  // CCC_PRD_AUTHORING_PREFLIGHT_UNSUPPORTED_PLATFORM refuses outright on a
+  // host without the Darwin-only semantic-proof sandbox backend.
+  itSemanticProofHost("takes a frozen packet through CLI admission, real runtime coding, executed proof, and exact human landing approval", async () => {
     const rootDir = h.rootDir();
     const baseCommit = await initializeTarget(rootDir);
     const packet = await createPacket(rootDir, baseCommit);
