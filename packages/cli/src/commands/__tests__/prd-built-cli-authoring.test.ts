@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { itSemanticProofHost } from "../../../../core/src/__test-utils__/proof-host-tools.js";
 import { cleanupPacketRoots, createPacketRoot, repoRoot, runFn, runFnAsync } from "./prd-built-cli-fixture.js";
 
 afterEach(cleanupPacketRoots);
@@ -89,7 +90,13 @@ describe("prd native authoring descendant contract", () => {
     expect(result.status).toBe(1);
   });
 
-  it("authors generated semantic-v2 Node proof without requiring a target Python venv", async () => {
+  // Authoring a semantic-v2 packet runs `runAuthoringPreflight`, whose
+  // `platform` and `sandbox` checks refuse outright
+  // (CCC_PRD_AUTHORING_PREFLIGHT_UNSUPPORTED_PLATFORM /
+  // CCC_PRD_AUTHORING_PREFLIGHT_SANDBOX_UNAVAILABLE) on a host without the
+  // Darwin-only semantic-proof sandbox backend, so this is Darwin product
+  // behaviour, not a test-environment gap. Also run in scripts/ci-darwin-proof-lane.mjs.
+  itSemanticProofHost("authors generated semantic-v2 Node proof without requiring a target Python venv", async () => {
     const packet = createPacketRoot({ semanticV2: true });
     expect(existsSync(join(packet.target, ".venv"))).toBe(false);
     const proposal = readFileSync(packet.proposal, "utf8");
@@ -118,7 +125,7 @@ describe("prd native authoring descendant contract", () => {
       const author = await runFnAsync([
         "prd", "author", packet.root, packet.manifest, packet.sidecar,
         "--target", packet.target, "--base", packet.base, "--provider", "loopback-authoring", "--model", "fixture-model",
-        "--max-requests", "1", "--max-duration-ms", "30000", "--max-concurrency", "1", "--max-prompt-bytes", "1000000", "--max-response-bytes", "262144", "--max-review-items", "8",
+        "--max-requests", "2", "--max-duration-ms", "30000", "--max-concurrency", "1", "--max-prompt-bytes", "1000000", "--max-response-bytes", "262144", "--max-review-items", "8",
       ], repoRoot, { HOME: isolatedHome, USERPROFILE: isolatedHome });
       expect(author.status, `${author.stdout}\n${author.stderr}`).toBe(0);
       expect(requests).toHaveLength(1);
