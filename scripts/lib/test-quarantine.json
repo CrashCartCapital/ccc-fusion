@@ -1,4 +1,35 @@
 {
-  "$comment": "Flaky-test quarantine ledger (deletion ratchet \u2014 see AGENTS.md 'Flaky tests: quarantine on sight' and docs/testing.md 'Quarantine ledger and the deletion ratchet'). A test observed failing without a corresponding real bug is quarantined ON SIGHT: add an entry here AND a matching one-line `exclude` entry in that package's vitest config, in the same commit. Every entry needs a non-empty `reason` (link the failing run) and a `quarantinedAt` date \u2014 the entry expires 14 days later, at which point the test file is DELETED unless someone rescues it with evidence it catches real regressions plus a root-cause fix (never appeasement). There is deliberately no loader module and no automation around this file: it is a dated record, the vitest config is the enforcement.",
-  "entries": []
+  "$comment": "Flaky-test quarantine ledger (deletion ratchet — see AGENTS.md 'Flaky tests: quarantine on sight' and docs/testing.md 'Quarantine ledger and the deletion ratchet'). A test observed failing without a corresponding real bug is quarantined ON SIGHT: add an entry here AND a matching one-line `exclude` entry in that package's vitest config, in the same commit. Every entry needs a non-empty `reason` (link the failing run) and a `quarantinedAt` date — the entry expires 14 days later, at which point the test file is DELETED unless someone rescues it with evidence it catches real regressions plus a root-cause fix (never appeasement). There is deliberately no loader module and no automation around this file: it is a dated record, the vitest config is the enforcement.",
+  "entries": [
+    {
+      "file": "packages/engine/src/__tests__/merger-ai-dependency-install.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 5/6 pass, 1 fails — \"proceeds without install when no configured command or known lockfile exists\" expects store.appendAgentLog to receive a \"(no command)\" fallback message but it receives the full AI-merge success flow (\"AI merge: merging fusion/fn-1 into main...\") instead, a real assertion/behavior drift (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    },
+    {
+      "file": "packages/engine/src/__tests__/reliability-interactions/branch-group-automerge-precedence.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 2/3 fail — findGateEvent(store, group.id)?.metadata is undefined instead of the expected gate-event metadata object, i.e. no gate event is persisted/found for the group under real Postgres (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    },
+    {
+      "file": "packages/engine/src/__tests__/reliability-interactions/branch-group-merge-routing.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 3/3 fail — first failure is `git show undefined:packages/engine/src/fn5782Shared.ts` (fatal: invalid object name 'undefined'), and the run also throws an unhandled Postgres UNDEFINED_VALUE rejection out of getBranchGroup — branch_groups.id resolves to undefined against real Postgres (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    },
+    {
+      "file": "packages/engine/src/__tests__/reliability-interactions/branch-group-pr-sync.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 4/4 fail — first failure is MergeNonConflictError (\"git merge --squash failed without producing conflicts, spawn /bin/sh ENOENT\"); the remaining three then fail on `mkdtemp ENOENT` for the shared fixture root plus an unhandled Postgres UNDEFINED_VALUE rejection out of updateBranchGroup — branch_groups.id resolves to undefined against real Postgres (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    },
+    {
+      "file": "packages/engine/src/__tests__/reliability-interactions/branch-group-single-pr-e2e.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 3/3 fail — the first two hit an unhandled Postgres UNDEFINED_VALUE rejection out of listTasksByBranchGroupImpl -> getBranchGroup (branch_groups.id resolves to undefined against real Postgres); the third fails on `git show undefined:packages/engine/src/fnU8SafeA.ts` (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    },
+    {
+      "file": "packages/engine/src/__tests__/reliability-interactions/shared-branch-group-lifecycle.slow.test.ts",
+      "reason": "Re-run against a disposable Postgres (engine-slow project, 2026-09-11): 6/6 fail — first failure (CASE 1) is a real assertion mismatch, resolveTaskWorkingBranch returns \"fusion/fn-5820-ri-a\" instead of the expected canonical \"fusion/kb-001\" branch name; CASES 2-6 then fail inside the shared stageSharedMember git fixture helper (excluded since c15c78fee 2026-07-13 without a ledger entry; re-quarantined 2026-09-11, owner: operator)",
+      "quarantinedAt": "2026-09-11"
+    }
+  ]
 }

@@ -415,6 +415,21 @@ export default defineConfig({
           on sight per AGENTS.md flaky-test rule so verify:workspace goes green. Mirrored in
           scripts/lib/test-quarantine.json.
           */
+          /*
+          FNXC:EngineTests 2026-09-11-17:30:
+          PR-C (full-suite quarantine reconciliation) re-verified all six exclusions below
+          against a disposable local PostgreSQL (`FUSION_PG_TEST_URL_BASE`, engine-slow
+          project selected directly). None pass cleanly today: merger-ai-dependency-install
+          has one real assertion/behavior drift; the five reliability-interactions files each
+          hit a live "branch_groups.id resolves to undefined" Postgres rejection out of
+          getBranchGroup/updateBranchGroup/listTasksByBranchGroupImpl (async-branch-groups.ts),
+          plus (in shared-branch-group-lifecycle) a genuine branch-naming assertion mismatch on
+          CASE 1. Every file now has a matching dated entry in scripts/lib/test-quarantine.json
+          with its real first-observed error — the comment above claiming these were "mirrored"
+          there was false from the moment it was written (c15c78fee, 2026-07-13: the ledger's
+          entries array has been [] since that commit). Rescue requires fixing the branch-group
+          id propagation under the real-PG path, not just re-running.
+          */
           exclude: [
             "src/__tests__/merger-ai-dependency-install.slow.test.ts",
             "src/__tests__/reliability-interactions/branch-group-automerge-precedence.slow.test.ts",
@@ -422,7 +437,6 @@ export default defineConfig({
             "src/__tests__/reliability-interactions/branch-group-pr-sync.slow.test.ts",
             "src/__tests__/reliability-interactions/branch-group-single-pr-e2e.slow.test.ts",
             "src/__tests__/reliability-interactions/shared-branch-group-lifecycle.slow.test.ts",
-            // SQLite-path (delete-sqlite-runtime-final PHASE A): uses inMemoryDb via _helpers.ts.
           ],
           minWorkers: 1,
           maxWorkers: 1,
