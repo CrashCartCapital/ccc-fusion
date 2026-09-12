@@ -116,7 +116,33 @@ pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () 
     await h.afterAll();
   });
 
-  itConfinedVerifierHost("imports the exact three-task packet with native dependency custody", async () => {
+  // Darwin code-signing cost, not a hang. `preview` and `import` each run the
+  // sealed verifier-conformance preflight over all four declared
+  // PROOF-LEDGER-* proofs, so a single pass through this test performs eight
+  // full toolchain seals (measured: eight distinct
+  // ccc-semantic-proof-preflight-* roots per run). Every seal rewrites each
+  // non-system dylib load command to an absolute path inside a brand-new
+  // mkdtemp root and then re-signs ad hoc, so the signed bytes are unique per
+  // round and amfid must revalidate node plus its whole 38-dylib sealed
+  // closure from scratch each time -- roughly 18s per round, observed as a
+  // sleeping (not stuck) `node --version` child while `codesign --verify`
+  // reports "valid on disk" and no com.apple.quarantine attribute is present.
+  // Signature validation, therefore, not a stall; the archived unified-log
+  // capture in .archive/l19-node-seal/11-fsgn7w-log-analysis.log shows the
+  // same closure walk at Code=-423 "adhoc signed or signed by an unknown
+  // certificate chain".
+  //
+  // Measured wall time for this test on an M5 Max against a disposable
+  // Postgres, three runs: 107s, 217s, 221s. 300s keeps roughly 1.4x margin
+  // over the slowest observed run while still bounding a genuine hang far
+  // below the Darwin lane's 60-minute job budget. This is the same per-test
+  // convention the third test below and
+  // ccc-prd-product-vertical-slice.real-pg.test.ts already use, not a cover
+  // for an unexplained hang. Collapsing the eight redundant seal rounds (one
+  // fresh mkdtemp root per proof per command, and a preflight that is not
+  // gated on preview) is product work tracked separately; until that lands,
+  // this cost is real and the budget has to admit it.
+  itConfinedVerifierHost("imports the exact three-task packet with native dependency custody", { timeout: 300_000 }, async () => {
     const common = [
       lifecycle.frozenRoot,
       lifecycle.manifestPath,
@@ -206,7 +232,13 @@ pgDescribe.sequential("CCC Golden Evidence Ledger three-task fake campaign", () 
     expect(readProviderEvents(fixture.markerPath)).toEqual([]);
   });
 
-  itConfinedVerifierHost("runs the exact three-task campaign to its durable unlanded merge hold", { timeout: 120_000 }, async () => {
+  // Same Darwin seal cost as the import test above: this campaign runs four
+  // real proof attempts, each sealing its own toolchain. Measured at 109.8s
+  // against the previous 120s budget -- 91% consumed on an idle developer
+  // Mac, which leaves no room on the shared CI runner behind its three-slot
+  // admission queue. Resized to match the import test rather than left one
+  // slow seal round away from a red lane.
+  itConfinedVerifierHost("runs the exact three-task campaign to its durable unlanded merge hold", { timeout: 300_000 }, async () => {
     const confirmation = firstHold.liveExecutionAuthorizationConfirmation!;
     const approved = await runProductCommand([
       "approve-execution",
