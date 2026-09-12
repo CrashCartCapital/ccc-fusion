@@ -136,7 +136,13 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   async function context(
     suffix: string,
     bounds: Readonly<{ maxRequests: number; maxDurationMs: number; maxConcurrency: number }> = {
-      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1,
+      // 10 minutes, not 60s: this window exists only so the campaign never expires mid-test,
+      // and 60s was not a safe margin. Full Suite run 34713383444 (shard 4, 2026-09-12) hit
+      // "CCC campaign approval ACTION-LIVE-EXECUTION is outside its not-before or expiry
+      // window" from this exact fixture default under a contended, single-CPU CI Postgres
+      // shared across parallel shards (same failure shape PR #95 / e4d20d945 fixed elsewhere
+      // in the postgres suite by widening its analogous fixture windows to 600_000ms).
+      maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1,
     },
     transport: "pi" | "cli" | "workflow" = "pi",
   ) {
@@ -176,7 +182,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     };
     const source = rehashCccPrdImportTestBundle({
       ...initial,
-      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      bounds: { maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1 },
       tasks: initial.tasks.map((task, index) => index === 0
         ? { ...task, protectedActionIds: [action.actionId] }
         : task),
@@ -441,7 +447,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("allocates an ordinal in the store and grants only one dispatch permit after a lost reservation response", async () => {
     const { taskId, campaign } = await context("store-owned-dispatch", {
-      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+      maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 2,
     });
     const store = api(h.store());
     const input = request(taskId, h.rootDir(), "turn-owned");
@@ -517,7 +523,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("allocates unique contiguous store-owned ordinals for concurrent distinct dispatch keys", async () => {
     const { taskId, campaign } = await context("concurrent-ordinals", {
-      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+      maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 2,
     });
     const results = await Promise.all([
       api(h.store()).reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-one")),
@@ -530,7 +536,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("holds the shared campaign snapshot stable while an in-transaction attempt inspection is open", async () => {
     const { taskId: firstTaskId, campaign } = await context("inspect-snapshot-lock", {
-      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+      maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 2,
     });
     const secondTaskId = await nativeTaskIdForImport(
       campaign.importId,
@@ -583,7 +589,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("keeps global request count coherent under multi-task Pi turn churn", async () => {
     const { taskId: firstTaskId, campaign } = await context("gate2-request-history", {
-      maxRequests: 96, maxDurationMs: 60_000, maxConcurrency: 3,
+      maxRequests: 96, maxDurationMs: 600_000, maxConcurrency: 3,
     });
     const secondTaskId = await nativeTaskIdForImport(
       campaign.importId,
@@ -647,7 +653,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("RED-G2-request-history-diagnostic: reports persisted and observed request-count facts", async () => {
     const { taskId, campaign } = await context("gate2-request-history-diagnostic", {
-      maxRequests: 4, maxDurationMs: 60_000, maxConcurrency: 1,
+      maxRequests: 4, maxDurationMs: 600_000, maxConcurrency: 1,
     });
     const store = api(h.store());
     const first = await store.reserveCccProviderAttempt(
@@ -775,7 +781,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("refuses a third reservation after two proved-not-dispatched attempts at maxRequests", async () => {
     const { taskId, campaign } = await context("max-requests", {
-      maxRequests: 2, maxDurationMs: 60_000, maxConcurrency: 1,
+      maxRequests: 2, maxDurationMs: 600_000, maxConcurrency: 1,
     });
     const store = api(h.store());
     for (const turnKey of ["turn-one", "turn-two"] as const) {
@@ -793,7 +799,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("enforces maxRequests as one campaign-global budget across semantic tasks", async () => {
     const { taskId: firstTaskId, campaign } = await context("global-max-requests", {
-      maxRequests: 1, maxDurationMs: 60_000, maxConcurrency: 1,
+      maxRequests: 1, maxDurationMs: 600_000, maxConcurrency: 1,
     });
     const secondTaskId = await nativeTaskIdForImport(
       campaign.importId,
@@ -824,7 +830,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
   it("allocates the next ordinal after a terminal attempt without accepting caller ordinal", async () => {
     const { taskId, campaign } = await context("ordinal", {
-      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1,
+      maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1,
     });
     const store = api(h.store());
     const first = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-one"));
@@ -1162,7 +1168,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   async function omniRouteContext(suffix: string) {
     const source = rehashCccPrdImportTestBundle({
       ...bundle(h.rootDir(), suffix),
-      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      bounds: { maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1 },
     });
     const imported = await importCccPrdBundle({
       bundle: source,
@@ -1188,7 +1194,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   async function omniRouteComboContext(suffix: string) {
     const source = rehashCccPrdImportTestBundle({
       ...bundle(h.rootDir(), suffix),
-      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      bounds: { maxRequests: 3, maxDurationMs: 600_000, maxConcurrency: 1 },
     });
     const imported = await importCccPrdBundle({
       bundle: source,
