@@ -107,19 +107,64 @@ function resolveGitPath(value: string, cwd: string): string {
   return isAbsolute(value) ? value : resolve(cwd, value);
 }
 
-function gitTraceEnvironmentStaysWithinWorker(context: TrustedTestGitContext): boolean {
+/**
+ * Which containment rule refused an invocation. One throw site serves every
+ * rule, so without this tag a refusal cannot be triaged: "outside the Vitest
+ * worker root" reads identically whether a `-C` target escaped, an environment
+ * variable pointed at the host, or a `-c` option simply was not on the
+ * allowlist. Keep these ids stable; CI triage greps for them.
+ */
+export type GitContainmentRuleId =
+  | "missing-worker-root"
+  | "git-path-env-outside-worker-root"
+  | "git-execution-env-set"
+  | "git-trace-env-outside-worker-root"
+  | "git-config-env-not-isolated"
+  | "git-config-count-not-allowlisted"
+  | "home-env-outside-worker-root"
+  | "attached-directory-option-outside-worker-root"
+  | "attached-config-option-not-allowlisted"
+  | "config-option-not-allowlisted"
+  | "config-env-or-exec-path-option"
+  | "path-option-outside-worker-root"
+  | "assigned-path-option-outside-worker-root"
+  | "assigned-value-outside-worker-root"
+  | "absolute-argument-outside-worker-root"
+  | "traversal-argument-outside-worker-root"
+  | "effective-cwd-outside-worker-root";
+
+export type GitContainmentVerdict =
+  | { ok: true }
+  | { ok: false; ruleId: GitContainmentRuleId; detail: string };
+
+const CONTAINED: GitContainmentVerdict = { ok: true };
+
+function refuse(ruleId: GitContainmentRuleId, detail: string): GitContainmentVerdict {
+  return { ok: false, ruleId, detail };
+}
+
+function gitTraceEnvironmentStaysWithinWorker(context: TrustedTestGitContext): GitContainmentVerdict {
   for (const [key, value] of Object.entries(context.env ?? {})) {
     if (!key.startsWith("GIT_TRACE") || !value) continue;
     const normalized = value.toLowerCase();
     if (key.endsWith("_NO_DATA") || key.endsWith("_REDACT")) {
-      if (!["0", "1", "false", "true"].includes(normalized)) return false;
+      if (!["0", "1", "false", "true"].includes(normalized)) {
+        return refuse("git-trace-env-outside-worker-root", `${key}=${value} is not a boolean flag`);
+      }
       continue;
     }
     if (["0", "false"].includes(normalized)) continue;
-    if (/^(?:true|[1-9])$/u.test(normalized) || value.startsWith("~") || value.includes("\0")) return false;
-    if (!isWithin(context.workerRoot, resolveGitPath(value, context.cwd))) return false;
+    if (/^(?:true|[1-9])$/u.test(normalized) || value.startsWith("~") || value.includes("\0")) {
+      return refuse("git-trace-env-outside-worker-root", `${key}=${value} names an unbounded trace sink`);
+    }
+    if (!isWithin(context.workerRoot, resolveGitPath(value, context.cwd))) {
+      return refuse(
+        "git-trace-env-outside-worker-root",
+        `${key}=${value} -> ${resolveGitPath(value, context.cwd)}`,
+      );
+    }
   }
-  return true;
+  return CONTAINED;
 }
 
 function tokenPathValue(token: string): string | null {
@@ -129,8 +174,17 @@ function tokenPathValue(token: string): string | null {
   return GIT_PATH_OPTIONS.has(option) ? token.slice(equals + 1) : null;
 }
 
-function invocationStaysWithinWorker(args: readonly string[], context: TrustedTestGitContext): boolean {
-  if (!context.workerRoot) return false;
+/**
+ * Decide whether one git invocation stays inside the Vitest worker root, and say
+ * exactly which rule refused it when it does not. Behaviour is unchanged from
+ * the boolean version this replaced: every `ok: false` here was a `return false`
+ * there, in the same order.
+ */
+export function inspectTrustedTestGitContainment(
+  args: readonly string[],
+  context: TrustedTestGitContext,
+): GitContainmentVerdict {
+  if (!context.workerRoot) return refuse("missing-worker-root", "context.workerRoot is empty");
   let effectiveCwd = context.cwd;
 
   for (const key of GIT_PATH_ENV_KEYS) {
@@ -138,59 +192,96 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
     const paths = key === "GIT_ALTERNATE_OBJECT_DIRECTORIES"
       ? value ? value.split(delimiter) : []
       : value ? [value] : [];
-    if (paths.some((path) => path && !isWithin(context.workerRoot, resolveGitPath(path, context.cwd)))) return false;
+    for (const path of paths) {
+      if (!path) continue;
+      const resolved = resolveGitPath(path, context.cwd);
+      if (!isWithin(context.workerRoot, resolved)) {
+        return refuse("git-path-env-outside-worker-root", `${key}=${path} -> ${resolved}`);
+      }
+    }
   }
-  if (GIT_EXECUTION_ENV_KEYS.some((key) => Boolean(context.env?.[key]))) return false;
-  if (!gitTraceEnvironmentStaysWithinWorker(context)) return false;
+  const executionEnvKey = GIT_EXECUTION_ENV_KEYS.find((key) => Boolean(context.env?.[key]));
+  if (executionEnvKey) {
+    return refuse("git-execution-env-set", `${executionEnvKey}=${context.env?.[executionEnvKey] ?? ""}`);
+  }
+  const trace = gitTraceEnvironmentStaysWithinWorker(context);
+  if (!trace.ok) return trace;
   // GIT_EDITOR, GIT_PAGER and PAGER are deliberately not tested here. They name a
   // program that displays or edits text, which is not a containment property, and
   // isolateTrustedTestGitEnvironment pins all three on every reroute path.
   const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
-  if ((context.env?.GIT_CONFIG_GLOBAL && context.env.GIT_CONFIG_GLOBAL !== nullDevice)
-    || (context.env?.GIT_CONFIG_SYSTEM && context.env.GIT_CONFIG_SYSTEM !== nullDevice)
-    || (context.env?.GIT_CONFIG_NOSYSTEM && context.env.GIT_CONFIG_NOSYSTEM !== "1")
-    || context.env?.GIT_CONFIG_PARAMETERS) return false;
+  if (context.env?.GIT_CONFIG_GLOBAL && context.env.GIT_CONFIG_GLOBAL !== nullDevice) {
+    return refuse("git-config-env-not-isolated", `GIT_CONFIG_GLOBAL=${context.env.GIT_CONFIG_GLOBAL}`);
+  }
+  if (context.env?.GIT_CONFIG_SYSTEM && context.env.GIT_CONFIG_SYSTEM !== nullDevice) {
+    return refuse("git-config-env-not-isolated", `GIT_CONFIG_SYSTEM=${context.env.GIT_CONFIG_SYSTEM}`);
+  }
+  if (context.env?.GIT_CONFIG_NOSYSTEM && context.env.GIT_CONFIG_NOSYSTEM !== "1") {
+    return refuse("git-config-env-not-isolated", `GIT_CONFIG_NOSYSTEM=${context.env.GIT_CONFIG_NOSYSTEM}`);
+  }
+  if (context.env?.GIT_CONFIG_PARAMETERS) {
+    return refuse("git-config-env-not-isolated", `GIT_CONFIG_PARAMETERS=${context.env.GIT_CONFIG_PARAMETERS}`);
+  }
   const configCountText = context.env?.GIT_CONFIG_COUNT;
   if (configCountText) {
     const configCount = Number.parseInt(configCountText, 10);
-    if (!Number.isInteger(configCount) || configCount < 0 || String(configCount) !== configCountText) return false;
+    if (!Number.isInteger(configCount) || configCount < 0 || String(configCount) !== configCountText) {
+      return refuse("git-config-count-not-allowlisted", `GIT_CONFIG_COUNT=${configCountText}`);
+    }
     for (let configIndex = 0; configIndex < configCount; configIndex += 1) {
-      if (context.env?.[`GIT_CONFIG_KEY_${configIndex}`] !== "init.defaultBranch"
-        || context.env?.[`GIT_CONFIG_VALUE_${configIndex}`] !== "main") {
-        return false;
+      const key = context.env?.[`GIT_CONFIG_KEY_${configIndex}`];
+      const value = context.env?.[`GIT_CONFIG_VALUE_${configIndex}`];
+      if (key !== "init.defaultBranch" || value !== "main") {
+        return refuse(
+          "git-config-count-not-allowlisted",
+          `GIT_CONFIG_KEY_${configIndex}=${key ?? ""} GIT_CONFIG_VALUE_${configIndex}=${value ?? ""}`,
+        );
       }
     }
   }
   for (const homeKey of ["HOME", "USERPROFILE", "XDG_CONFIG_HOME"] as const) {
     const home = context.env?.[homeKey];
-    if (home && !isWithin(context.workerRoot, home)) return false;
+    if (home && !isWithin(context.workerRoot, home)) {
+      return refuse("home-env-outside-worker-root", `${homeKey}=${home}`);
+    }
   }
 
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index]!;
     if (token.startsWith("-C") && token.length > 2) {
       const target = resolveGitPath(token.slice(2), effectiveCwd);
-      if (!isWithin(context.workerRoot, target)) return false;
+      if (!isWithin(context.workerRoot, target)) {
+        return refuse("attached-directory-option-outside-worker-root", `${token} -> ${target}`);
+      }
       effectiveCwd = target;
       continue;
     }
     if (token.startsWith("-c") && token.length > 2) {
-      if (token !== "-ccore.quotePath=false") return false;
+      if (token !== "-ccore.quotePath=false") {
+        return refuse("attached-config-option-not-allowlisted", token);
+      }
       continue;
     }
     if (token === "-c") {
       const config = args[index + 1] ?? "";
       if (config !== "core.quotePath=false"
         && !config.startsWith("user.name=")
-        && !config.startsWith("user.email=")) return false;
+        && !config.startsWith("user.email=")) {
+        return refuse("config-option-not-allowlisted", `-c ${config}`);
+      }
       index += 1;
       continue;
     }
-    if (token.startsWith("--config-env") || token === "--exec-path" || token.startsWith("--exec-path=")) return false;
+    if (token.startsWith("--config-env") || token === "--exec-path" || token.startsWith("--exec-path=")) {
+      return refuse("config-env-or-exec-path-option", token);
+    }
     if (GIT_PATH_OPTIONS.has(token)) {
       const value = args[index + 1];
       const target = value ? resolveGitPath(value, effectiveCwd) : null;
-      if (!target || !isWithin(context.workerRoot, target)) return false;
+      if (!target) return refuse("path-option-outside-worker-root", `${token} (no value)`);
+      if (!isWithin(context.workerRoot, target)) {
+        return refuse("path-option-outside-worker-root", `${token} ${value ?? ""} -> ${target}`);
+      }
       if (token === "-C") effectiveCwd = target;
       index += 1;
       continue;
@@ -198,7 +289,13 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
 
     const assignedPath = tokenPathValue(token);
     if (assignedPath !== null) {
-      if (!assignedPath || !isWithin(context.workerRoot, resolveGitPath(assignedPath, effectiveCwd))) return false;
+      if (!assignedPath) {
+        return refuse("assigned-path-option-outside-worker-root", `${token} (empty value)`);
+      }
+      const resolved = resolveGitPath(assignedPath, effectiveCwd);
+      if (!isWithin(context.workerRoot, resolved)) {
+        return refuse("assigned-path-option-outside-worker-root", `${token} -> ${resolved}`);
+      }
       continue;
     }
 
@@ -207,22 +304,33 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
       const value = token.slice(equals + 1);
       if ((isAbsolute(value) || /(^|[\\/])\.\.([\\/]|$)/.test(value))
         && !isWithin(context.workerRoot, resolve(effectiveCwd, value))) {
-        return false;
+        return refuse(
+          "assigned-value-outside-worker-root",
+          `${token} -> ${resolve(effectiveCwd, value)}`,
+        );
       }
     }
 
     if (isAbsolute(token)) {
-      if (!isWithin(context.workerRoot, token)) return false;
+      if (!isWithin(context.workerRoot, token)) {
+        return refuse("absolute-argument-outside-worker-root", token);
+      }
       continue;
     }
 
     if (token.split(/[\\/]+/).includes("..")
       && !isWithin(context.workerRoot, resolve(effectiveCwd, token))) {
-      return false;
+      return refuse(
+        "traversal-argument-outside-worker-root",
+        `${token} -> ${resolve(effectiveCwd, token)}`,
+      );
     }
   }
 
-  return isWithin(context.workerRoot, effectiveCwd);
+  if (!isWithin(context.workerRoot, effectiveCwd)) {
+    return refuse("effective-cwd-outside-worker-root", effectiveCwd);
+  }
+  return CONTAINED;
 }
 
 function parseSimpleShellWords(command: string): string[] | null {
@@ -339,12 +447,26 @@ export function resolveTrustedTestGitFile(
   const trusted = context.trustedGitBinary ?? "/usr/bin/git";
   const explicitTrusted = isTrustedGitExecutable(file, trusted, context.cwd);
   if (file !== "git" && !explicitTrusted) return file;
-  const safeTarget = invocationStaysWithinWorker(args, context);
-  if (explicitTrusted && !safeTarget) {
-    throw new Error(`Explicit trusted git target is outside the Vitest worker root: ${args.join(" ")}`);
+  const containment = inspectTrustedTestGitContainment(args, context);
+  if (explicitTrusted && !containment.ok) {
+    /*
+    Name the rule, the resolved offending value and the full invocation. One
+    throw site serves seventeen rules, and a message that only repeats the argv
+    forces a reader to re-derive the whole policy by hand before they can tell a
+    mis-rooted fixture apart from an option the allowlist never covered.
+    */
+    throw new Error([
+      "Explicit trusted git target is outside the Vitest worker root:",
+      `rule=${containment.ruleId}`,
+      `detail=${containment.detail}`,
+      `executable=${file}`,
+      `args=${args.join(" ")}`,
+      `cwd=${context.cwd}`,
+      `workerRoot=${context.workerRoot}`,
+    ].join(" "));
   }
   if (explicitTrusted) return trusted;
-  if (!context.enableTrustedGitBypass || !existsSync(trusted) || !safeTarget || !requiresTrustedGitBypass(args)) return file;
+  if (!context.enableTrustedGitBypass || !existsSync(trusted) || !containment.ok || !requiresTrustedGitBypass(args)) return file;
   return trusted;
 }
 
