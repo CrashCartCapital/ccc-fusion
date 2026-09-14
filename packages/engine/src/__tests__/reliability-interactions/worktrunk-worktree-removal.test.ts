@@ -75,13 +75,17 @@ describe("reliability interactions: worktrunk worktree removal routing", () => {
     readdirSpy.mockReturnValue([{ isDirectory: () => true, name: "fn-1" }] as any);
     execSpy.mockImplementation((cmd: string, _opts: unknown, cb: (err: unknown, stdout: string, stderr: string) => void) => {
       if (cmd.includes("git worktree list --porcelain")) {
-        cb(null, "worktree /repo/.worktrees/fn-1\n", "");
+        // Branch line is load-bearing: since the worktree-sweep incident fix,
+        // scanIdleWorktrees only treats a registered worktree as a cleanup
+        // candidate when a durable Fusion task record backs it — here via the
+        // fusion/fn-1 branch naming plus the matching FN-1 task below.
+        cb(null, "worktree /repo/.worktrees/fn-1\nbranch refs/heads/fusion/fn-1\n", "");
         return;
       }
       cb(null, "", "");
     });
 
-    const store = { listTasks: vi.fn(async () => []) } as unknown as TaskStore;
+    const store = { listTasks: vi.fn(async () => [{ id: "FN-1", column: "done" }]) } as unknown as TaskStore;
     await cleanupOrphanedWorktrees("/repo", store, { worktreesDir: "/repo/.worktrees" });
 
     expect(removeSpy).toHaveBeenCalledWith(expect.objectContaining({ rootDir: "/repo", worktreePath: "/repo/.worktrees/fn-1" }));

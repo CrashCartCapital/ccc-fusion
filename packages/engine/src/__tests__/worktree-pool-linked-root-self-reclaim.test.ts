@@ -24,14 +24,30 @@ describe("worktree pool sweeps never reclaim the engine's own project root", () 
     return { listTasks: async () => [] } as unknown as TaskStore;
   }
 
+  // FNXC:SelfHealingOwnershipGuard 2026-09-06: since the worktree-sweep
+  // incident fix, a worktree is only reclaimable if a task record binds it
+  // or its branch matches Fusion's own `fusion/<task-id>` naming AND that
+  // task id exists in the store. A minimal store with one matching task is
+  // the least invasive way to keep exercising "genuinely idle sibling is
+  // still reclaimable" without re-asserting the pre-fix (vulnerable) claim
+  // that ANY unbound worktree is fair game.
+  function fusionOwnedTaskStore(taskId: string): TaskStore {
+    return {
+      listTasks: async () => [{ id: taskId, column: "done" }],
+    } as unknown as TaskStore;
+  }
+
   /**
    * Builds a primary checkout plus a shared `.worktrees/` pool holding two
-   * linked worktrees: the engine's own project root, and a genuinely idle one.
+   * linked worktrees: the engine's own project root, and a genuinely idle
+   * one on a `fusion/<task-id>` branch (Fusion's own naming convention, so
+   * it can be recognized as owned once paired with a matching task record).
    */
   function createLinkedRootFixture(): {
     fixtureRoot: string;
     engineRoot: string;
     idleWorktree: string;
+    idleTaskId: string;
   } {
     // realpath the fixture root so every expectation compares the same form the
     // pool resolver produces; on macOS the tmpdir is reached through a symlink.
@@ -45,23 +61,51 @@ describe("worktree pool sweeps never reclaim the engine's own project root", () 
     git(primaryRoot, "git add README.md");
     git(primaryRoot, 'git commit -q -m "init"');
 
+    const idleTaskId = "FN-999";
     const engineRoot = join(primaryRoot, ".worktrees", "engine-root");
-    const idleWorktree = join(primaryRoot, ".worktrees", "idle-task");
+    const idleWorktree = join(primaryRoot, ".worktrees", "fn-999");
     git(primaryRoot, `git worktree add -b engine-root ${JSON.stringify(engineRoot)} HEAD`);
-    git(primaryRoot, `git worktree add -b idle-task ${JSON.stringify(idleWorktree)} HEAD`);
+    git(primaryRoot, `git worktree add -b fusion/fn-999 ${JSON.stringify(idleWorktree)} HEAD`);
 
-    return { fixtureRoot, engineRoot, idleWorktree };
+    return { fixtureRoot, engineRoot, idleWorktree, idleTaskId };
   }
 
   it("excludes the engine's own linked project root from the idle-worktree scan", async () => {
-    const { fixtureRoot, engineRoot, idleWorktree } = createLinkedRootFixture();
+    const { fixtureRoot, engineRoot, idleWorktree, idleTaskId } = createLinkedRootFixture();
+    try {
+      const idle = (await scanIdleWorktrees(engineRoot, fusionOwnedTaskStore(idleTaskId), undefined))
+        .map((path) => realpathSync(path));
+
+      expect(idle).not.toContain(engineRoot);
+      // The guard must stay narrow: a genuinely idle, Fusion-owned sibling is
+      // still reclaimable.
+      expect(idle).toContain(idleWorktree);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("never reclaims a sibling worktree with no durable Fusion task record, even though it is not the engine's own root", async () => {
+    // Reproduces the 2026-09-06 incident shape directly: a `serve` process
+    // whose cwd auto-registered a brand-new project (zero task rows ever)
+    // ran its maintenance sweep against a repo that also held real,
+    // unrelated `agent/<name>` worktrees created outside Fusion task
+    // management — exactly what `.worktrees/l12-live-campaign` and
+    // `.worktrees/l8-live-campaign` were. Both were swept as "idle" and
+    // removed, twice, even though nothing in that engine's database ever
+    // claimed them.
+    const { fixtureRoot, engineRoot } = createLinkedRootFixture();
+    const foreignWorktree = join(fixtureRoot, "primary", ".worktrees", "agent-l12-live-campaign");
+    git(join(fixtureRoot, "primary"), `git worktree add -b agent/l12-live-campaign ${JSON.stringify(foreignWorktree)} HEAD`);
     try {
       const idle = (await scanIdleWorktrees(engineRoot, emptyTaskStore(), undefined))
         .map((path) => realpathSync(path));
 
-      expect(idle).not.toContain(engineRoot);
-      // The guard must stay narrow: a genuinely idle sibling is still reclaimable.
-      expect(idle).toContain(idleWorktree);
+      expect(idle).not.toContain(foreignWorktree);
+
+      await cleanupOrphanedWorktrees(engineRoot, emptyTaskStore(), undefined);
+      expect(existsSync(join(foreignWorktree, "README.md"))).toBe(true);
+      expect(existsSync(join(foreignWorktree, ".git"))).toBe(true);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -129,13 +173,14 @@ describe("worktree pool sweeps never reclaim the engine's own project root", () 
   });
 
   it("never deletes the engine's own linked project root during orphan cleanup", async () => {
-    const { fixtureRoot, engineRoot, idleWorktree } = createLinkedRootFixture();
+    const { fixtureRoot, engineRoot, idleWorktree, idleTaskId } = createLinkedRootFixture();
     try {
-      await cleanupOrphanedWorktrees(engineRoot, emptyTaskStore(), undefined);
+      await cleanupOrphanedWorktrees(engineRoot, fusionOwnedTaskStore(idleTaskId), undefined);
 
       expect(existsSync(join(engineRoot, "README.md"))).toBe(true);
       expect(existsSync(join(engineRoot, ".git"))).toBe(true);
-      // The idle sibling is still reclaimed, so cleanup has not simply stopped.
+      // The Fusion-owned idle sibling is still reclaimed, so cleanup has not
+      // simply stopped.
       expect(existsSync(join(idleWorktree, "README.md"))).toBe(false);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
