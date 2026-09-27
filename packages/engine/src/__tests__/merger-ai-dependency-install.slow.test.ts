@@ -173,7 +173,7 @@ describe("runAiMerge dependency install", () => {
     expect(store.appendAgentLog).toHaveBeenCalledWith(
       "FN-1",
       expect.stringContaining("(no command)"),
-      "text",
+      "status",
       undefined,
       "merger",
     );

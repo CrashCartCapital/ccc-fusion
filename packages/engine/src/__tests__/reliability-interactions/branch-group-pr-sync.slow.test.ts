@@ -52,7 +52,7 @@ describe("U6: group PR sync on member landing", () => {
         steps: [],
       } as any);
 
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-U6-A",
         branchName: "fusion/groups/fn-u6-a",
@@ -64,7 +64,7 @@ describe("U6: group PR sync on member landing", () => {
       await store.updateTask(second.id, { branchContext: { groupId: group.id, source: "planning", assignmentMode: "shared" } } as any);
 
       // Simulate a group PR already created and open (as if a prior promotion ran).
-      store.updateBranchGroup(group.id, { prState: "open", prNumber: 99, prUrl: "https://github.com/o/r/pull/99" });
+      await store.updateBranchGroup(group.id, { prState: "open", prNumber: 99, prUrl: "https://github.com/o/r/pull/99" });
 
       const syncCalls: Array<{ prNumber: number | null; memberIds: string[] }> = [];
       const syncGroupPr: SyncGroupPrFn = vi.fn(async ({ group: g, members }) => {
@@ -90,8 +90,8 @@ describe("U6: group PR sync on member landing", () => {
       expect(syncCalls[0].prNumber).toBe(99);
       expect(syncCalls[0].memberIds).toEqual(expect.arrayContaining([task.id, second.id]));
       // No duplicate PR creation — prState stays open, prNumber unchanged.
-      expect(store.getBranchGroup(group.id)?.prNumber).toBe(99);
-      expect(store.getBranchGroup(group.id)?.prState).toBe("open");
+      expect((await store.getBranchGroup(group.id))?.prNumber).toBe(99);
+      expect((await store.getBranchGroup(group.id))?.prState).toBe("open");
     } finally {
       await fixture.cleanup();
     }
@@ -101,7 +101,7 @@ describe("U6: group PR sync on member landing", () => {
     const fixture = await makeReliabilityFixture({ taskId: "FN-U6-SYNC-NOPR", settings: { testMode: true, autoMerge: true } as any });
     try {
       const { rootDir, store, task } = fixture;
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-U6-NOPR",
         branchName: "fusion/groups/fn-u6-nopr",
@@ -125,7 +125,7 @@ describe("U6: group PR sync on member landing", () => {
     const fixture = await makeReliabilityFixture({ taskId: "FN-U6-SYNC-FAIL", settings: { testMode: true, autoMerge: true } as any });
     try {
       const { rootDir, store, task } = fixture;
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-U6-FAIL",
         branchName: "fusion/groups/fn-u6-fail",
@@ -133,7 +133,7 @@ describe("U6: group PR sync on member landing", () => {
       });
       await store.setTaskBranchGroup(task.id, group.id);
       await store.updateTask(task.id, { branchContext: { groupId: group.id, source: "planning", assignmentMode: "shared" } } as any);
-      store.updateBranchGroup(group.id, { prState: "open", prNumber: 7, prUrl: "https://github.com/o/r/pull/7" });
+      await store.updateBranchGroup(group.id, { prState: "open", prNumber: 7, prUrl: "https://github.com/o/r/pull/7" });
 
       const syncGroupPr: SyncGroupPrFn = vi.fn(async () => {
         throw new Error("github down");
@@ -151,8 +151,8 @@ describe("U6: group PR sync on member landing", () => {
       await syncSettled;
       expect(syncGroupPr).toHaveBeenCalled();
       // prState/prNumber unchanged despite the sync failure (retryable next landing).
-      expect(store.getBranchGroup(group.id)?.prState).toBe("open");
-      expect(store.getBranchGroup(group.id)?.prNumber).toBe(7);
+      expect((await store.getBranchGroup(group.id))?.prState).toBe("open");
+      expect((await store.getBranchGroup(group.id))?.prNumber).toBe(7);
     } finally {
       await fixture.cleanup();
     }
@@ -162,7 +162,7 @@ describe("U6: group PR sync on member landing", () => {
     const fixture = await makeReliabilityFixture({ taskId: "FN-U6-SYNC-OOB", settings: { testMode: true, autoMerge: true } as any });
     try {
       const { rootDir, store, task } = fixture;
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-U6-OOB",
         branchName: "fusion/groups/fn-u6-oob",
@@ -170,7 +170,7 @@ describe("U6: group PR sync on member landing", () => {
       });
       await store.setTaskBranchGroup(task.id, group.id);
       await store.updateTask(task.id, { branchContext: { groupId: group.id, source: "planning", assignmentMode: "shared" } } as any);
-      store.updateBranchGroup(group.id, { prState: "open", prNumber: 13, prUrl: "https://github.com/o/r/pull/13" });
+      await store.updateBranchGroup(group.id, { prState: "open", prNumber: 13, prUrl: "https://github.com/o/r/pull/13" });
 
       // GitHub reports the PR merged out-of-band; sync returns the reconciled state.
       const syncGroupPr: SyncGroupPrFn = vi.fn(async ({ group: g }) => ({
@@ -190,7 +190,7 @@ describe("U6: group PR sync on member landing", () => {
       expect(merge.merged).toBe(true);
       await syncSettled;
       // The merger persists the reconciled prState rather than leaving stale "open".
-      expect(store.getBranchGroup(group.id)?.prState).toBe("merged");
+      expect((await store.getBranchGroup(group.id))?.prState).toBe("merged");
     } finally {
       await fixture.cleanup();
     }

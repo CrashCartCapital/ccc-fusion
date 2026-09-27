@@ -140,7 +140,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         } as any);
 
         // Group created exactly as the planning entry point creates it.
-        const group = store.createBranchGroup({
+        const group = await store.createBranchGroup({
           sourceType: "planning",
           sourceId: "PS-U8-PLAN",
           branchName: "fusion/groups/fn-u8-plan",
@@ -206,7 +206,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         const promoted = await promote({ createGroupPr });
         expect(promoted.reason).toBe("promoted");
         expect(createGroupPr).toHaveBeenCalledTimes(1);
-        const afterPromote = store.getBranchGroup(group.id)!;
+        const afterPromote = (await store.getBranchGroup(group.id))!;
         expect(afterPromote.prNumber).toBe(4242);
         expect(afterPromote.prUrl).toBe("https://github.com/o/r/pull/4242");
         expect(afterPromote.prState).toBe("open");
@@ -219,7 +219,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         const again = await promote({ createGroupPr });
         expect(again.reason).toBe("already-finalized");
         expect(createGroupPr).toHaveBeenCalledTimes(1);
-        expect(store.getBranchGroup(group.id)?.prNumber).toBe(4242);
+        expect((await store.getBranchGroup(group.id))?.prNumber).toBe(4242);
 
         // A subsequent landing on the now-open PR fires a sync (keeps the single
         // managed PR in sync — R6) and never opens a second PR. The exact x/N
@@ -245,8 +245,8 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         expect(syncCalls.length).toBeGreaterThan(syncCountBefore);
         expect(syncGroupPr).toHaveBeenCalled();
         expect(syncCalls.at(-1)?.memberIds).toEqual(expect.arrayContaining([task.id]));
-        expect(store.getBranchGroup(group.id)?.prNumber).toBe(4242);
-        expect(store.getBranchGroup(group.id)?.prState).toBe("open");
+        expect((await store.getBranchGroup(group.id))?.prNumber).toBe(4242);
+        expect((await store.getBranchGroup(group.id))?.prState).toBe("open");
         // Third member also assembled on the group branch, never main.
         expect(git(rootDir, `git show ${group.branchName}:packages/engine/src/fnU8PlanC.ts`)).toContain("fnU8PlanC");
         expect(() => git(rootDir, "git show main:packages/engine/src/fnU8PlanC.ts")).toThrow();
@@ -256,7 +256,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         // primitive the GET /branch-groups/:id route wires up) with an injected
         // syncGroupPr that reports the PR as merged, and assert the persisted
         // state came from the reconcile path — not from a hand-written write.
-        const openGroup = store.getBranchGroup(group.id)!;
+        const openGroup = (await store.getBranchGroup(group.id))!;
         expect(openGroup.prState).toBe("open");
         const reconcileSync: SyncGroupPrFn = vi.fn(async ({ group: g }) => ({
           prNumber: g.prNumber!,
@@ -273,8 +273,8 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         expect(reconciled.reconciled).toBe(true);
         expect(reconciled.prState).toBe("merged");
         // The persisted row reflects the reconcile result.
-        expect(store.getBranchGroup(group.id)?.prState).toBe("merged");
-        expect(store.getBranchGroup(group.id)?.prNumber).toBe(4242);
+        expect((await store.getBranchGroup(group.id))?.prState).toBe("merged");
+        expect((await store.getBranchGroup(group.id))?.prNumber).toBe(4242);
       } finally {
         await fixture.cleanup();
       }
@@ -300,7 +300,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         } as any);
 
         // Group created exactly as mission triage creates it.
-        const group = store.createBranchGroup({
+        const group = await store.createBranchGroup({
           sourceType: "mission",
           sourceId: "M-U8-MIS",
           branchName: "fusion/groups/fn-u8-mis",
@@ -333,8 +333,8 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         const promoted = await promote({ createGroupPr });
         expect(promoted.reason).toBe("promoted");
         expect(createGroupPr).toHaveBeenCalledTimes(1);
-        expect(store.getBranchGroup(group.id)?.prNumber).toBe(808);
-        expect(store.getBranchGroup(group.id)?.prState).toBe("open");
+        expect((await store.getBranchGroup(group.id))?.prNumber).toBe(808);
+        expect((await store.getBranchGroup(group.id))?.prState).toBe("open");
 
         // Abandon mid-flight: close callback invoked, prState=closed (R7).
         //
@@ -354,19 +354,19 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
           prUrl: g.prUrl!,
           prState: "closed" as const,
         }));
-        const current = store.getBranchGroup(group.id)!;
+        const current = (await store.getBranchGroup(group.id))!;
         let prState: BranchGroup["prState"] = "closed";
         if (current.prNumber != null && current.prState === "open") {
           const reconciled = await closeGroupPr({ group: current });
           prState = reconciled.prState;
         }
-        store.updateBranchGroup(group.id, { status: "abandoned", prState });
+        await store.updateBranchGroup(group.id, { status: "abandoned", prState });
         expect(closeGroupPr).toHaveBeenCalledTimes(1);
-        const abandoned = store.getBranchGroup(group.id)!;
+        const abandoned = (await store.getBranchGroup(group.id))!;
         expect(abandoned.status).toBe("abandoned");
         expect(abandoned.prState).toBe("closed");
         // Idempotent re-abandon attempt does not re-close (already closed).
-        expect(store.getBranchGroup(group.id)?.prState).toBe("closed");
+        expect((await store.getBranchGroup(group.id))?.prState).toBe("closed");
       } finally {
         await fixture.cleanup();
       }
@@ -382,7 +382,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         const { rootDir, store, task } = fixture;
         // A sibling fusion/fn-* branch exists in the repo to prove routing never
         // resolves a shared member against it.
-        const group = store.createBranchGroup({
+        const group = await store.createBranchGroup({
           sourceType: "planning",
           sourceId: "PS-U8-SAFE",
           branchName: "fusion/groups/fn-u8-safe",
@@ -426,7 +426,7 @@ describe("U8 end-to-end: single managed group PR (planning + mission)", () => {
         const promoted = await promote({ createGroupPr });
         expect(promoted.reason).toBe("promoted");
         expect(createGroupPr).toHaveBeenCalledTimes(1);
-        expect(store.getBranchGroup(group.id)?.prNumber).toBe(909);
+        expect((await store.getBranchGroup(group.id))?.prNumber).toBe(909);
       } finally {
         await fixture.cleanup();
       }
