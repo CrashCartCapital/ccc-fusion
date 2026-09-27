@@ -1,3 +1,4 @@
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,8 +17,6 @@ type StagedMember = {
   worktreePath: string;
   fileName: string;
 };
-
-const shellQuote = (value: string): string => `'${value.replaceAll("'", `'\\''`)}'`;
 
 /*
 FNXC:EngineTests 2026-06-18-11:52:
@@ -51,25 +50,12 @@ async function stageSharedMember(
   } as any);
 
   const filePath = `packages/engine/src/${input.fileName}.ts`;
-  const content = `export const ${input.fileName} = true;\n`;
-  const message = `feat: add ${input.fileName}`;
-  /*
-  FNXC:EngineTests 2026-06-18-11:47:
-  FN-6646 preserves the FN-5820 shared-branch lifecycle assertions but stages member branches through one deterministic shell seam so this slow-lane file does less repeated Node-side subprocess and fs orchestration per member.
-  */
-  const script = `set -e
-branch=$1
-file=$2
-content=$3
-message=$4
-git checkout -b "$branch"
-mkdir -p "$(dirname "$file")"
-printf "%s" "$content" > "$file"
-git add "$file"
-git commit -m "$message"
-git checkout main
-`;
-  git(rootDir, `sh -c ${shellQuote(script)} sh ${[branch, filePath, content, message].map(shellQuote).join(" ")}`);
+  git(rootDir, `git checkout -b ${branch}`);
+  await mkdir(join(rootDir, "packages/engine/src"), { recursive: true });
+  await writeFile(join(rootDir, filePath), `export const ${input.fileName} = true;\n`);
+  git(rootDir, `git add ${JSON.stringify(filePath)}`);
+  git(rootDir, `git commit -m ${JSON.stringify(`feat: add ${input.fileName}`)}`);
+  git(rootDir, "git checkout main");
   await store.enqueueMergeQueue(input.taskId);
 
   return { taskId: input.taskId, branch, worktreePath, fileName: input.fileName };
@@ -81,26 +67,14 @@ async function fastIntegrateSharedMember(
   member: StagedMember,
   group: { id: string; branchName: string },
 ): Promise<string> {
-  /*
-  FNXC:EngineTests 2026-06-19-02:55:
-  FN-6691 keeps full aiMergeTask coverage in the routing-focused and self-healing cases, but promotion/gating cases only need member branches already accumulated on the shared branch with merge metadata.
-  Use one deterministic git shell seam here so FN-5820 completion, promotion, and auto-merge-off assertions stay intact without paying the mock merger session cost in every case.
-  */
   const message = `test: integrate ${member.taskId} into ${group.branchName}`;
-  const script = `set -e
-member_branch=$1
-group_branch=$2
-message=$3
-if ! git show-ref --verify --quiet "refs/heads/$group_branch"; then
-  git branch "$group_branch" main
-fi
-git checkout "$group_branch"
-git merge --no-ff "$member_branch" -m "$message"
-git rev-parse HEAD
-git checkout main
-`;
-  const output = git(rootDir, `sh -c ${shellQuote(script)} sh ${[member.branch, group.branchName, message].map(shellQuote).join(" ")}`);
-  const commitSha = output.split("\n").map((line) => line.trim()).filter(Boolean).at(-1) ?? "";
+  if (!git(rootDir, `git branch --list ${group.branchName}`)) {
+    git(rootDir, `git branch ${group.branchName} main`);
+  }
+  git(rootDir, `git checkout ${group.branchName}`);
+  git(rootDir, `git merge --no-ff ${member.branch} -m ${JSON.stringify(message)}`);
+  const commitSha = git(rootDir, "git rev-parse HEAD");
+  git(rootDir, "git checkout main");
   await store.updateTask(member.taskId, {
     column: "done",
     status: null,
@@ -132,7 +106,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
         steps: [],
       } as any);
 
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-FN5820-CASE1",
         branchName: "fusion/groups/fn-5820-shared",
@@ -176,7 +150,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
         steps: [],
       } as any);
 
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "mission",
         sourceId: "M-FN5820-CASE2",
         branchName: "fusion/groups/fn-5820-accumulate",
@@ -203,7 +177,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
       expect(() => git(rootDir, "git show main:packages/engine/src/fn5820Case2A.ts")).toThrow();
       expect(() => git(rootDir, "git show main:packages/engine/src/fn5820Case2B.ts")).toThrow();
 
-      const routedEvents = store.getRunAuditEvents().filter((event) => event.mutationType === "merge:branch-group-routed");
+      const routedEvents = (await store.getRunAuditEventsAsync()).filter((event) => event.mutationType === "merge:branch-group-routed");
       expect(routedEvents).toEqual(expect.arrayContaining([
         expect.objectContaining({
           target: task.id,
@@ -242,7 +216,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
         steps: [],
       } as any);
 
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-FN5820-CASE3",
         branchName: "fusion/groups/fn-5820-promotion",
@@ -297,8 +271,8 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
       });
       expect(promoted.reason).toBe("promoted");
       expect(promoted.promoted).toBe(true);
-      expect(store.getBranchGroup(group.id)?.status).toBe("finalized");
-      expect(store.getBranchGroup(group.id)?.prState).toBe("merged");
+      expect((await store.getBranchGroup(group.id))?.status).toBe("finalized");
+      expect((await store.getBranchGroup(group.id))?.prState).toBe("merged");
       expect(git(rootDir, "git show main:packages/engine/src/fn5820Case3A.ts")).toContain("fn5820Case3A");
       expect(git(rootDir, "git show main:packages/engine/src/fn5820Case3B.ts")).toContain("fn5820Case3B");
 
@@ -339,7 +313,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
         steps: [],
       } as any);
 
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-FN5820-CASE4",
         branchName: "fusion/groups/fn-5820-gated",
@@ -395,7 +369,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
       });
 
       expect(gated.reason).toBe("gated");
-      expect(store.getBranchGroup(group.id)?.status).toBe("open");
+      expect((await store.getBranchGroup(group.id))?.status).toBe("open");
       expect(audits).toEqual(expect.arrayContaining([
         expect.objectContaining({
           mutationType: "merge:branch-group-promotion-gated",
@@ -416,7 +390,7 @@ describe("FN-5820 reliability interactions: shared branch group lifecycle", () =
     const fixture = await makeReliabilityFixture({ taskId: "FN-5820-RI-K", settings: sharedBranchLifecycleSettings({ autoMerge: true }) });
     try {
       const { rootDir, store, task } = fixture;
-      const group = store.createBranchGroup({
+      const group = await store.createBranchGroup({
         sourceType: "planning",
         sourceId: "PS-FN5820-CASE5",
         branchName: "fusion/groups/fn-5820-self-heal",
