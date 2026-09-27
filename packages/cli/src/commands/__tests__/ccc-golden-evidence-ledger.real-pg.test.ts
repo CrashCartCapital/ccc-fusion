@@ -74,10 +74,17 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
   const invalidBaseIdempotencyKey = "ccc-golden-evidence-ledger-invalid-base-v1";
 
   beforeAll(async () => {
-    await h.beforeAll();
-    await h.beforeEach();
     lifecycleRoot = await mkdtemp(join(tmpdir(), "ccc-golden-import-"));
-    lifecycle = await prepareLifecycle(lifecycleRoot);
+    // The packet CLI and isolated PostgreSQL fixture are independent setup.
+    // Run them together so their work fits the normal hook budget under load.
+    const [prepared] = await Promise.all([
+      prepareLifecycle(lifecycleRoot),
+      (async () => {
+        await h.beforeAll();
+        await h.beforeEach();
+      })(),
+    ]);
+    lifecycle = prepared;
     packetArgs = [
       lifecycle.frozenRoot,
       lifecycle.manifestPath,
