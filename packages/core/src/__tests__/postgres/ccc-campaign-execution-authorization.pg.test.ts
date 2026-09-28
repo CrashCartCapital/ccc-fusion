@@ -1532,86 +1532,84 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
     });
   });
 
-  it("RED-S3-opened-lifecycles: every actual reserved or terminal provider-attempt lifecycle remains opened", async () => {
-    for (const lifecycle of [
-      "reserved",
-      "proved-not-dispatched",
-      "dispatched-unknown",
-      "proved-failed",
-    ] as const) {
-      const campaign = await fixture(`opened-${lifecycle}`, { maxDurationMs: 60_000 });
-      const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
-        authorityStore: h.store(),
-        rootDir: h.rootDir(),
-        taskId: campaign.taskIds[0]!,
-        requester: REQUESTER,
-        notBeforeAt: campaign.campaignStartedAt,
-        expiresAt: campaign.campaignDeadlineAt,
-      });
-      const claimed = await claimCccCampaignExecutionAuthorization(h.layer(), {
-        authorityStore: h.store(),
-        rootDir: h.rootDir(),
-        authorizationId: issued.authorizationId,
-        claimant: OPERATOR,
-        claimToken: `sealed-parent-opened-${lifecycle}-token`,
-      });
-      const attempt = await h.store().reserveCccProviderAttempt(
-        providerRequest(campaign, 0, `opened-${lifecycle}`),
-      );
-      const transition: CccProviderAttemptTransition = {
-        taskId: attempt.taskId,
-        attemptKey: attempt.attemptKey,
-        controllerToken: attempt.controllerToken,
-      };
-      if (lifecycle === "proved-not-dispatched") {
-        await h.store().proveCccProviderAttemptNotDispatched(transition);
-      } else if (lifecycle === "dispatched-unknown" || lifecycle === "proved-failed") {
-        await h.store().beginCccProviderAttemptDispatch(transition);
-        if (lifecycle === "proved-failed") {
-          await h.store().settleCccProviderAttemptAndApproval({
-            ...attempt,
-            outcome: "proved_failed",
-            evidenceDigest: "f".repeat(64),
-            observerId: `execution-authorization-${lifecycle}`,
-          });
-        }
+  it.each([
+    "reserved",
+    "proved-not-dispatched",
+    "dispatched-unknown",
+    "proved-failed",
+  ] as const)("RED-S3-opened-lifecycles: %s provider-attempt lifecycle remains opened", async (lifecycle) => {
+    const campaign = await fixture(`opened-${lifecycle}`, { maxDurationMs: 60_000 });
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: campaign.taskIds[0]!,
+      requester: REQUESTER,
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const claimed = await claimCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      authorizationId: issued.authorizationId,
+      claimant: OPERATOR,
+      claimToken: `sealed-parent-opened-${lifecycle}-token`,
+    });
+    const attempt = await h.store().reserveCccProviderAttempt(
+      providerRequest(campaign, 0, `opened-${lifecycle}`),
+    );
+    const transition: CccProviderAttemptTransition = {
+      taskId: attempt.taskId,
+      attemptKey: attempt.attemptKey,
+      controllerToken: attempt.controllerToken,
+    };
+    if (lifecycle === "proved-not-dispatched") {
+      await h.store().proveCccProviderAttemptNotDispatched(transition);
+    } else if (lifecycle === "dispatched-unknown" || lifecycle === "proved-failed") {
+      await h.store().beginCccProviderAttemptDispatch(transition);
+      if (lifecycle === "proved-failed") {
+        await h.store().settleCccProviderAttemptAndApproval({
+          ...attempt,
+          outcome: "proved_failed",
+          evidenceDigest: "f".repeat(64),
+          observerId: `execution-authorization-${lifecycle}`,
+        });
       }
-      await h.layer().db.execute(sql`
-        UPDATE project.workflow_work_items
-        SET state = 'failed',
-            last_error = ${`workflow-node-failed:${lifecycle}`},
-            blocked_reason = NULL,
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            updated_at = ${new Date().toISOString()}
-        WHERE id = ${claimed.workItemId}
-      `);
-
-      const closed = await closeUnopenedCccCampaignExecutionAuthorizationMembers(h.layer(), {
-        authorityStore: h.store(),
-        rootDir: h.rootDir(),
-        authorizationId: claimed.authorizationId,
-        actor: OPERATOR,
-        runId: `sealed-opened-${lifecycle}-closure:${claimed.authorizationId}`,
-      });
-      expect(closed.authorization.status).toBe("claimed");
-      expect(closed.openedApprovalRequestIds).toEqual([
-        claimed.members[0]!.approvalRequestId,
-      ]);
-      expect(closed.closedApprovalRequestIds).toEqual([
-        claimed.members[1]!.approvalRequestId,
-      ]);
-      const childRows = await h.layer().db.execute(sql`
-        SELECT id, status
-        FROM project.approval_requests
-        WHERE campaign_import_id = ${campaign.imported.importId}
-        ORDER BY id
-      `) as unknown as Array<{ id: string; status: string }>;
-      expect(childRows.find(({ id }) => id === claimed.members[0]!.approvalRequestId)?.status)
-        .toBe("claimed");
-      expect(childRows.find(({ id }) => id === claimed.members[1]!.approvalRequestId)?.status)
-        .toBe("expired");
     }
+    await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items
+      SET state = 'failed',
+          last_error = ${`workflow-node-failed:${lifecycle}`},
+          blocked_reason = NULL,
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          updated_at = ${new Date().toISOString()}
+      WHERE id = ${claimed.workItemId}
+    `);
+
+    const closed = await closeUnopenedCccCampaignExecutionAuthorizationMembers(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      authorizationId: claimed.authorizationId,
+      actor: OPERATOR,
+      runId: `sealed-opened-${lifecycle}-closure:${claimed.authorizationId}`,
+    });
+    expect(closed.authorization.status).toBe("claimed");
+    expect(closed.openedApprovalRequestIds).toEqual([
+      claimed.members[0]!.approvalRequestId,
+    ]);
+    expect(closed.closedApprovalRequestIds).toEqual([
+      claimed.members[1]!.approvalRequestId,
+    ]);
+    const childRows = await h.layer().db.execute(sql`
+      SELECT id, status
+      FROM project.approval_requests
+      WHERE campaign_import_id = ${campaign.imported.importId}
+      ORDER BY id
+    `) as unknown as Array<{ id: string; status: string }>;
+    expect(childRows.find(({ id }) => id === claimed.members[0]!.approvalRequestId)?.status)
+      .toBe("claimed");
+    expect(childRows.find(({ id }) => id === claimed.members[1]!.approvalRequestId)?.status)
+      .toBe("expired");
   });
 
   it("RED-S3-unknown-effect: an unresolved effect receipt rolls back every proposed no-effect closure", async () => {

@@ -2,7 +2,8 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import { computeMaxWorkers } from "../../packages/core/src/__test-utils__/vitest-workers";
 
-const maxWorkers = computeMaxWorkers();
+// PostgreSQL fixture setup shares one local server; keep full-suite fanout bounded.
+const maxWorkers = computeMaxWorkers(process.env.FUSION_TEST_TOTAL_WORKERS ? { maxCap: 2 } : {});
 
 export default defineConfig({
   resolve: {

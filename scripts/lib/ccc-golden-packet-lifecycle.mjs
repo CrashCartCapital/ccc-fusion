@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, URL } from "node:url";
@@ -19,13 +19,25 @@ export function buildLifecycleChildEnvironment(source, home) {
   return environment;
 }
 
-function run(command, args, options = {}) {
-  return spawnSync(command, args, {
-    cwd: options.cwd,
-    encoding: "utf8",
-    env: options.env,
-    input: options.input,
+async function run(command, args, options = {}) {
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.stdin.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(options.input);
   });
+  return result;
 }
 
 function requireExitZero(result, label) {
@@ -41,8 +53,8 @@ function requireJsonSuccess(result, label) {
   return JSON.parse(result.stdout);
 }
 
-function runGit(root, args, label, env) {
-  const result = run("git", args, { cwd: root, env });
+async function runGit(root, args, label, env) {
+  const result = await run("git", args, { cwd: root, env });
   requireExitZero(result, label);
   return result.stdout.trim();
 }
@@ -56,12 +68,12 @@ export async function prepareEvidenceLedgerPacketLifecycle(input) {
   const childEnvironment = buildLifecycleChildEnvironment(process.env, lifecycleHome);
   const targetRoot = path.join(root, "target");
   await createEvidenceLedgerBaseline(targetRoot);
-  runGit(targetRoot, ["init", "-b", "main"], "git init", childEnvironment);
-  runGit(targetRoot, ["config", "user.name", "CCC Golden Test"], "git config name", childEnvironment);
-  runGit(targetRoot, ["config", "user.email", "ccc-golden@example.invalid"], "git config email", childEnvironment);
-  runGit(targetRoot, ["add", "."], "git add", childEnvironment);
-  runGit(targetRoot, ["commit", "-m", "chore: freeze golden baseline"], "git commit", childEnvironment);
-  const baseCommit = runGit(targetRoot, ["rev-parse", "HEAD"], "git rev-parse", childEnvironment);
+  await runGit(targetRoot, ["init", "-b", "main"], "git init", childEnvironment);
+  await runGit(targetRoot, ["config", "user.name", "CCC Golden Test"], "git config name", childEnvironment);
+  await runGit(targetRoot, ["config", "user.email", "ccc-golden@example.invalid"], "git config email", childEnvironment);
+  await runGit(targetRoot, ["add", "."], "git add", childEnvironment);
+  await runGit(targetRoot, ["commit", "-m", "chore: freeze golden baseline"], "git commit", childEnvironment);
+  const baseCommit = await runGit(targetRoot, ["rev-parse", "HEAD"], "git rev-parse", childEnvironment);
   if (!/^[a-f0-9]{40}$/.test(baseCommit)) throw new Error("git base commit is not a 40-hex object id");
 
   const definition = buildEvidenceLedgerPacketDefinition({
@@ -75,7 +87,7 @@ export async function prepareEvidenceLedgerPacketLifecycle(input) {
   const activeRoot = path.join(root, "active");
   const frozenRoot = path.join(root, "frozen");
   const sourceReceipt = await writeEvidenceLedgerPacketSources(activeRoot, definition);
-  const freeze = requireJsonSuccess(run(process.execPath, [
+  const freeze = requireJsonSuccess(await run(process.execPath, [
     cliPath, "prd", "freeze", activeRoot, sourceReceipt.prdPath, frozenRoot, "--context-stdin", "--json",
   ], { cwd: root, env: childEnvironment, input: JSON.stringify(definition.operatorContext) }), "prd freeze");
   const manifestPath = path.join(frozenRoot, "manifest.json");
@@ -87,16 +99,16 @@ export async function prepareEvidenceLedgerPacketLifecycle(input) {
   const executionPlanPath = path.join(frozenRoot, "execution-plan.json");
   await writeFile(proposalPath, `${JSON.stringify(definition.proposal, null, 2)}\n`);
   await writeFile(routesPath, `${JSON.stringify(definition.routes, null, 2)}\n`);
-  const author = requireJsonSuccess(run(process.execPath, [
+  const author = requireJsonSuccess(await run(process.execPath, [
     cliPath, "prd", "author", frozenRoot, manifestPath, proposalPath, sidecarPath, "--json",
   ], { cwd: root, env: childEnvironment }), "prd author");
-  const validate = requireJsonSuccess(run(process.execPath, [
+  const validate = requireJsonSuccess(await run(process.execPath, [
     cliPath, "prd", "validate", frozenRoot, manifestPath, sidecarPath, targetRoot, baseCommit, "--json",
   ], { cwd: root, env: childEnvironment }), "prd validate");
-  const compile = requireJsonSuccess(run(process.execPath, [
+  const compile = requireJsonSuccess(await run(process.execPath, [
     cliPath, "prd", "compile", frozenRoot, manifestPath, sidecarPath, targetRoot, baseCommit, "--json",
   ], { cwd: root, env: childEnvironment }), "prd compile");
-  const policy = requireJsonSuccess(run(process.execPath, [
+  const policy = requireJsonSuccess(await run(process.execPath, [
     cliPath, "prd", "policy", frozenRoot, manifestPath, sidecarPath, targetRoot, baseCommit,
     executionPlanPath, "--routes-file", routesPath, "--json",
   ], { cwd: root, env: childEnvironment }), "prd policy");

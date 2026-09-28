@@ -134,15 +134,6 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-async function waitForPath(path: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path)) return true;
-    await delay(10);
-  }
-  return existsSync(path);
-}
-
 function mkfifoSync(path: string): void {
   execFileSync("/usr/bin/mkfifo", [path], {
     stdio: ["ignore", "ignore", "pipe"],
@@ -979,7 +970,14 @@ describe("CCC campaign local Git observation", () => {
         descendantAlive: boolean;
       } | undefined;
       try {
-        expect(await waitForPath(pidPath, 1_000)).toBe(true);
+        // Wait for the executable to publish its PIDs or for inspection to
+        // settle. A fixed one-second startup check can fail under full-suite
+        // load before the executable has run, leaving it active at test exit.
+        const launchDeadline = Date.now() + 8_000;
+        while (!existsSync(pidPath) && !settled && Date.now() < launchDeadline) {
+          await delay(10);
+        }
+        expect(existsSync(pidPath)).toBe(true);
         pids = JSON.parse(readFileSync(pidPath, "utf8")) as {
           parent: number;
           descendant: number;
@@ -998,6 +996,9 @@ describe("CCC campaign local Git observation", () => {
           descendantAlive: isProcessAlive(pids.descendant),
         };
       } finally {
+        // Even if startup failed, let the production supervisor finish its
+        // bounded termination before the subprocess guard checks for leaks.
+        await inspection;
         for (const pid of [pids?.descendant, pids?.parent]) {
           if (pid !== undefined && isProcessAlive(pid)) {
             try {

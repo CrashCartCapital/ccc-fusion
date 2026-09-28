@@ -374,6 +374,12 @@ never invisible again.
 
 ## Darwin proof lane and NOT RUN semantics (non-blocking CI)
 
+For local Darwin product-route proof, use the official Node 24 binary selected by CI's
+`actions/setup-node`, with that binary first on `PATH`. On 2026-09-27 the M5's
+Homebrew Node 24.16.0 took over 60 seconds in the vertical-slice test; the
+official Node 24.21.0 completed the same test in 33.41 seconds without changing
+the proof checks or its 60-second limit.
+
 `.archive/full-suite-red-diagnosis-20260911.md` found the biggest single failure cluster in the
 sharded suite is a platform gap, not a real regression: `ccc-campaign-proof-sandbox.ts`'s semantic-v2
 proof sandbox has no Linux confinement backend, and every `test-shards`/`test-slow` runner is Linux.

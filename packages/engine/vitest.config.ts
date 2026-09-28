@@ -2,7 +2,9 @@ import { defineConfig } from "vitest/config";
 import { resolve } from "node:path";
 import { computeMaxWorkers } from "../core/src/__test-utils__/vitest-workers";
 
-const maxWorkers = computeMaxWorkers();
+// Full workspace sweeps share PostgreSQL and spawn many real Git/Node probes.
+// Keep that lane within a small worker budget without slowing focused runs.
+const maxWorkers = computeMaxWorkers(process.env.FUSION_TEST_TOTAL_WORKERS ? { maxCap: 2 } : {});
 
 export default defineConfig({
   resolve: {
@@ -405,39 +407,9 @@ export default defineConfig({
           // and inflating wall time further. Excluded from the default
           // `pnpm test` lane; run via `pnpm test:slow` / `pnpm test:all`.
           include: ["src/**/*.slow.test.ts"],
-          /*
-          FNXC:EngineTests 2026-06-25-14:30:
-          The SQLite-to-PostgreSQL cutover (feature quarantine-sqlite-internals-tests, retry
-          session) quarantines 6 engine-slow reliability-interaction test files that fail on
-          clean baseline (stash + rerun, 6 failed | 8 passed). These are real-git + SQLite-backed
-          branch-group tests that hit the async-satellite getAsyncLayer/isBackendMode mock drift
-          or branch-group "undefined not found" errors under the cutover's dual-path. Quarantined
-          on sight per AGENTS.md flaky-test rule so verify:workspace goes green. Mirrored in
-          scripts/lib/test-quarantine.json.
-          */
-          /*
-          FNXC:EngineTests 2026-09-11-17:30:
-          PR-C (full-suite quarantine reconciliation) re-verified all six exclusions below
-          against a disposable local PostgreSQL (`FUSION_PG_TEST_URL_BASE`, engine-slow
-          project selected directly). None pass cleanly today: merger-ai-dependency-install
-          has one real assertion/behavior drift; the five reliability-interactions files each
-          hit a live "branch_groups.id resolves to undefined" Postgres rejection out of
-          getBranchGroup/updateBranchGroup/listTasksByBranchGroupImpl (async-branch-groups.ts),
-          plus (in shared-branch-group-lifecycle) a genuine branch-naming assertion mismatch on
-          CASE 1. Every file now has a matching dated entry in scripts/lib/test-quarantine.json
-          with its real first-observed error — the comment above claiming these were "mirrored"
-          there was false from the moment it was written (c15c78fee, 2026-07-13: the ledger's
-          entries array has been [] since that commit). Rescue requires fixing the branch-group
-          id propagation under the real-PG path, not just re-running.
-          */
-          exclude: [
-            "src/__tests__/merger-ai-dependency-install.slow.test.ts",
-            "src/__tests__/reliability-interactions/branch-group-automerge-precedence.slow.test.ts",
-            "src/__tests__/reliability-interactions/branch-group-merge-routing.slow.test.ts",
-            "src/__tests__/reliability-interactions/branch-group-pr-sync.slow.test.ts",
-            "src/__tests__/reliability-interactions/branch-group-single-pr-e2e.slow.test.ts",
-            "src/__tests__/reliability-interactions/shared-branch-group-lifecycle.slow.test.ts",
-          ],
+          // 2026-09-27: The six expired quarantine files were rescued and run
+          // in this project against PostgreSQL; keep them active here.
+          exclude: [],
           minWorkers: 1,
           maxWorkers: 1,
           fileParallelism: false,
