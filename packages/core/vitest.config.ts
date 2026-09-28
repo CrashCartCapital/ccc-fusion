@@ -2,7 +2,8 @@ import { defineConfig } from "vitest/config";
 import { resolve } from "node:path";
 import { computeMaxWorkers } from "./src/__test-utils__/vitest-workers";
 
-const maxWorkers = computeMaxWorkers();
+// PostgreSQL fixtures share one local server in the full core suite.
+const maxWorkers = computeMaxWorkers(process.env.FUSION_TEST_TOTAL_WORKERS ? { maxCap: 2 } : {});
 
 /*
 FNXC:CoreTestInventory 2026-07-13-22:38:

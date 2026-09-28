@@ -19,7 +19,7 @@
  * changed-columns port in atomicWriteTaskJson/WithAudit).
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import {
   pgDescribe,
   createSharedPgTaskStoreTestHarness,
@@ -61,6 +61,57 @@ pgTest("transitionPending marker + status-clear durability (PostgreSQL)", () => 
     expect(result.scanned).toBeGreaterThanOrEqual(1);
     expect(result.recovered).toBeGreaterThanOrEqual(1);
     expect(await readTransitionPendingAsync(h.layer().db, task.id)).toBeNull();
+  });
+
+  it("waits for the recovery audit before reporting completion", async () => {
+    const store = h.store();
+    const task = await store.createTask({ description: "audit completion target" });
+    await writeTransitionPendingAsync(
+      h.layer().db,
+      task.id,
+      makeTransitionPending("todo", ["default-workflow:postCommit"], Date.now()),
+    );
+
+    let releaseAudit!: () => void;
+    let auditStarted!: () => void;
+    let auditFinished!: () => void;
+    const holdAudit = new Promise<void>((resolve) => { releaseAudit = resolve; });
+    const started = new Promise<void>((resolve) => { auditStarted = resolve; });
+    const finished = new Promise<void>((resolve) => { auditFinished = resolve; });
+    const recordAudit = store.recordRunAuditEvent.bind(store);
+    let auditWasStarted = false;
+    const spy = vi.spyOn(store, "recordRunAuditEvent").mockImplementation(async (input) => {
+      auditWasStarted = true;
+      auditStarted();
+      try {
+        await holdAudit;
+        return await recordAudit(input);
+      } finally {
+        auditFinished();
+      }
+    });
+
+    let recoveryFinished = false;
+    const recovery = store.recoverStaleTransitionPending().then((result) => {
+      recoveryFinished = true;
+      return result;
+    });
+    try {
+      await Promise.race([
+        started,
+        recovery.then(() => { throw new Error("recovery completed before starting its audit"); }),
+      ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(recoveryFinished).toBe(false);
+    } finally {
+      releaseAudit();
+      await Promise.allSettled(auditWasStarted ? [recovery, finished] : [recovery]);
+      spy.mockRestore();
+    }
+
+    expect((await store.getRunAuditEventsAsync()).some((event) =>
+      event.taskId === task.id && event.mutationType === "task:transition-pending-recovered",
+    )).toBe(true);
   });
 
   it("a completed moveTask leaves no pending marker behind (write + post-commit clear round trip)", async () => {

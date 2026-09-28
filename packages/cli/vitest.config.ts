@@ -2,7 +2,8 @@ import { defineConfig } from "vitest/config";
 import { resolve } from "node:path";
 import { computeMaxWorkers } from "../core/src/__test-utils__/vitest-workers";
 
-const maxWorkers = computeMaxWorkers();
+// PostgreSQL CLI fixtures share one local server; keep full-suite fanout bounded.
+const maxWorkers = computeMaxWorkers(process.env.FUSION_TEST_TOTAL_WORKERS ? { maxCap: 2 } : {});
 
 const quarantinedCliTests: string[] = [
   /*

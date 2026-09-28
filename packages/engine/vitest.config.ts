@@ -2,7 +2,9 @@ import { defineConfig } from "vitest/config";
 import { resolve } from "node:path";
 import { computeMaxWorkers } from "../core/src/__test-utils__/vitest-workers";
 
-const maxWorkers = computeMaxWorkers();
+// Full workspace sweeps share PostgreSQL and spawn many real Git/Node probes.
+// Keep that lane within a small worker budget without slowing focused runs.
+const maxWorkers = computeMaxWorkers(process.env.FUSION_TEST_TOTAL_WORKERS ? { maxCap: 2 } : {});
 
 export default defineConfig({
   resolve: {

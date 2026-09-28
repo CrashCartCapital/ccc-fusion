@@ -1081,8 +1081,10 @@ describe("ModelOnboardingModal", () => {
       expect(await within(copilotCard).findByText("ABCD-1234")).toBeTruthy();
       expect(within(copilotCard).queryByTestId("onboarding-login-instructions-github-copilot")).toBeNull();
       expect(mockWindowOpen).not.toHaveBeenCalled();
-      expect(writeText).toHaveBeenCalledWith("ABCD-1234");
-      expect(writeText).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect(writeText).toHaveBeenCalledWith("ABCD-1234");
+        expect(writeText).toHaveBeenCalledTimes(1);
+      });
 
       fireEvent.click(within(copilotCard).getByRole("button", { name: "Copy code" }));
       await waitFor(() => {

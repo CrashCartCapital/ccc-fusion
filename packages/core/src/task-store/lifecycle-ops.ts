@@ -1368,20 +1368,28 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
           // best-effort; a later sweep retries.
         }
 
-        void store.recordRunAuditEvent({
-          taskId: id,
-          agentId: "system",
-          runId: `transition-pending-recovery-${id}-${Date.now()}`,
-          domain: "database",
-          mutationType: "task:transition-pending-recovered",
-          target: id,
-          metadata: {
-            toColumn: live.toColumn,
-            hooksReran: hooksRemaining,
-            droppedHooks: warnings.length,
-            startedAt: live.startedAt,
-          },
-        });
+        try {
+          await store.recordRunAuditEvent({
+            taskId: id,
+            agentId: "system",
+            runId: `transition-pending-recovery-${id}-${Date.now()}`,
+            domain: "database",
+            mutationType: "task:transition-pending-recovered",
+            target: id,
+            metadata: {
+              toColumn: live.toColumn,
+              hooksReran: hooksRemaining,
+              droppedHooks: warnings.length,
+              startedAt: live.startedAt,
+            },
+          });
+        } catch (err) {
+          storeLog.warn("transitionPending recovery audit failed", {
+            phase: "recover-stale-transition-pending",
+            taskId: id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         recovered += 1;
       });
     }
