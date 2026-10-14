@@ -8,6 +8,22 @@ FNXC:CccPlanningTypes 2026-10-14-08:20:
 The pure vocabulary of a request-to-code run (CONTRACT-v2 sections 2.1, 2.3, 2.4, 2.7 and 2.10). Every later card imports these names, so they live in core and nothing here reaches PostgreSQL, the engine or the clock. The run-state list and the allowed transitions are a mirror of `project.ccc_planning_run_transition_allowed` (migration 0042); L1 proves the two agree for all 400 pairs.
 */
 
+/*
+FNXC:CccPlanningPolicy 2026-10-14-13:26:
+Errata E2-45: every object that feeds `cccPlanningPolicyDigest` is frozen at every depth, because `as const` is a compile-time promise only and a runtime mutation would change the policy without changing what was admitted. This helper lives here, beside the other pure vocabulary, so `budget-fit.ts` and `policy.ts` share it without an import cycle.
+*/
+/**
+ * Freezes a plain-data (acyclic) constant and everything inside it; returns the same value with its type unchanged.
+ * It descends into an already-frozen object too, because a shallow `Object.freeze` leaves the children mutable.
+ */
+export function deepFreezeCccPlanningConstant<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const entry of Object.values(value)) deepFreezeCccPlanningConstant(entry);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------- modes and profiles
 
 export type CccPlanningMode = "spec" | "build";

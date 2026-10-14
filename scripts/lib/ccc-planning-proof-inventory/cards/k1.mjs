@@ -2,7 +2,7 @@
 FNXC:CccPlanningProofInventory 2026-10-14-09:45:
 Proof inventory for request-to-code card K1 (core planning types, role policy, budget fit, artifact envelope, schemas, workflow IR, runtime identity and the Pi view types). Card K1 owns exactly this module; the inventory index (card P0) loads every cards/*.mjs in sorted order and rejects duplicate command ids.
 
-TARGETED is file-closed over the seven K1 test files. OFFLINE is name-closed over the same files: the 103 names below are exactly the tests in them, built as ancestor titles and the title joined by " > " (the `assertionName` rule of scripts/run-ccc-pg-proof.mjs), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. None of these tests touches PostgreSQL or the network.
+TARGETED is file-closed over the seven K1 test files. OFFLINE is name-closed over the same files: the names below are exactly the tests in them, built as ancestor titles and the title joined by " > " (the `assertionName` rule of scripts/run-ccc-pg-proof.mjs), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. None of these tests touches PostgreSQL or the network.
 
 The seventh file, ccc-provider-attempt-views.typecheck.test.ts, runs the TypeScript compiler over its own source with core's compiler options, because core's `typecheck` script excludes *.test.ts and would never check the type assertions (CONTRACT-v2 card K1 says it does; reported as a contract gap).
 
@@ -10,6 +10,11 @@ FNXC:CccPlanningProofInventory 2026-10-14-09:21:
 The E1 repair adds 12 tests: the passed-deadline fit refusals and their non-finite controls (E1-9), the extra-field derived-key test (E1-11), the canonical-JSON envelope refusals (E1-13), the case, normalization, duplicate, .git and .env owned-path refusals (E1-10), the per-proof verify:<id> target (E1-12) and the section 2.17 proof-results shape (E1-8).
 
 Measured on the M5 Max: about 7 s wall for all seven files, 103 tests (4 s of Vitest time after the E1 repair). The 60 s command timeout is that measurement with headroom for a slower host; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProofInventory 2026-10-14-13:26:
+The E2 final repair adds 12 tests, for 115 in all: full case folding of the path key across tasks, within one task and as the shared key GG reuses (E2-40, E2-13); denied-name segments (E2-42); verifier bundle and control file refusals and key de-duplication (E2-41); proof ids in task plans and proof results, and committed-means-exit-0 (E2-43); closure-digest refusals (E2-44); deep-frozen policy digest inputs and the denied-name list (E2-45, E2-42); write-root containment on the key (E2-46); and the runtime ordinal guard (E2-47). The names stay ASCII so they compare byte for byte.
+
+Errata E2-48 adds a second K1 check that this inventory cannot express, because a closed suite command runs Vitest only: `pnpm --filter @fusion/core exec tsc -p tsconfig.ccc-planning-tests.json`, which type-checks the seven test files and their sources (core's own typecheck excludes *.test.ts). It must exit 0. The Vitest command still takes under 10 s, so the 60 s timeout stands.
 */
 
 const FILES = Object.freeze([
@@ -62,10 +67,13 @@ export const OFFLINE = Object.freeze([
       "derived identifiers > derives the run id from a domain tag, a NUL and canonical JSON",
       "derived identifiers > derives turn, attempt, linked writer and event keys with their own domain tags",
       "derived identifiers > hashes exactly the contract-named fields, so extra caller fields leave every derived key unchanged",
+      "derived identifiers > refuses a node or dispatch attempt ordinal outside 1 to 3 at runtime",
       "derived identifiers > formats the decision id, import key and baseline branch ref",
       "derived identifiers > hashes the grant canonically and the binding without its own hash",
       "counters and the I2 source policy > pins the frozen counter values",
       "counters and the I2 source policy > digests the source policy canonically",
+      "policy digest inputs > lists the denied names sorted, including .envrc (errata E2-42)",
+      "policy digest inputs > deep-freezes every object that feeds the policy digest, so a mutation attempt throws in strict mode and the digest is unchanged",
       "run states and transitions > allows exactly the 64 frozen pairs, the adjudication-38 pair and identity, across all 400 pairs",
       "run states and transitions > refuses running -> importing and allows importing -> budget_exhausted (adjudication item 38)",
       "run states and transitions > rests Build on accepted or verification_failed, and only Spec on spec_ready",
@@ -108,6 +116,7 @@ export const OFFLINE = Object.freeze([
       "identity and closure digests > treats an absent optional producer field like an undefined one",
       "identity and closure digests > refuses an envelope canonical JSON cannot encode as ENVELOPE_INVALID",
       "identity and closure digests > digests a closure as its sorted unique refs",
+      "identity and closure digests > refuses a closure ref canonical JSON cannot encode as ENVELOPE_INVALID, and a key seen with and without a digest as a mismatch",
       "task plan validation (G4 prerequisites) > admits the I2 diamond with zero problems (positive control)",
       "task plan validation (G4 prerequisites) > refuses a duplicate task id",
       "task plan validation (G4 prerequisites) > refuses a dependency on an undeclared task",
@@ -117,13 +126,19 @@ export const OFFLINE = Object.freeze([
       "task plan validation (G4 prerequisites) > refuses owned paths that overlap only after normalization",
       "task plan validation (G4 prerequisites) > refuses owned paths that differ only in letter case or Unicode normalization form",
       "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task, including a case-only or ./ duplicate",
+      "task plan validation (G4 prerequisites) > refuses owned paths across tasks that only full case folding merges (sharp s, final sigma, fi ligature) and over-refuses I against dotless i as accepted fail-closed",
+      "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task that only full case folding reveals (sharp s, final sigma, fi ligature)",
       "task plan validation (G4 prerequisites) > refuses an owned path inside .git or naming an .env file, and the same for a write root",
+      "task plan validation (G4 prerequisites) > refuses an owned path or write root with a denied-name segment (.npmrc, _secrets, .agentsecrets, .envrc), folded",
       "task plan validation (G4 prerequisites) > refuses an owned path that is absolute, escapes the worktree or names the root",
       "task plan validation (G4 prerequisites) > refuses a write root outside the task's owned paths",
+      "task plan validation (G4 prerequisites) > counts a write root inside its owned paths on the comparison key, so SRC/Tokenizer.mjs is inside src/tokenizer.mjs",
+      "task plan validation (G4 prerequisites) > refuses a task proof id that is not a Taskfile-safe proof id",
       "task plan validation (G4 prerequisites) > refuses an extra key and a wrong schema",
       "owned path normalization > normalizes relative spellings to one canonical path",
       "owned path normalization > returns null for paths that cannot be owned",
       "owned path normalization > rewrites a plan's owned paths and write roots into canonical form",
+      "path comparison key > gives one key to every spelling APFS opens as the same file: case, NFC and NFD, ./ and .., a trailing slash, sharp s, final sigma, the fi ligature, the Kelvin sign and dotted capital I",
       "content schema validators > admits a well-formed acceptance cases and refuses each one-field defect",
       "content schema validators > admits a well-formed requirement map and refuses each one-field defect",
       "content schema validators > admits a well-formed routing plan and refuses each one-field defect",
@@ -136,7 +151,9 @@ export const OFFLINE = Object.freeze([
       "content schema validators > admits a well-formed build transition and refuses each one-field defect",
       "content schema validators > admits a well-formed proof results and refuses each one-field defect",
       "content schema validators > names each proof's own verify:<id> Taskfile target and has no root-level task",
+      "content schema validators > refuses a bundle or control file inside .git, naming an .env file or a denied name, or colliding with another on the comparison key",
       "content schema validators > follows section 2.17: one settled attempt per proof id with its terminal evidence",
+      "content schema validators > mirrors the proof-attempt store: a committed result has exit code 0, and every proof id matches the proof id pattern",
       "content schema validators > registers one validator per content schema id",
       "planning workflow IR > chains one gate node per IR stage in contract order for Build",
       "planning workflow IR > omits only the import stage in Spec mode",

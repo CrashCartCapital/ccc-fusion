@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  cccPlanningPathComparisonKey,
+  cccPlanningPathsOverlap,
   normalizeCccPlanningRelativePath,
   normalizeCccPlanningTaskPlanV1,
   validateCccPlanningAcceptanceCasesV1,
@@ -40,7 +42,7 @@ const ref = (artifactKey: string, digest = "a".repeat(64)) => ({ artifactKey, di
 function diamondPlan(): CccPlanningTaskPlanV1 {
   const task = (id: string, owned: string, deps: string[]) => ({
     id, title: `task ${id}`, description: `implements ${id}`, requirementIds: [`REQ-${id}`],
-    dependencyTaskIds: deps, proofIds: [`PROOF-${id}`], ownedPaths: [owned], allowedWriteRoots: [owned], protectedActionIds: [],
+    dependencyTaskIds: deps, proofIds: [`proof-${id.toLowerCase()}`], ownedPaths: [owned], allowedWriteRoots: [owned], protectedActionIds: [],
   });
   return {
     schema: "ccc-planning.task-plan.v1",
@@ -152,6 +154,47 @@ describe("task plan validation (G4 prerequisites)", () => {
       .toEqual([]);
   });
 
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-40 amends E1-10. APFS folds letter case fully, not by simple lower-casing: on this host's volume `straße` and `strasse`, final and medial sigma, and the `ﬁ` ligature and `fi` each open one file. A plan admitted with one such pair split across two tasks would give two writers one physical file. The comparison key therefore upper-cases and then lower-cases (with NFC on both sides), which merges every pair APFS merges. Its one over-refusal is capital I against dotless ı, which APFS keeps apart; refusing that pair is accepted as fail-closed.
+  */
+  const FULL_FOLD_PAIRS: readonly (readonly [string, string])[] = [
+    ["src/straße.mjs", "src/strasse.mjs"], // sharp s and ss
+    ["src/ας.mjs", "src/ασ.mjs"], // final and medial sigma
+    ["src/ﬁle.mjs", "src/file.mjs"], // fi ligature and fi
+  ];
+
+  it("refuses owned paths across tasks that only full case folding merges (sharp s, final sigma, fi ligature) and over-refuses I against dotless i as accepted fail-closed", () => {
+    for (const [left, right] of [...FULL_FOLD_PAIRS, ["src/I.mjs", "src/ı.mjs"] as const]) {
+      expect(problemsOf(mutate((plan) => {
+        plan.tasks[0]!.ownedPaths = [left]; plan.tasks[0]!.allowedWriteRoots = [left];
+        plan.tasks[1]!.ownedPaths = [right]; plan.tasks[1]!.allowedWriteRoots = [right];
+      })), `${left} | ${right}`).toMatch(/tasks T1 and T2 own overlapping paths/);
+    }
+    // A folded directory still contains the folded file.
+    expect(problemsOf(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = ["STRASSE"]; plan.tasks[0]!.allowedWriteRoots = ["STRASSE"];
+      plan.tasks[1]!.ownedPaths = ["straße/x.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["straße/x.mjs"];
+    }))).toMatch(/tasks T1 and T2 own overlapping paths STRASSE and straße\/x\.mjs/);
+    // Control: names that differ by more than case stay admissible.
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = ["src/strase.mjs"]; plan.tasks[0]!.allowedWriteRoots = ["src/strase.mjs"];
+      plan.tasks[1]!.ownedPaths = ["src/strasse.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["src/strasse.mjs"];
+    }))).toEqual([]);
+  });
+
+  it("refuses a duplicate owned path within one task that only full case folding reveals (sharp s, final sigma, fi ligature)", () => {
+    for (const [first, second] of FULL_FOLD_PAIRS) {
+      expect(problemsOf(mutate((plan) => {
+        plan.tasks[0]!.ownedPaths = [first, second]; plan.tasks[0]!.allowedWriteRoots = [first];
+      })), `${first} | ${second}`).toMatch(/task T1 owns the same path twice: /);
+    }
+    // Control: two files that differ by more than case in one task are admissible.
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = ["src/strase.mjs", "src/strasse.mjs"]; plan.tasks[0]!.allowedWriteRoots = ["src/strase.mjs"];
+    }))).toEqual([]);
+  });
+
   it("refuses an owned path inside .git or naming an .env file, and the same for a write root", () => {
     for (const bad of [".git", ".git/hooks/pre-commit", "src/.git/config", ".GIT/config"]) {
       expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; plan.tasks[0]!.allowedWriteRoots = [bad]; })), bad)
@@ -163,8 +206,26 @@ describe("task plan validation (G4 prerequisites)", () => {
     }
     expect(problemsOf(mutate((plan) => { plan.tasks[3]!.ownedPaths = ["bin"]; plan.tasks[3]!.allowedWriteRoots = ["bin/.git"]; })))
       .toMatch(/task T4 write root "bin\/\.git" has a \.git path segment/);
-    // Control: names that only contain "git" or "env" are admissible.
-    for (const good of ["src/git.mjs", "src/.github/workflow.mjs", "src/env.mjs", "src/.envrc", "src/app.env", "src/.environment.mjs"]) {
+    // Control: names that only contain "git" or "env" are admissible (`.envrc` is a denied name since errata E2-42).
+    for (const good of ["src/git.mjs", "src/.github/workflow.mjs", "src/env.mjs", "src/app.env", "src/.environment.mjs"]) {
+      expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.ownedPaths = [good]; plan.tasks[0]!.allowedWriteRoots = [good]; })), good)
+        .toEqual([]);
+    }
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-42: an owned path or write root may not have any segment equal, after case folding, to a `CCC_PLANNING_DENIED_NAMES` entry (`.agentsecrets`, `.env`, `.env.*`, `.envrc`, `.npmrc`, `_secrets`). A writer that owns `.npmrc` or anything under `_secrets/` could plant registry credentials or read secrets the confined shell is meant to hide.
+  */
+  it("refuses an owned path or write root with a denied-name segment (.npmrc, _secrets, .agentsecrets, .envrc), folded", () => {
+    for (const bad of [".npmrc", "_secrets/x", ".agentsecrets", ".envrc", "src/.NPMRC", "config/_Secrets/key.json", "pkg/.envrc/x", ".env.d/x"]) {
+      expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; plan.tasks[0]!.allowedWriteRoots = [bad]; })), bad)
+        .toMatch(/task T1 owned path .* has the denied name \S+ as a path segment/);
+    }
+    expect(problemsOf(mutate((plan) => { plan.tasks[3]!.ownedPaths = ["bin"]; plan.tasks[3]!.allowedWriteRoots = ["bin/.npmrc"]; })))
+      .toMatch(/task T4 write root "bin\/\.npmrc" has the denied name \.npmrc as a path segment/);
+    // Controls: names that merely mention env or secrets are admissible.
+    for (const good of ["src/env.mjs", "docs/secrets-guide.md", "src/npmrc.mjs", "src/secrets/x.mjs", "src/agentsecrets.mjs"]) {
       expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.ownedPaths = [good]; plan.tasks[0]!.allowedWriteRoots = [good]; })), good)
         .toEqual([]);
     }
@@ -179,6 +240,37 @@ describe("task plan validation (G4 prerequisites)", () => {
   it("refuses a write root outside the task's owned paths", () => {
     expect(problemsOf(mutate((plan) => { plan.tasks[0]!.allowedWriteRoots = ["src/other.mjs"]; })))
       .toMatch(/task T1 write root src\/other\.mjs is outside its owned paths/);
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-46: the write-root containment check compares on the same key as ownership, so a root spelled `SRC/Tokenizer.mjs` is inside an owned `src/tokenizer.mjs`, as it is on the I2 host's volume.
+  */
+  it("counts a write root inside its owned paths on the comparison key, so SRC/Tokenizer.mjs is inside src/tokenizer.mjs", () => {
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.allowedWriteRoots = ["SRC/Tokenizer.mjs"]; }))).toEqual([]);
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[3]!.ownedPaths = ["bin"]; plan.tasks[3]!.allowedWriteRoots = ["BIN/text-stats.mjs"];
+    }))).toEqual([]);
+    // Control: a root outside the owned paths in every spelling is still refused.
+    expect(problemsOf(mutate((plan) => { plan.tasks[0]!.allowedWriteRoots = ["SRC/other.mjs"]; })))
+      .toMatch(/task T1 write root SRC\/other\.mjs is outside its owned paths/);
+    expect(problemsOf(mutate((plan) => {
+      plan.tasks[3]!.ownedPaths = ["bin"]; plan.tasks[3]!.allowedWriteRoots = ["BINARY/text-stats.mjs"];
+    }))).toMatch(/task T4 write root BINARY\/text-stats\.mjs is outside its owned paths/);
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-43: a task's proof ids are Taskfile names (E1-12), so they match `CCC_PLANNING_PROOF_ID_PATTERN` like the verifier bundle's proof ids. A task naming `PROOF-T1` could never be matched to a `verify:<id>` target.
+  */
+  it("refuses a task proof id that is not a Taskfile-safe proof id", () => {
+    for (const id of ["PROOF-T1", "Tokenizer", "-t1", "t1_a", "verify:t1", `a${"b".repeat(63)}`]) {
+      expect(problemsOf(mutate((plan) => { plan.tasks[0]!.proofIds = [id]; })), id).toMatch(/tasks\[0\]\.proofIds\[0\] must be a proof id/);
+    }
+    // Controls: lowercase, hyphenated and the longest legal ids are admitted.
+    for (const id of ["proof-t1", "0tokenizer", `a${"b".repeat(62)}`]) {
+      expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.proofIds = [id]; })), id).toEqual([]);
+    }
   });
 
   it("refuses an extra key and a wrong schema", () => {
@@ -217,6 +309,38 @@ describe("owned path normalization", () => {
   });
 });
 
+/*
+FNXC:CccPlanningSchemas 2026-10-14-13:26:
+Errata E2-40 and E2-13: `cccPlanningPathComparisonKey` is the one path identity every planning card compares with (GG reuses it for graph admission). It posix-normalizes the spelling itself, so a caller never has to remember to strip `./` or a trailing slash first, then folds case fully with NFC on both sides. The key must merge every pair this host's APFS volume opens as one file and nothing that differs by more than case or composition.
+*/
+describe("path comparison key", () => {
+  it("gives one key to every spelling APFS opens as the same file: case, NFC and NFD, ./ and .., a trailing slash, sharp s, final sigma, the fi ligature, the Kelvin sign and dotted capital I", () => {
+    const same: readonly (readonly [string, string])[] = [
+      ["src/Tokenizer.mjs", "src/tokenizer.mjs"],
+      ["src/café.mjs", "src/café.mjs"],
+      ["./src/a.mjs", "src/a.mjs"],
+      ["src/../src/a.mjs", "src/a.mjs"],
+      ["src/", "src"],
+      ["./SRC/CafÉ.mjs", "src/café.mjs"],
+      ["straße", "STRASSE"],
+      ["ας", "ασ"],
+      ["ﬁle.mjs", "file.mjs"],
+      ["K.mjs", "k.mjs"],
+      ["İ.mjs", "i̇.mjs"],
+    ];
+    for (const [left, right] of same) {
+      expect(cccPlanningPathComparisonKey(left), `${left} | ${right}`).toBe(cccPlanningPathComparisonKey(right));
+      expect(cccPlanningPathsOverlap(left, right), `${left} | ${right}`).toBe(true);
+    }
+    // Controls: names that differ by more than case or composition keep different keys and do not overlap.
+    for (const [left, right] of [["src/a.mjs", "src/b.mjs"], ["src/strase", "src/strasse"], ["src/cafe.mjs", "src/café.mjs"],
+      ["src/a", "src/ab"], ["src/a.mjs", "src/a.mjs.bak"]] as const) {
+      expect(cccPlanningPathComparisonKey(left), `${left} | ${right}`).not.toBe(cccPlanningPathComparisonKey(right));
+      expect(cccPlanningPathsOverlap(left, right), `${left} | ${right}`).toBe(false);
+    }
+  });
+});
+
 const ACCEPTANCE: CccPlanningAcceptanceCasesV1 = {
   schema: "ccc-planning.acceptance-cases.v1",
   cases: [{ id: "AC-1", statement: "Counts words", requestQuotes: ["word frequency"] }],
@@ -225,7 +349,7 @@ const ACCEPTANCE: CccPlanningAcceptanceCasesV1 = {
 const REQUIREMENT_MAP: CccPlanningRequirementMapV1 = {
   schema: "ccc-planning.requirement-map.v1",
   requirements: [{
-    id: "REQ-1", title: "Tokenize", statement: "Split text into words", proofIds: ["PROOF-1"],
+    id: "REQ-1", title: "Tokenize", statement: "Split text into words", proofIds: ["tokenizer"],
     clauses: [
       { id: "C1", text: "split on whitespace", derivation: { kind: "request", requestQuotes: ["a tokenizer"], acceptanceCaseIds: ["AC-1"] } },
       { id: "C2", text: "lower-case tokens", derivation: { kind: "annex", decisionIds: ["D-1"] } },
@@ -294,15 +418,15 @@ const BUILD_TRANSITION: CccPlanningBuildTransitionV1 = {
 const PROOF_RESULTS: CccPlanningProofResultsV1 = {
   sourceCommit: "3".repeat(40),
   sourceTree: "4".repeat(40),
-  proofIds: ["PROOF-1", "PROOF-2"],
+  proofIds: ["tokenizer", "word-frequency"],
   phase: "task",
   results: [
     {
-      proofId: "PROOF-1", attemptKey: `ccc-proof-attempt-${"5".repeat(64)}`, state: "committed", resultSuccess: true,
+      proofId: "tokenizer", attemptKey: `ccc-proof-attempt-${"5".repeat(64)}`, state: "committed", resultSuccess: true,
       exitCode: 0, durationMs: 1_234, stdoutSha256: "6".repeat(64), stderrSha256: "7".repeat(64), terminalEnvelopeSha256: "8".repeat(64),
     },
     {
-      proofId: "PROOF-2", attemptKey: `ccc-proof-attempt-${"9".repeat(64)}`, state: "proved_failed", resultSuccess: false,
+      proofId: "word-frequency", attemptKey: `ccc-proof-attempt-${"9".repeat(64)}`, state: "proved_failed", resultSuccess: false,
       exitCode: null, durationMs: 0, stdoutSha256: "a".repeat(64), stderrSha256: "b".repeat(64), terminalEnvelopeSha256: "c".repeat(64),
     },
   ],
@@ -415,6 +539,36 @@ describe("content schema validators", () => {
   });
 
   /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-41: the verifier bundle's files become the baseline commit, and a control's files are written over the implementation, so their paths get the owned-path refusals. A `.git/hooks/post-checkout` would run on the host at the next checkout, and an `.env` or denied name could plant or expose secrets. Paths are also de-duplicated on the comparison key: `Taskfile.yml` and `taskfile.yml` are one file on the I2 host's volume, so the Taskfile on disk could differ from the blob the custody check reads. Control files are de-duplicated within one control; two controls may each replace the same implementation file.
+  */
+  it("refuses a bundle or control file inside .git, naming an .env file or a denied name, or colliding with another on the comparison key", () => {
+    type BundleFile = Readonly<{ path: string; mode: "100644" | "100755"; content: string }>;
+    const file = (path: string, mode: BundleFile["mode"] = "100644"): BundleFile => ({ path, mode, content: "export {};\n" });
+    const withFiles = (...extra: BundleFile[]) => validateCccPlanningVerifierBundleV1(withField(VERIFIER, "files", [...VERIFIER.files, ...extra]));
+    expect(withFiles(file(".git/hooks/post-checkout", "100755")))
+      .toContainEqual(expect.stringMatching(/files\[2\]\.path "\.git\/hooks\/post-checkout" has a \.git path segment/));
+    expect(withFiles(file("taskfile.yml"))).toContainEqual(expect.stringMatching(/verifier file taskfile\.yml is the same path as Taskfile\.yml/));
+    expect(withFiles(file("test/café.mjs"), file("test/café.mjs")))
+      .toContainEqual(expect.stringMatching(/verifier file test\/café\.mjs is the same path as test\/café\.mjs/));
+    expect(withFiles(file(".env"))).toContainEqual(expect.stringMatching(/files\[2\]\.path "\.env" names an \.env file/));
+    expect(withFiles(file("config/.npmrc"))).toContainEqual(expect.stringMatching(/files\[2\]\.path "config\/\.npmrc" has the denied name \.npmrc/));
+
+    const control = VERIFIER.controls[0]!;
+    const withControlFiles = (...paths: string[]) => validateCccPlanningVerifierBundleV1(withField(VERIFIER, "controls",
+      [{ ...control, files: paths.map((path) => ({ path, content: "export {};\n" })) }]));
+    expect(withControlFiles(".git/hooks/post-checkout"))
+      .toContainEqual(expect.stringMatching(/controls\[0\]\.files\[0\]\.path "\.git\/hooks\/post-checkout" has a \.git path segment/));
+    expect(withControlFiles(".env.local")).toContainEqual(expect.stringMatching(/controls\[0\]\.files\[0\]\.path "\.env\.local" names an \.env file/));
+    expect(withControlFiles("src/Tokenizer.mjs", "src/tokenizer.mjs"))
+      .toContainEqual(expect.stringMatching(/control CTRL-1 file src\/tokenizer\.mjs is the same path as src\/Tokenizer\.mjs/));
+
+    // Controls: an ordinary harness path is admitted, and two controls may each replace the same implementation file.
+    expect(withFiles(file("test/harness/run.mjs"), file("test/fixtures/sample.txt"))).toEqual([]);
+    expect(validateCccPlanningVerifierBundleV1(withField(VERIFIER, "controls", [control, { ...control, id: "CTRL-2" }]))).toEqual([]);
+  });
+
+  /*
   FNXC:CccPlanningSchemas 2026-10-14-09:21:
   Errata E1-8 (v3 section 2.17, item 46): proof results are read from the settled proof attempts (`listCccCampaignProofAttemptsForCommit`), one entry per proof id, carrying the attempt key, the settled state and the stored terminal evidence digests. A proof attempt settles `committed` exactly when its result succeeded (proof-attempt.ts settle), so the two fields must agree. The exit code is a PostgreSQL integer or null (a killed process has none).
   */
@@ -423,10 +577,10 @@ describe("content schema validators", () => {
     const failed: Record<string, unknown> = { ...PROOF_RESULTS.results[1]! };
     const withResults = (...results: unknown[]) => validateCccPlanningProofResultsV1(withField(PROOF_RESULTS, "results", results));
     const refusals: readonly [string, unknown, RegExp][] = [
-      ["v1 outcome shape", { proofId: "PROOF-1", outcome: "passed", evidenceDigest: "5".repeat(64) }, /unexpected key outcome/],
+      ["v1 outcome shape", { proofId: "tokenizer", outcome: "passed", evidenceDigest: "5".repeat(64) }, /unexpected key outcome/],
       ["unknown state", { ...passed, state: "passed" }, /state must be one of committed, proved_failed/],
       ["committed but failed", { ...passed, resultSuccess: false }, /committed .* resultSuccess true/],
-      ["proved_failed but succeeded", { ...failed, proofId: "PROOF-1", resultSuccess: true }, /proved_failed .* resultSuccess false/],
+      ["proved_failed but succeeded", { ...failed, proofId: "tokenizer", resultSuccess: true }, /proved_failed .* resultSuccess false/],
       ["boolean as number", { ...passed, resultSuccess: 1 }, /resultSuccess must be a boolean/],
       ["malformed attempt key", { ...passed, attemptKey: "ccc-plan-attempt-x" }, /attemptKey must be a proof attempt key/],
       ["fractional exit code", { ...passed, exitCode: 1.5 }, /exitCode must be/],
@@ -439,11 +593,38 @@ describe("content schema validators", () => {
     for (const [label, bad, problem] of refusals) {
       expect(withResults(bad, failed), label).toContainEqual(expect.stringMatching(problem));
     }
-    expect(withResults(passed)).toContainEqual(expect.stringMatching(/proof PROOF-2 has no result/));
-    expect(withResults(passed, failed, { ...failed })).toContainEqual(expect.stringMatching(/proof PROOF-2 has more than one result/));
+    expect(withResults(passed)).toContainEqual(expect.stringMatching(/proof word-frequency has no result/));
+    expect(withResults(passed, failed, { ...failed })).toContainEqual(expect.stringMatching(/proof word-frequency has more than one result/));
     // Controls: a negative exit code within int4 and a null exit code are admitted.
     expect(withResults({ ...passed, exitCode: -2_147_483_648, state: "proved_failed", resultSuccess: false }, failed)).toEqual([]);
     expect(withResults(passed, { ...failed, exitCode: null })).toEqual([]);
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-13:26:
+  Errata E2-43: the state and exit code agree exactly as the proof-attempt store requires. `prepareTerminalResult` (ccc-campaign/proof-attempt.ts) refuses a successful result unless its exit code is 0, and the attempt settles `committed` exactly when the result succeeded; a failed result may carry any int4 exit code or none. Every proof id is a Taskfile name (E1-12), in `proofIds` and in each result.
+  */
+  it("mirrors the proof-attempt store: a committed result has exit code 0, and every proof id matches the proof id pattern", () => {
+    const passed: Record<string, unknown> = { ...PROOF_RESULTS.results[0]! };
+    const failed: Record<string, unknown> = { ...PROOF_RESULTS.results[1]! };
+    const withResults = (...results: unknown[]) => validateCccPlanningProofResultsV1(withField(PROOF_RESULTS, "results", results));
+    for (const exitCode of [1, -1, null]) {
+      expect(withResults({ ...passed, exitCode }, failed), String(exitCode))
+        .toContainEqual(expect.stringMatching(/results\[0\] state committed needs exitCode 0/));
+    }
+    expect(validateCccPlanningProofResultsV1({ ...PROOF_RESULTS, proofIds: ["Any Id!", "word-frequency"],
+      results: [{ ...passed, proofId: "Any Id!" }, failed] }))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/proofIds\[0\] must be a proof id/),
+        expect.stringMatching(/results\[0\]\.proofId must be a proof id/)]));
+    expect(validateCccPlanningProofResultsV1({ ...PROOF_RESULTS, proofIds: ["PROOF-1", "word-frequency"],
+      results: [{ ...passed, proofId: "PROOF-1" }, failed] }))
+      .toEqual(expect.arrayContaining([expect.stringMatching(/proofIds\[0\] must be a proof id/),
+        expect.stringMatching(/results\[0\]\.proofId must be a proof id/)]));
+    // Controls: committed with exit code 0, and proved_failed with exit code 0, 1 or none, are admitted.
+    expect(validateCccPlanningProofResultsV1(PROOF_RESULTS)).toEqual([]);
+    for (const exitCode of [0, 1, 137, null]) {
+      expect(withResults(passed, { ...failed, exitCode }), String(exitCode)).toEqual([]);
+    }
   });
 
   it("registers one validator per content schema id", () => {

@@ -3,7 +3,7 @@ import { CCC_PRD_PROTECTED_ACTION_KINDS } from "../ccc-prd/contract.js";
 import type { CccPrdProtectedActionKind } from "../ccc-prd/types.js";
 import { decodeCccPlanningArtifactKey, type CccPlanningArtifactRef } from "./artifacts.js";
 import { isCccPlanningRunId } from "./marker.js";
-import { classifyCccModelIdentity, cccPlanningRole } from "./policy.js";
+import { classifyCccModelIdentity, cccPlanningRole, CCC_PLANNING_DENIED_NAMES } from "./policy.js";
 import {
   CCC_PLANNING_STAGE_IDS,
   type CccPlanningExactModelId,
@@ -17,6 +17,8 @@ FNXC:CccPlanningSchemas 2026-10-14-09:35:
 The content schemas a request-to-code run publishes as JSON artifacts (CONTRACT-v2 section 2.17) and one validator per schema. Every validator is pure, checks exact keys at every level and returns a list of plain-language problems, empty when the value is admissible. The task-plan validator is the gate G4 runs before the compiler's graph admission, which under-refuses (carry-forward GG): it refuses duplicate task ids, duplicate or undeclared protected-action ids, dependencies on undeclared tasks, edges that are not `depends_on` or disagree with the declared dependencies, and owned paths that overlap only after normalization (`./src/a.mjs`, `src/../src/a.mjs`). ADR B fixes the requirement-map and spec-ready shapes; the other shapes here are the smallest ones the later cards need, because no ADR froze them.
 FNXC:CccPlanningSchemas 2026-10-14-09:21:
 Errata E1 tightens three shapes. Proof results follow CONTRACT-v3 section 2.17 (item 46): one settled proof attempt per proof id, with its attempt key, state and stored terminal digests (E1-8). Owned paths are compared on a case- and normalization-folded key because the I2 host's APFS volume folds both, and a task may not list a path twice, own anything inside `.git` or own an `.env` file (E1-10). A verifier proof id is its Taskfile name and each proof names its own `verify:<id>` target; the bundle has no root-level task (E1-12, item 41).
+FNXC:CccPlanningSchemas 2026-10-14-13:26:
+Errata E2 (the K1 final repair). The path key folds case fully, as APFS does (E2-40), and also decides write-root containment (E2-46). Owned paths, write roots, verifier files and control files refuse every denied name as well as `.git` and `.env` (E2-41, E2-42), and bundle and control files are de-duplicated on the key (E2-41). Proof ids in a task plan and in proof results match the Taskfile proof-id pattern, and a committed proof result has exit code 0, as the proof-attempt store requires (E2-43).
 */
 
 export const CCC_PLANNING_CONTENT_SCHEMAS = {
@@ -237,31 +239,56 @@ export function normalizeCccPlanningTaskPlanV1(plan: CccPlanningTaskPlanV1): Ccc
 
 /*
 FNXC:CccPlanningOwnedPaths 2026-10-14-09:21:
-The I2 host is Darwin, whose default APFS volume ignores letter case and Unicode composed-versus-decomposed form, so `src/A.mjs` and `src/a.mjs`, or `café` in NFC and in NFD, are one file there (errata E1-10). Ownership is therefore compared on `normalize("NFC").toLowerCase()` of the already-normalized relative path. This is stricter than a case-sensitive Linux volume needs, which only refuses more plans, never fewer.
+The I2 host is Darwin, whose default APFS volume ignores letter case and Unicode composed-versus-decomposed form, so `src/A.mjs` and `src/a.mjs`, or `café` in NFC and in NFD, are one file there (errata E1-10). Ownership is therefore compared on a folded key of the path. This is stricter than a case-sensitive Linux volume needs, which only refuses more plans, never fewer.
+FNXC:CccPlanningOwnedPaths 2026-10-14-13:26:
+Errata E2-40 replaces the E1-10 formula. APFS folds case fully, so `straße`/`strasse`, final/medial sigma and the `ﬁ` ligature/`fi` are also one file there, and simple lower-casing missed all three. The key is now the posix-normalized `p.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC")`, without a trailing slash: upper-casing first expands ß to SS and ﬁ to FI and maps both sigmas to Σ, and lower-casing then lands every APFS-equal spelling on one string. Its one over-refusal is capital I against dotless ı, which APFS keeps apart; that is accepted as fail-closed. The key normalizes the spelling itself (`./`, `..`, `//`, a trailing slash), so every card that compares paths (GG under E2-13, for one) gets the same identity from any spelling.
 */
-/** The comparison key of a normalized relative path on a case-insensitive, normalization-insensitive volume. */
-export function cccPlanningPathComparisonKey(normalizedPath: string): string {
-  return normalizedPath.normalize("NFC").toLowerCase();
+/** The one comparison key of a worktree path on the I2 host's case- and normalization-insensitive volume. */
+export function cccPlanningPathComparisonKey(path: string): string {
+  let key = posix.normalize(path.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC"));
+  while (key.length > 1 && key.endsWith("/")) key = key.slice(0, -1);
+  return key;
 }
 
-/** a and b (normalized relative paths) overlap when their comparison keys are equal or one is a directory prefix of the other. */
+/** a and b (relative paths) overlap when their comparison keys are equal or one is a directory prefix of the other. */
 export function cccPlanningPathsOverlap(a: string, b: string): boolean {
   const left = cccPlanningPathComparisonKey(a);
   const right = cccPlanningPathComparisonKey(b);
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
-/** Why a normalized relative path can never be owned or written by a task, or null: a `.git` segment or an `.env` file. */
-function forbiddenOwnedPathReason(normalizedPath: string): string | null {
-  const segments = cccPlanningPathComparisonKey(normalizedPath).split("/");
+/** The policy's denied names, folded like paths; an entry ending in `.*` matches by the prefix before the `*` (policy.ts). */
+const DENIED_NAME_RULES: readonly Readonly<{ name: string; folded: string; prefix: boolean }>[] = Object.freeze(
+  CCC_PLANNING_DENIED_NAMES.map((name) => {
+    const prefix = name.endsWith(".*");
+    return Object.freeze({ name, folded: cccPlanningPathComparisonKey(prefix ? name.slice(0, -1) : name), prefix });
+  }));
+
+/*
+FNXC:CccPlanningOwnedPaths 2026-10-14-13:26:
+Errata E2-41 and E2-42: one reason helper refuses a path a task may never own or write, and a verifier or control file may never be: a `.git` segment, an `.env` or `.env.*` file, or any segment that folds to a `CCC_PLANNING_DENIED_NAMES` entry (`.npmrc`, `_secrets/x`, `.agentsecrets`, `.envrc`, ...). Names that merely mention one, such as `src/env.mjs` or `docs/secrets-guide.md`, stay admissible.
+*/
+/** Why a relative path can never be owned or written by a task, or carried by a verifier bundle, or null. */
+function forbiddenOwnedPathReason(path: string): string | null {
+  const segments = cccPlanningPathComparisonKey(path).split("/");
   if (segments.includes(".git")) return "has a .git path segment";
   const basename = segments[segments.length - 1]!;
   if (basename === ".env" || basename.startsWith(".env.")) return "names an .env file";
+  for (const segment of segments) {
+    for (const rule of DENIED_NAME_RULES) {
+      if (rule.prefix ? segment.startsWith(rule.folded) : segment === rule.folded) {
+        return `has the denied name ${rule.name} as a path segment`;
+      }
+    }
+  }
   return null;
 }
 
 // ---------------------------------------------------------------- shared checks
 
+/** A proof id is its Taskfile name (errata E1-12): lowercase, digits and hyphens, at most 63 characters. */
+export const CCC_PLANNING_PROOF_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/u;
+const PROOF_ID = "a proof id of lowercase letters, digits and hyphens, at most 63 characters, not starting with a hyphen";
 const HEX64 = /^[0-9a-f]{64}$/u;
 const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u;
 const COUNTEREXAMPLE_MAX = 600;
@@ -345,6 +372,20 @@ class Problems {
       if (seen.has(text)) this.add(`${path} lists ${text} more than once`);
       seen.add(text);
       result.push(text);
+    });
+    return result;
+  }
+
+  /** Proof ids (Taskfile names, errata E1-12 and E2-43), each listed once. */
+  proofIds(value: unknown, path: string, min = 0): string[] {
+    const result: string[] = [];
+    const seen = new Set<string>();
+    this.array(value, path, min).forEach((entry, index) => {
+      const id = this.pattern(entry, `${path}[${index}]`, CCC_PLANNING_PROOF_ID_PATTERN, PROOF_ID);
+      if (id === null) return;
+      if (seen.has(id)) this.add(`${path} lists ${id} more than once`);
+      seen.add(id);
+      result.push(id);
     });
     return result;
   }
@@ -529,7 +570,7 @@ export const validateCccPlanningTaskPlanV1: CccPlanningContentValidator = (value
     p.text(task.title, `${at}.title`);
     p.text(task.description, `${at}.description`);
     p.texts(task.requirementIds, `${at}.requirementIds`, 1);
-    p.texts(task.proofIds, `${at}.proofIds`, 1);
+    p.proofIds(task.proofIds, `${at}.proofIds`, 1);
     const deps = p.texts(task.dependencyTaskIds, `${at}.dependencyTaskIds`);
     const protectedActionIds = p.texts(task.protectedActionIds, `${at}.protectedActionIds`);
     const owned = ownedPathList(p, task.ownedPaths, `task ${name} owned path`, 1);
@@ -570,8 +611,11 @@ export const validateCccPlanningTaskPlanV1: CccPlanningContentValidator = (value
     for (const actionId of task.protectedActionIds) {
       if (!declaredActions.has(actionId)) p.add(`task ${task.id} names undeclared protected action ${actionId}`);
     }
+    // Containment compares on the ownership key (errata E2-46): `SRC/a.mjs` is inside an owned `src/a.mjs` on the I2 volume.
+    const ownedKeys = task.owned.map(cccPlanningPathComparisonKey);
     for (const writeRoot of task.roots) {
-      if (!task.owned.some((owned) => writeRoot === owned || writeRoot.startsWith(`${owned}/`))) {
+      const rootKey = cccPlanningPathComparisonKey(writeRoot);
+      if (!ownedKeys.some((owned) => rootKey === owned || rootKey.startsWith(`${owned}/`))) {
         p.add(`task ${task.id} write root ${writeRoot} is outside its owned paths`);
       }
     }
@@ -643,8 +687,6 @@ export const validateCccPlanningRoutingPlanV1: CccPlanningContentValidator = (va
 // ---------------------------------------------------------------- verifier bundle
 
 const FILE_MODES = ["100644", "100755"] as const;
-/** A proof id is its Taskfile name (errata E1-12): lowercase, digits and hyphens, at most 63 characters. */
-export const CCC_PLANNING_PROOF_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/u;
 
 function canonicalPath(p: Problems, value: unknown, path: string): string | null {
   const normalized = typeof value === "string" ? normalizeCccPlanningRelativePath(value) : null;
@@ -655,21 +697,50 @@ function canonicalPath(p: Problems, value: unknown, path: string): string | null
   return normalized;
 }
 
+/*
+FNXC:CccPlanningSchemas 2026-10-14-13:26:
+Errata E2-41: verifier bundle files become the baseline commit and a control's files are written over the implementation, so their paths get the owned-path refusals (`.git` segment, `.env` file, denied names), and they are de-duplicated on the comparison key: `Taskfile.yml` and `taskfile.yml` would check out as one file on the I2 volume, so the Taskfile on disk could differ from the blob the custody check reads. A control's files are de-duplicated within that control; two controls may each replace the same implementation file.
+*/
+function bundleFilePath(p: Problems, value: unknown, path: string): string | null {
+  const normalized = canonicalPath(p, value, path);
+  if (normalized === null) return null;
+  const forbidden = forbiddenOwnedPathReason(normalized);
+  if (forbidden !== null) p.add(`${path} ${JSON.stringify(value)} ${forbidden}`);
+  return normalized;
+}
+
+/** Records `path` under its comparison key; returns the first spelling already recorded there, or null. */
+function firstSpelling(byKey: Map<string, string>, path: string): string | null {
+  const key = cccPlanningPathComparisonKey(path);
+  const first = byKey.get(key);
+  if (first !== undefined) return first;
+  byKey.set(key, path);
+  return null;
+}
+
+function samePathProblem(label: string, path: string, first: string): string {
+  return first === path ? `${label} ${path} is declared more than once` : `${label} ${path} is the same path as ${first}`;
+}
+
 export const validateCccPlanningVerifierBundleV1: CccPlanningContentValidator = (value) => validated((p) => {
   const root = p.object(value, "verifier bundle", ["schema", "files", "proofs", "controls"]);
   if (!root) return;
   if (root.schema !== CCC_PLANNING_CONTENT_SCHEMAS.verifierBundle) p.add(`verifier bundle schema must be ${CCC_PLANNING_CONTENT_SCHEMAS.verifierBundle}`);
   const filePaths: string[] = [];
+  const fileKeys = new Map<string, string>();
   p.array(root.files, "files", 1).forEach((entry, index) => {
     const at = `files[${index}]`;
     const file = p.object(entry, at, ["path", "mode", "content"]);
     if (!file) return;
-    const path = canonicalPath(p, file.path, `${at}.path`);
-    if (path !== null) filePaths.push(path);
+    const path = bundleFilePath(p, file.path, `${at}.path`);
+    if (path !== null) {
+      filePaths.push(path);
+      const first = firstSpelling(fileKeys, path);
+      if (first !== null) p.add(samePathProblem("verifier file", path, first));
+    }
     p.oneOf(file.mode, `${at}.mode`, FILE_MODES);
     if (typeof file.content !== "string") p.add(`${at}.content must be a string`);
   });
-  for (const path of duplicates(filePaths)) p.add(`verifier file ${path} is declared more than once`);
   const bundled = new Set(filePaths);
   const proofIds: string[] = [];
   const coveredRequirements = new Set<string>();
@@ -677,8 +748,7 @@ export const validateCccPlanningVerifierBundleV1: CccPlanningContentValidator = 
     const at = `proofs[${index}]`;
     const proof = p.object(entry, at, ["id", "requirementIds", "files", "taskfileTask"]);
     if (!proof) return;
-    const validId = p.pattern(proof.id, `${at}.id`, CCC_PLANNING_PROOF_ID_PATTERN,
-      "a proof id of lowercase letters, digits and hyphens, at most 63 characters, not starting with a hyphen");
+    const validId = p.pattern(proof.id, `${at}.id`, CCC_PLANNING_PROOF_ID_PATTERN, PROOF_ID);
     const id = validId ?? at;
     proofIds.push(id);
     if (validId !== null && "taskfileTask" in proof && proof.taskfileTask !== `verify:${validId}`) {
@@ -701,11 +771,16 @@ export const validateCccPlanningVerifierBundleV1: CccPlanningContentValidator = 
     if (requirementId !== null && !coveredRequirements.has(requirementId)) {
       p.add(`control ${id} names requirement ${requirementId} that no proof covers`);
     }
+    const controlKeys = new Map<string, string>();
     p.array(control.files, `${at}.files`, 1).forEach((fileEntry, fileIndex) => {
       const fileAt = `${at}.files[${fileIndex}]`;
       const file = p.object(fileEntry, fileAt, ["path", "content"]);
       if (!file) return;
-      canonicalPath(p, file.path, `${fileAt}.path`);
+      const path = bundleFilePath(p, file.path, `${fileAt}.path`);
+      if (path !== null) {
+        const first = firstSpelling(controlKeys, path);
+        if (first !== null) p.add(samePathProblem(`control ${id} file`, path, first));
+      }
       if (typeof file.content !== "string") p.add(`${fileAt}.content must be a string`);
     });
   });
@@ -897,7 +972,7 @@ export const validateCccPlanningBuildTransitionV1: CccPlanningContentValidator =
 
 // ---------------------------------------------------------------- proof results (v3 section 2.17, item 46)
 
-/** Mirrors ATTEMPT_KEY_PATTERN and the int4 exit-code rule of ccc-campaign/proof-attempt.ts. */
+/** Mirrors ATTEMPT_KEY_PATTERN, the int4 exit-code rule and the success-means-exit-0 rule of ccc-campaign/proof-attempt.ts. */
 const PROOF_ATTEMPT_KEY = /^ccc-proof-attempt-[0-9a-f]{64}$/u;
 const INT4_MIN = -2_147_483_648;
 const INT4_MAX = 2_147_483_647;
@@ -907,7 +982,7 @@ export const validateCccPlanningProofResultsV1: CccPlanningContentValidator = (v
   if (!root) return;
   p.pattern(root.sourceCommit, "sourceCommit", GIT_OID, "a git object id");
   p.pattern(root.sourceTree, "sourceTree", GIT_OID, "a git object id");
-  const proofIds = new Set(p.texts(root.proofIds, "proofIds", 1));
+  const proofIds = new Set(p.proofIds(root.proofIds, "proofIds", 1));
   p.oneOf(root.phase, "phase", ["task", "final_integrated"] as const);
   const resulted: string[] = [];
   p.array(root.results, "results", 1).forEach((entry, index) => {
@@ -915,7 +990,7 @@ export const validateCccPlanningProofResultsV1: CccPlanningContentValidator = (v
     const result = p.object(entry, at, ["proofId", "attemptKey", "state", "resultSuccess", "exitCode", "durationMs",
       "stdoutSha256", "stderrSha256", "terminalEnvelopeSha256"]);
     if (!result) return;
-    const proofId = p.text(result.proofId, `${at}.proofId`);
+    const proofId = p.pattern(result.proofId, `${at}.proofId`, CCC_PLANNING_PROOF_ID_PATTERN, PROOF_ID);
     if (proofId !== null) {
       resulted.push(proofId);
       if (!proofIds.has(proofId)) p.add(`result for proof ${proofId} is not in proofIds`);
@@ -928,6 +1003,9 @@ export const validateCccPlanningProofResultsV1: CccPlanningContentValidator = (v
       p.add(`${at} state ${state} needs resultSuccess ${String(state === "committed")}`);
     }
     if (result.exitCode !== null) p.integer(result.exitCode, `${at}.exitCode`, INT4_MIN, INT4_MAX);
+    // The store refuses a successful result unless its exit code is 0 (proof-attempt.ts prepareTerminalResult), and only a
+    // successful result settles committed; a failed one may carry any int4 exit code or none (errata E2-43).
+    if (state === "committed" && result.exitCode !== 0) p.add(`${at} state committed needs exitCode 0, as the proof-attempt store requires`);
     p.integer(result.durationMs, `${at}.durationMs`, 0);
     for (const key of ["stdoutSha256", "stderrSha256", "terminalEnvelopeSha256"] as const) {
       p.pattern(result[key], `${at}.${key}`, HEX64, "a lowercase sha256");

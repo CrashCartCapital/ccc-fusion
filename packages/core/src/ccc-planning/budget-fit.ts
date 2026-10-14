@@ -1,9 +1,11 @@
+import { deepFreezeCccPlanningConstant } from "./types.js";
+
 /*
 FNXC:CccPlanningBudgetFit 2026-10-14-09:10:
 The budget profiles, strict node counting and fit rule of a request-to-code run (CONTRACT-v2 section 2.8). A run is admitted, a leaf is added, a repair chunk starts and a Build is linked only when the remaining calls cover twice the cost of the remaining nodes and twice the sequential critical path fits the time left, so a run cannot start work it can never finish. A refusal names every short dimension with the exact required and remaining amounts and reserves nothing. Node counts are strict: the preflight lineages are not nodes (their calls sit inside the fixed 300), the leaf reviewer counts only when there is a leaf, and repairs are never in N.
 */
 
-export const CCC_PLANNING_BUDGET_POLICY_V1 = {
+export const CCC_PLANNING_BUDGET_POLICY_V1 = deepFreezeCccPlanningConstant({
   policyVersion: "ccc-planning.budget-policy.v1",
   profiles: {
     "spec:standard":  { total: 1536,  planning: 1536, implementation: 0,     reviewProof: 0,    deadlineMs: 43_200_000 },
@@ -15,7 +17,7 @@ export const CCC_PLANNING_BUDGET_POLICY_V1 = {
   floor: { perNodeCalls: 30, fixedCalls: 300, multiplier: 2 },   // the fixed 300 also covers the 9 preflight calls
   watchdogMs: { planningSessionAttempt: 1_800_000, reviewSessionAttempt: 1_800_000, writerAttempt: 3_600_000, heavyCheck: 1_200_000 },
   estimateMs: { preflightLineage: 600_000, planningNode: 600_000, reviewNode: 600_000, writer: 3_600_000, heavyCheck: 1_200_000 },
-} as const;
+} as const); // deep-frozen: it feeds cccPlanningPolicyDigest (errata E2-45)
 export type CccPlanningBudgetPolicy = typeof CCC_PLANNING_BUDGET_POLICY_V1;
 
 const POLICY = CCC_PLANNING_BUDGET_POLICY_V1;

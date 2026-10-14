@@ -202,19 +202,22 @@ export function computeCccPlanningEnvelopeIdentityDigest(
   return sha256Hex(canonicalOrRefuse(withoutUndefined(identity), "envelope"));
 }
 
+/*
+FNXC:CccPlanningArtifacts 2026-10-14-13:26:
+Errata E2-44: the closure digest refuses refs canonical JSON cannot encode (a missing digest, for one) as `CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID`, like content and the identity digest. A key listed once without a digest and once with one is two digests for one key: it is refused as a mismatch, never merged into the defined one.
+*/
 /** sha256(canonical(refs sorted by key, duplicates removed)); one key with two digests is refused. */
 export function computeCccPlanningClosureDigest(closure: readonly CccPlanningArtifactRef[]): string {
   const byKey = new Map<string, string>();
   for (const ref of closure) {
-    const seen = byKey.get(ref.artifactKey);
-    if (seen !== undefined && seen !== ref.digest) {
+    if (byKey.has(ref.artifactKey) && byKey.get(ref.artifactKey) !== ref.digest) {
       throw new CccPlanningRefusal("CCC_PLANNING_ARTIFACT_DIGEST_MISMATCH",
-        `closure names ${ref.artifactKey} with two digests ${seen} and ${ref.digest}`, "inputs");
+        `closure names ${ref.artifactKey} with two digests ${String(byKey.get(ref.artifactKey))} and ${String(ref.digest)}`, "inputs");
     }
     byKey.set(ref.artifactKey, ref.digest);
   }
   const refs = [...byKey.entries()]
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([artifactKey, digest]) => ({ artifactKey, digest }));
-  return sha256Hex(canonicalCccPrdJson(refs));
+  return sha256Hex(canonicalOrRefuse(refs, "inputs"));
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
+import { CCC_PLANNING_BUDGET_POLICY_V1 } from "../ccc-planning/budget-fit.js";
 import {
   cccPlanningRefusalFromDatabaseError,
   CccPlanningRefusal,
@@ -25,11 +26,13 @@ import {
   cccPlanningSourcePolicySha256,
   cccPlanningTurnKey,
   CCC_PLANNING_COMPLETE_PHASE_TOOL,
+  CCC_PLANNING_DENIED_NAMES,
   CCC_PLANNING_LINKED_WRITER_TOOLSET,
   CCC_PLANNING_MAX_CALLS_PER_ATTEMPT,
   CCC_PLANNING_MAX_DISPATCH_ATTEMPTS_PER_LINEAGE,
   CCC_PLANNING_MAX_REPAIR_CHUNKS,
   CCC_PLANNING_MODEL_FAMILIES,
+  CCC_PLANNING_PREFLIGHT_LINEAGES,
   CCC_PLANNING_PREFLIGHT_MAX_CALLS_PER_ATTEMPT,
   CCC_PLANNING_PROBE_TOOL,
   CCC_PLANNING_ROLE_POLICY_FULL_V2,
@@ -267,6 +270,27 @@ describe("derived identifiers", () => {
     expect(cccPlanningEventId({ ...widenedEvent, subject: "running->paused@t" })).not.toBe(cccPlanningEventId(eventInput));
   });
 
+  /*
+  FNXC:CccPlanningPolicy 2026-10-14-13:26:
+  Errata E2-47: the attempt ordinals are typed 1 | 2 | 3, but types vanish at runtime, so the turn-key and linked-writer turn-key derivations refuse any other value. An ordinal of 4 would mint a fourth dispatch identity past the three-attempt lineage cap.
+  */
+  it("refuses a node or dispatch attempt ordinal outside 1 to 3 at runtime", () => {
+    const runId = cccPlanningRunId(runInput);
+    const turnInput = { projectId: "proj-a", runId, revision: 1, stageId: "spec" as const, roleId: "spec-author" as const,
+      lineageId: "spec:spec-author" };
+    for (const ordinal of [4, 0, -1, 1.5, Number.NaN, "1"]) {
+      expect(() => cccPlanningTurnKey({ ...turnInput, nodeAttemptOrdinal: ordinal as 1 }), String(ordinal)).toThrow(TypeError);
+      expect(() => cccPlanningLinkedWriterTurnKey({ baseTurnKey: "campaign-turn-1", dispatchAttemptOrdinal: ordinal as 1 }), String(ordinal))
+        .toThrow(TypeError);
+    }
+    // Control: each typed ordinal derives a distinct key.
+    const turnKeys = ([1, 2, 3] as const).map((nodeAttemptOrdinal) => cccPlanningTurnKey({ ...turnInput, nodeAttemptOrdinal }));
+    const writerKeys = ([1, 2, 3] as const).map((dispatchAttemptOrdinal) =>
+      cccPlanningLinkedWriterTurnKey({ baseTurnKey: "campaign-turn-1", dispatchAttemptOrdinal }));
+    expect(new Set(turnKeys).size).toBe(3);
+    expect(new Set(writerKeys).size).toBe(3);
+  });
+
   it("formats the decision id, import key and baseline branch ref", () => {
     const runId = cccPlanningRunId(runInput);
     expect(cccPlanningDecisionId({ revision: 1, questionDigest: "c".repeat(64) })).toBe(`ccc-plan-decision-r001-${"c".repeat(16)}`);
@@ -310,6 +334,49 @@ describe("counters and the I2 source policy", () => {
   it("digests the source policy canonically", () => {
     expect(cccPlanningSourcePolicySha256()).toBe(sha256(canonicalCccPrdJson(CCC_PLANNING_SOURCE_POLICY_I2)));
     expect(cccPlanningSourcePolicySha256()).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+/*
+FNXC:CccPlanningPolicy 2026-10-14-13:26:
+Errata E2-45: the policy digest is only a fingerprint of the admitted policy if the policy cannot change after it is computed. `as const` is a compile-time promise only, so every object that feeds `cccPlanningPolicyDigest` is deep-frozen: a mutation attempt throws in strict mode (all ES modules are strict) and the digest stays the same. Errata E2-42 adds `.envrc` to the denied names.
+*/
+describe("policy digest inputs", () => {
+  it("lists the denied names sorted, including .envrc (errata E2-42)", () => {
+    expect(CCC_PLANNING_DENIED_NAMES).toEqual([".agentsecrets", ".env", ".env.*", ".envrc", ".npmrc", "_secrets"]);
+  });
+
+  it("deep-freezes every object that feeds the policy digest, so a mutation attempt throws in strict mode and the digest is unchanged", () => {
+    const digest = cccPlanningPolicyDigest();
+    const sourceDigest = cccPlanningSourcePolicySha256();
+    const unfrozen: string[] = [];
+    const walk = (value: unknown, path: string): void => {
+      if (value === null || typeof value !== "object") return;
+      if (!Object.isFrozen(value)) unfrozen.push(path);
+      for (const [key, entry] of Object.entries(value)) walk(entry, `${path}.${key}`);
+    };
+    walk(cccPlanningPolicyDigestMaterial(), "material");
+    expect(unfrozen).toEqual([]);
+
+    const attempts: readonly (readonly [string, () => void])[] = [
+      ["preflight lineage list", () => { (CCC_PLANNING_PREFLIGHT_LINEAGES as unknown as unknown[]).push({}); }],
+      ["preflight lineage id", () => { (CCC_PLANNING_PREFLIGHT_LINEAGES[0] as { lineageId: string }).lineageId = "preflight:other"; }],
+      ["preflight probes", () => { (CCC_PLANNING_PREFLIGHT_LINEAGES[0].probes as unknown as string[]).push("bash"); }],
+      ["denied names", () => { (CCC_PLANNING_DENIED_NAMES as unknown as string[]).push(".ssh"); }],
+      ["denied name entry", () => { (CCC_PLANNING_DENIED_NAMES as unknown as string[])[0] = ".nothing"; }],
+      ["source policy host", () => { (CCC_PLANNING_SOURCE_POLICY_I2.allow[0] as { host: string }).host = "evil.example"; }],
+      ["source policy mime types", () => { (CCC_PLANNING_SOURCE_POLICY_I2.mimeTypes as unknown as string[]).push("application/octet-stream"); }],
+      ["source policy fetch cap", () => { (CCC_PLANNING_SOURCE_POLICY_I2 as { maxFetchesPerRun: number }).maxFetchesPerRun = 1_000_000; }],
+      ["budget profile", () => { (CCC_PLANNING_BUDGET_POLICY_V1.profiles["build:standard"] as { planning: number }).planning = 1; }],
+      ["budget floor", () => { (CCC_PLANNING_BUDGET_POLICY_V1.floor as { fixedCalls: number }).fixedCalls = 0; }],
+      ["role model", () => { (CCC_PLANNING_ROLE_POLICY_FULL_V2.roles[0] as { modelId: string }).modelId = "glm/glm-5.2"; }],
+      ["writer toolset", () => { (CCC_PLANNING_TOOLSETS.writer as string[]).push("fn_complete_phase"); }],
+      ["linked writer toolset", () => { (CCC_PLANNING_LINKED_WRITER_TOOLSET as unknown as string[]).pop(); }],
+      ["model families", () => { (CCC_PLANNING_MODEL_FAMILIES as Record<string, string>)["glm/glm-5.2"] = "glm"; }],
+    ];
+    for (const [label, attempt] of attempts) expect(attempt, label).toThrow(TypeError);
+    expect(cccPlanningPolicyDigest()).toBe(digest);
+    expect(cccPlanningSourcePolicySha256()).toBe(sourceDigest);
   });
 });
 

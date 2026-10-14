@@ -229,4 +229,29 @@ describe("identity and closure digests", () => {
     expect(computeCccPlanningClosureDigest([a])).not.toBe(digest);
     expect(() => computeCccPlanningClosureDigest([a, { ...a, digest: "3".repeat(64) }])).toThrow(CccPlanningRefusal);
   });
+
+  /*
+  FNXC:CccPlanningArtifacts 2026-10-14-13:26:
+  Errata E2-44: the closure digest refuses a ref canonical JSON cannot encode as a typed envelope refusal, like content and the identity digest (E1-13), never a plain Error. A key listed once with no digest and once with one is two digests for one key, not a silent merge into the defined one.
+  */
+  it("refuses a closure ref canonical JSON cannot encode as ENVELOPE_INVALID, and a key seen with and without a digest as a mismatch", () => {
+    const a = { artifactKey: "cccplan-r001-spec-main-v01", digest: "1".repeat(64) };
+    const refusalOf = (closure: readonly unknown[]): unknown => {
+      try {
+        computeCccPlanningClosureDigest(closure as never);
+      } catch (error) {
+        return error;
+      }
+      return null;
+    };
+    const undefinedDigest = refusalOf([{ artifactKey: a.artifactKey, digest: undefined }]);
+    expect(undefinedDigest).toBeInstanceOf(CccPlanningRefusal);
+    expect((undefinedDigest as CccPlanningRefusal).code).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    const halfDefined = refusalOf([{ artifactKey: a.artifactKey, digest: undefined }, a]);
+    expect(halfDefined).toBeInstanceOf(CccPlanningRefusal);
+    expect((halfDefined as CccPlanningRefusal).code).toBe("CCC_PLANNING_ARTIFACT_DIGEST_MISMATCH");
+    // Control: the same key with its digest digests.
+    expect(refusalOf([a])).toBeNull();
+    expect(computeCccPlanningClosureDigest([a])).toBe(sha256(canonicalCccPrdJson([a])));
+  });
 });

@@ -1,0 +1,33 @@
+{
+  /*
+  FNXC:CccPlanningTests 2026-10-14-13:26:
+  Errata E2-48: core's own tsconfig excludes *.test.ts, so `pnpm --filter @fusion/core typecheck` never checks the K1 test files or their typed fixtures. This config type-checks exactly the card K1 test files and the sources they cover, under core's compiler options, and emits nothing. Incremental mode is off and its build-info path is cleared, so this check never writes or reuses core's dist/.tsbuildinfo. K1 check line: `pnpm --filter @fusion/core exec tsc -p tsconfig.ccc-planning-tests.json`.
+  */
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "tsBuildInfoFile": null
+  },
+  "include": [
+    "src/ccc-planning/artifacts.ts",
+    "src/ccc-planning/budget-fit.ts",
+    "src/ccc-planning/errors.ts",
+    "src/ccc-planning/marker.ts",
+    "src/ccc-planning/policy.ts",
+    "src/ccc-planning/runtime-identity.ts",
+    "src/ccc-planning/schemas.ts",
+    "src/ccc-planning/types.ts",
+    "src/ccc-planning/workflow-ir.ts",
+    "src/ccc-campaign/types.ts",
+    "src/ccc-campaign/provider-controller.ts",
+    "src/__tests__/ccc-planning-policy.test.ts",
+    "src/__tests__/ccc-planning-budget-fit.test.ts",
+    "src/__tests__/ccc-planning-artifacts.test.ts",
+    "src/__tests__/ccc-planning-schemas.test.ts",
+    "src/__tests__/ccc-planning-workflow-ir.test.ts",
+    "src/__tests__/ccc-planning-runtime-identity.test.ts",
+    "src/__tests__/ccc-provider-attempt-views.typecheck.test.ts"
+  ],
+  "exclude": []
+}

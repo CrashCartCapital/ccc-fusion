@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import { CCC_PLANNING_BUDGET_POLICY_V1 } from "./budget-fit.js";
 import { CCC_PLANNING_RUN_ID_PATTERN } from "./marker.js";
+import { deepFreezeCccPlanningConstant } from "./types.js";
 import type {
   CccModelFamily,
   CccModelIdentityReason,
@@ -44,6 +45,16 @@ function requireRunId(runId: string, label: string): void {
   }
 }
 
+/*
+FNXC:CccPlanningDerivedKeys 2026-10-14-13:26:
+Errata E2-47: an attempt ordinal is typed 1 | 2 | 3, matching the three dispatch attempts a lineage may make, but a type is gone at runtime. The turn-key derivations refuse any other value, so an untyped caller cannot mint a fourth attempt identity past the cap.
+*/
+function requireAttemptOrdinal(ordinal: unknown, label: string): void {
+  if (ordinal !== 1 && ordinal !== 2 && ordinal !== 3) {
+    throw new TypeError(`${label}: attempt ordinal must be 1, 2 or 3, got ${String(ordinal)}`);
+  }
+}
+
 function withoutKey<T extends object, K extends string>(value: T, key: K): Omit<T, K> {
   const copy: Record<string, unknown> = { ...(value as Record<string, unknown>) };
   delete copy[key];
@@ -64,6 +75,7 @@ export function cccPlanningRunId(i: { projectId: string; requestDigest: string; 
 
 export function cccPlanningTurnKey(i: { projectId: string; runId: string; revision: number; stageId: CccPlanningStageId;
   roleId: CccPlanningRoleId; lineageId: string; nodeAttemptOrdinal: 1 | 2 | 3 }): string {
+  requireAttemptOrdinal(i.nodeAttemptOrdinal, "cccPlanningTurnKey");
   const named = { projectId: i.projectId, runId: i.runId, revision: i.revision, stageId: i.stageId, roleId: i.roleId,
     lineageId: i.lineageId, nodeAttemptOrdinal: i.nodeAttemptOrdinal };
   return `ccc-plan-turn-${domainDigest("ccc-plan-turn/v1", named)}`;
@@ -77,6 +89,7 @@ export function cccPlanningAttemptKey(i: { projectId: string; runId: string; tur
 
 /** `baseTurnKey` is the campaign key from createProviderAttemptTurnKey, which carries no retry index (challenge 18). */
 export function cccPlanningLinkedWriterTurnKey(i: { baseTurnKey: string; dispatchAttemptOrdinal: 1 | 2 | 3 }): string {
+  requireAttemptOrdinal(i.dispatchAttemptOrdinal, "cccPlanningLinkedWriterTurnKey");
   const named = { baseTurnKey: i.baseTurnKey, dispatchAttemptOrdinal: i.dispatchAttemptOrdinal };
   return `ccc-plan-writer-${domainDigest("ccc-plan-writer-turn/v1", named)}`;
 }
@@ -202,12 +215,17 @@ export function cccPlanningSessionToolNames(i: Readonly<{
   return i.probe === true ? Object.freeze([...base, CCC_PLANNING_PROBE_TOOL].sort()) : base;
 }
 
-export const CCC_PLANNING_PREFLIGHT_LINEAGES = [
+/*
+FNXC:CccPlanningPolicy 2026-10-14-13:26:
+Errata E2-45 and E2-42. Every constant below that feeds `cccPlanningPolicyDigest` is deep-frozen, so a runtime mutation throws instead of silently changing a policy the digest already vouched for. The denied names gain `.envrc` (direnv runs it on entering the directory). An entry ending in `.*` matches a name that starts with the part before the `*`; every other entry matches a whole path segment. Task-plan owned paths, write roots and verifier files refuse any segment that matches, after case folding (schemas.ts).
+*/
+export const CCC_PLANNING_PREFLIGHT_LINEAGES = deepFreezeCccPlanningConstant([
   { lineageId: "preflight:writer", roleId: "preflight-writer", probes: ["identity", "strict-echo", "exact-edit"] },
   { lineageId: "preflight:critic", roleId: "preflight-critic", probes: ["identity", "strict-echo", "verdict-shape"] },
   { lineageId: "preflight:researcher", roleId: "preflight-researcher", probes: ["identity", "strict-echo", "citation-read"] },
-] as const;
-export const CCC_PLANNING_DENIED_NAMES = [".agentsecrets", ".env", ".env.*", ".npmrc", "_secrets"] as const;
+] as const);
+export const CCC_PLANNING_DENIED_NAMES = deepFreezeCccPlanningConstant(
+  [".agentsecrets", ".env", ".env.*", ".envrc", ".npmrc", "_secrets"] as const);
 
 // ---------------------------------------------------------------- exact model identity (section 2.7)
 
@@ -249,7 +267,7 @@ export const CCC_PLANNING_AUDIT_STRING_MAX = 256 as const;
 export const CCC_PRD_IMPORT_MAX_REQUESTS = 10_000 as const;               // mirrors import-admission.ts
 export const CCC_PRD_IMPORT_MAX_DURATION_MS = 86_400_000 as const;        // mirrors import-admission.ts
 export const CCC_PLANNING_I2_MAX_CONCURRENCY = 1 as const;
-export const CCC_PLANNING_SOURCE_POLICY_I2 = {
+export const CCC_PLANNING_SOURCE_POLICY_I2 = deepFreezeCccPlanningConstant({
   policyId: "ccc-planning.source-policy.i2.v1",
   allow: [
     { host: "nodejs.org", pathPrefix: "/docs/latest-v24.x/api/" },
@@ -257,16 +275,16 @@ export const CCC_PLANNING_SOURCE_POLICY_I2 = {
   ],
   maxFetchesPerNode: 8, maxFetchesPerRun: 24, maxRawBytesPerFetch: 1_048_576, maxRawBytesPerRun: 16_777_216,
   timeoutMs: 20_000, maxRedirects: 3, mimeTypes: ["text/html", "text/plain", "text/markdown", "application/json"],
-} as const;
+} as const);
 
 /** policySha256 = sha256(canonical(source policy)); must equal receipt.sourceToolPolicy.sha256 at G0. */
 export function cccPlanningSourcePolicySha256(): string {
   return sha256Hex(canonicalCccPrdJson(CCC_PLANNING_SOURCE_POLICY_I2));
 }
 
-/** Exactly what `cccPlanningPolicyDigest` hashes; exported so a reviewer can see and re-derive it. */
+/** Exactly what `cccPlanningPolicyDigest` hashes, deep-frozen; exported so a reviewer can see and re-derive it. */
 export function cccPlanningPolicyDigestMaterial(): Readonly<Record<string, unknown>> {
-  return {
+  return deepFreezeCccPlanningConstant({
     roles: CCC_PLANNING_ROLE_POLICY_FULL_V2.roles,
     toolsets: CCC_PLANNING_TOOLSETS,
     linkedWriterToolset: CCC_PLANNING_LINKED_WRITER_TOOLSET,
@@ -288,7 +306,7 @@ export function cccPlanningPolicyDigestMaterial(): Readonly<Record<string, unkno
       importMaxDurationMs: CCC_PRD_IMPORT_MAX_DURATION_MS,
       i2MaxConcurrency: CCC_PLANNING_I2_MAX_CONCURRENCY,
     },
-  };
+  });
 }
 
 /** sha256(canonical({roles, toolsets, linked writer toolset, probe tool, preflight lineages, deniedNames, budget policy, source policy, counters})). */
