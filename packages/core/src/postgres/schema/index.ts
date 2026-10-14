@@ -25,6 +25,11 @@ export * as archive from "./archive.js";
 export * as plugin from "./plugin.js";
 
 export { projectTableNames } from "./project.js";
+// FNXC:CccPlanningRuns 2026-10-14-12:00: exported here, not from project.ts,
+// because ccc-planning.ts imports `tasks` from project.ts (a re-export there
+// would form a module cycle).
+export { cccPlanningRuns } from "./ccc-planning.js";
+export type { CccPlanningRunRow, CccPlanningRunInsert } from "./ccc-planning.js";
 export { centralTableNames } from "./central.js";
 export { archiveTableNames } from "./archive.js";
 export { roadmapPluginTableNames, cePluginTableNames, evenRealitiesPluginTableNames, reportsPluginTableNames, cliPressPluginTableNames } from "./plugin.js";
