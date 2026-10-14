@@ -24,18 +24,22 @@ sandbox. An in-sandbox reaper cannot be the authority, because the profile's
 it, after which its descendants keep running (review probes P4, P6).
 
 - Each operations instance clones the sealed executables (APFS clonefile, full
-  copy across volumes) into its own `<scratch>/.ccc-exec-<random>` directory,
-  mirroring their absolute paths so `@loader_path` dylibs resolve, with a `bin/`
-  of role-named symlinks as PATH. `process-exec` is admitted only under that
-  directory, and the profile denies every write to it, so a hard link out of it
-  is refused, a copy cannot run, and a symlink still runs the clone. Every
-  sandboxed process therefore runs from that directory.
+  copy across volumes) into its own `<scratch>/toolchains/<instanceId>/bin/`,
+  one file per PATH name (E2-24, E2-25). A dylib the executable loads relative
+  to itself (`@rpath`, `@loader_path`) is cloned to the same place relative to
+  `bin/` (Homebrew node's `../lib/libnode`). `process-exec` is admitted only
+  under the instance directory, and the profile denies every write under
+  `<scratch>/toolchains/`, so a hard link out of it is refused, a copy cannot
+  run, and a symlink still runs the clone. Every sandboxed process therefore
+  runs from that directory.
 - macOS kills an Apple platform binary (`/bin/bash`, `/bin/cat`, ...) copied off
-  the system volume, so platform binaries cannot be sealed. The toolchain is
-  Homebrew-style: a non-platform bash (sealed as `sh` too: bash run as `sh` is
-  POSIX mode), node, git and utilities, which appear in PATH under their own
-  real names (coreutils' `gcat`, not `cat`). Absolute-path shebangs such as
-  `#!/bin/sh` and `#!/usr/bin/env` cannot run inside; invoke the interpreter.
+  the system volume, so platform binaries cannot be sealed
+  (`platform-binary-in-toolchain`). The toolchain is Homebrew-style: a
+  non-platform bash (sealed as `sh` too: bash run as `sh` is POSIX mode), node,
+  git and utilities. A utility appears in PATH under its sealed `name`, or else
+  its real file name (coreutils' `gcat` sealed with name `cat` runs as `cat`).
+  Absolute-path shebangs such as `#!/bin/sh` and `#!/usr/bin/env` cannot run
+  inside; invoke the interpreter (toolchain discovery and shims are card X1b).
 - After every exec that started a process (normal, error, timeout and
   qualification-failure paths) the controller finds every same-uid process
   whose `lsof` txt mapping is one of the clone's inodes (argv[0] spoofing with
@@ -45,32 +49,80 @@ it, after which its descendants keep running (review probes P4, P6).
   confirms closure even when the reaper died or froze. A sweep that does not
   converge is CLOSURE_UNCONFIRMED: descendants may still be running with write
   access to the write roots and scratch and network access to the admitted
-  loopback port, so quarantine means moving the write roots out of place and
-  closing the admitted loopback listener, not only flagging the worktree.
-  Cost: every exec pays at least two lsof scans (about 0.3 s each measured on
-  the M5 Max), and a command that leaves a survivor pays about four.
+  loopback port, so the caller quarantines (errata E2-5: WR moves the write
+  roots out of place). Cost: every exec pays at least two lsof scans (about
+  0.3 s each measured on the M5 Max), and a command that leaves a survivor
+  pays about four.
 - The in-sandbox reaper stays as the fast first line. Launch shape:
   `sandbox-exec -p <profile> <cloned node> -e REAPER_SOURCE -- ...`. It spawns
   bash detached with its own pipes, relays at most `maxOutputBytes`, and on
-  bash exit, controller `reap`, or stdin EOF kills bash's group, then sweeps pid
-  2..99999 with signal 0 and SIGKILLs every answer until two consecutive passes
-  find nothing new (P6-P8). It never sweeps unless signalling the controller
-  fails with EPERM, so it cannot run outside a sandbox, and it never uses
-  kill(-1). It writes one framed closure record to fd 3. Its `killed` list can
-  name a foreign zombie (P7: a zombie answers signal 0).
+  bash exit, controller `reap`, or stdin EOF SIGSTOPs bash's group, then sweeps
+  pid 2..99999 with signal 0 and SIGSTOPs every answer until two consecutive
+  passes find nothing new (P6-P8), so nothing it found can run, fork or exit
+  before the controller sees it. It never sweeps unless signalling the
+  controller fails with EPERM, so it cannot run outside a sandbox, and it never
+  uses kill(-1). It writes one framed record to fd 3.
 - Execs on one instance are serialized, so the last-closure record and the
   shared scratch home and tmp belong to one command at a time (E1-20).
 
 Residual (recorded, not closed here): a process that forks and exits faster
 than one lsof pass can evade a snapshot scan; the per-user process limit
 bounds it, and the sweep stops what it sees before killing it.
+
+FNXC:CccConfinedShell 2026-10-14-13:43:
+Errata E2 (final repair of X1).
+- E2-21/E2-11: `qualifyCccConfinedShell` takes a `testOnly` seam
+  (`sealedEnvironment`, `lsofPath`); production never passes it. It exists so
+  a test can prove the env-scrubbed probe fails on a leaked environment.
+  `createCccConfinedBashOperations` takes the same seam as an optional second
+  argument, which keeps the contract type `CccConfinedShellInput` unchanged.
+- E2-22: the sweep spawns `/usr/sbin/lsof` by absolute path through the
+  supervised async capture. Creation refuses with `closure-sweep-unavailable`
+  when it is not an absolute executable file. A scan that fails, times out,
+  prints a line that is not an lsof field, or does not list the controller is
+  unconfirmed, never a confirmation.
+- E2-23: one exported write predicate (`cccConfinedWriteRefusal`) and the
+  effective denied names (`cccConfinedEffectiveDeniedNames`, always a superset
+  of `CCC_CONFINED_DEFAULT_DENIED_NAMES`) decide `.git` segments and denied
+  names for this shell's validation and for C2's file tools. Names compare
+  under K1's fold (E2-40). The defaults add `.envrc`, so they stay a superset
+  of K1's `CCC_PLANNING_DENIED_NAMES` after E2-42 (the INT-1 check, E2-81).
+  Measured here: sandbox-exec's path regexes already match case-insensitively,
+  Unicode folds included, on this APFS volume (`.ENV`, `.NPMRC`, `_ſecrets`
+  are all refused), so the profile keeps its plain regexes.
+- E2-24: `dispose()` sweeps once more, removes exactly this instance's
+  directory, and later execs refuse with `instance-disposed` (a reason this
+  repair adds; E2-24 names none).
+- E2-26c: the closure record's `killed` lists only pids the controller saw
+  with a txt mapping in the clone. The reaper therefore stops rather than
+  kills, so the controller sees, kills and records every instance process,
+  and a foreign zombie that answers the reaper's signal 0 (P7) is left out.
+- E2-26a, measured on this host (M5 Max, macOS 26): RLIMIT_CPU stops a pure
+  user-mode loop (`node -e 'for(;;){}'` under `ulimit -t 2` dies of SIGXCPU
+  after about 2.0 s), but a loop that makes a system call on every pass
+  (`process.cpuUsage()`, `process.getuid()`, `fs.fstatSync`) is never stopped by
+  it (still running at 15-20 s). A loop that makes one every 1,000 passes is
+  stopped, about 1 s late. The binding CPU bound is therefore the wall ceiling
+  (`wallMsCeiling`, enforced by the controller), not `cpuSeconds`.
+  Risk row: "macOS RLIMIT_CPU misses syscall-heavy loops" -> mitigated by the
+  wall ceiling and the controller sweep, proven by the syscall-loop test.
+
+FNXC:CccConfinedShell 2026-10-14-14:07:
+The command's wall timer starts when the reaper reports the command spawned
+(a `CCC-STARTED` frame on fd 3, before the exited frame), not when the
+controller spawns sandbox-exec. Measured: the first exec of a freshly cloned
+binary inside the sandbox costs 1 to 3 s on a loaded host (about 0.2 s
+outside it), which made a 1 s model timeout fire before a 10 ms command ran.
+The runner's own timeout, counted from spawn, still bounds the whole exec.
+Under a load average of 16 to 33 each lsof scan costs 0.5 to 0.9 s, not the
+0.3 s quoted above for a quiet host.
 */
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsConstants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { chmod, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { connect as netConnect, createServer, type Server } from "node:net";
 import { constants as osConstants } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { superviseSpawn, type SupervisedChild } from "@fusion/core";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
@@ -88,7 +140,8 @@ import {
   runCccDarwinSandboxedProcess,
 } from "../ccc-campaign-proof-sandbox.js";
 
-export type CccSealedExecutable = Readonly<{ path: string; sha256: string }>;
+/** `name` (E2-25, `^[A-Za-z0-9._+-]{1,64}$`) is the PATH name of a utility's clone; it defaults to the file's basename. */
+export type CccSealedExecutable = Readonly<{ path: string; sha256: string; name?: string }>;
 export type CccSealedToolchain = Readonly<{
   bash: CccSealedExecutable;
   sh: CccSealedExecutable;
@@ -126,7 +179,23 @@ export type CccConfinementRefusalReason =
   | "toolchain-digest-drift"
   | "root-overlap"
   | "qualification-missing"
-  | "taskenv-not-allowlisted";
+  | "taskenv-not-allowlisted"
+  | "closure-sweep-unavailable"
+  | "platform-binary-in-toolchain"
+  | "instance-disposed";
+
+/**
+ * Test-only seams (E2-11, E2-21, E2-22). Production never passes them.
+ * `sealedEnvironment` rewrites the sealed environment just before each exec;
+ * `lsofPath` replaces the absolute `/usr/sbin/lsof` the controller sweep runs.
+ */
+export type CccConfinedShellTestOnly = Readonly<{
+  sealedEnvironment?: (sealed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>;
+  lsofPath?: string;
+}>;
+
+/** E2-24: the operations own their toolchain clone; `dispose` removes it and later execs refuse. */
+export type CccConfinedBashOperations = BashOperations & Readonly<{ dispose(): Promise<void> }>;
 
 export class CccConfinementRefusedError extends Error {
   readonly code = "CCC_CONFINEMENT_REFUSED" as const;
@@ -173,14 +242,20 @@ const CAPTURE_TIMEOUT_MS = 10_000;
 const CAPTURE_KILL_GRACE_MS = 1_000;
 const CAPTURE_MAX_OUTPUT_BYTES = 16 * 1_024 * 1_024;
 const CAPTURE_ENV: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C" };
+/** E2-22: the sweep runs this exact file, never a PATH lookup. */
 const LSOF_EXECUTABLE = "/usr/sbin/lsof";
 const PS_EXECUTABLE = "/bin/ps";
-const CLONE_DIR_PREFIX = ".ccc-exec-";
+/** E2-24: every instance clone lives at `<scratch>/toolchains/<instanceId>/`; the whole directory is write-denied. */
+const TOOLCHAINS_DIR_NAME = "toolchains";
 const CONTROLLER_SWEEP_MAX_SCANS = 20;
 const CONTROLLER_SWEEP_SETTLE_MS = 50;
 const CLOSURE_FRAME_PREFIX = "CCC-CLOSURE ";
 const EXITED_FRAME_PREFIX = "CCC-EXITED ";
+const STARTED_FRAME_PREFIX = "CCC-STARTED ";
 const SHA256_HEX = /^[0-9a-f]{64}$/u;
+/** E2-25: the PATH name a sealed utility may carry. */
+const SEALED_NAME_SHAPE = /^[A-Za-z0-9._+-]{1,64}$/u;
+const DENIED_NAME_SHAPE = /^[A-Za-z0-9._*-]+$/u;
 const SYSTEM_RUNTIME_READ_ROOTS = [
   "/System/Library",
   "/usr/lib",
@@ -189,7 +264,19 @@ const SYSTEM_RUNTIME_READ_ROOTS = [
   "/private/var/db/timezone",
 ] as const;
 const DEVICE_READ_FILES = ["/dev/null", "/dev/urandom"] as const;
-const DEFAULT_DENIED_NAMES = [".env", ".env.*", ".agentsecrets", "_secrets", ".npmrc"] as const;
+/**
+ * E2-23: the names every confined shell denies, whatever the caller passes. A
+ * superset of K1's `CCC_PLANNING_DENIED_NAMES` including E2-42's `.envrc`
+ * (INT-1 asserts it, E2-81).
+ */
+export const CCC_CONFINED_DEFAULT_DENIED_NAMES: readonly string[] = Object.freeze([
+  ".agentsecrets",
+  ".env",
+  ".env.*",
+  ".envrc",
+  ".npmrc",
+  "_secrets",
+]);
 /** Names bash itself exports to every child, beyond the sealed and task keys. */
 const SHELL_ADDED_ENV_KEYS = ["PWD", "SHLVL", "_", "OLDPWD"] as const;
 /**
@@ -253,6 +340,10 @@ process.stdout.on("error", () => {});
 process.stderr.on("error", () => {});
 relay(child.stdout, process.stdout);
 relay(child.stderr, process.stderr);
+// The controller's command timer starts here, so this reaper's own launch is not charged to the command.
+child.on("spawn", () => {
+  if (!reaping) writeFrame("${STARTED_FRAME_PREFIX}" + JSON.stringify({ pid: child.pid }) + "\n");
+});
 child.on("error", (error) => {
   if (reaping) return;
   exitInfo = { code: null, signal: null, error: String((error && error.code) || error) };
@@ -318,12 +409,14 @@ function reap() {
   } catch (error) {
     sandboxed = Boolean(error && error.code === "EPERM");
   }
+  // Stop, never kill: a stopped process cannot run, fork or exit, so the
+  // controller still sees it running from the clone, kills it and records it.
   if (typeof child.pid === "number") {
     try {
-      process.kill(-child.pid, "SIGKILL");
+      process.kill(-child.pid, "SIGSTOP");
     } catch {}
   }
-  const killed = new Set();
+  const stopped = new Set();
   let passes = 0;
   let clean = 0;
   let last = [];
@@ -336,12 +429,12 @@ function reap() {
       }
       let fresh = false;
       for (const pid of found) {
-        if (!killed.has(pid)) {
+        if (!stopped.has(pid)) {
           fresh = true;
-          killed.add(pid);
+          stopped.add(pid);
         }
         try {
-          process.kill(pid, "SIGKILL");
+          process.kill(pid, "SIGSTOP");
         } catch {}
       }
       clean = fresh ? 0 : clean + 1;
@@ -349,13 +442,15 @@ function reap() {
     }
   }
   writeFrame("${CLOSURE_FRAME_PREFIX}" + JSON.stringify({
-    v: 1,
+    v: 2,
     sandboxed,
     converged: clean >= 2,
     outputCapped,
     exit: exitInfo,
-    record: { passes, killed: [...killed].sort((a, b) => a - b), persistent: last },
+    record: { passes, stopped: [...stopped].sort((a, b) => a - b), persistent: last },
   }) + "\n");
+  // The stopped bash never exits; unref it so this process can end.
+  child.unref();
   process.stdin.destroy();
   process.exitCode = 0;
 }
@@ -480,15 +575,27 @@ function sealedExecutable(path: string, label: string): CccSealedExecutable {
   const real = cccCanonicalExistingPath(path, `sealed ${label}`);
   if (!statSync(real).isFile()) throw new Error(`sealed ${label} is not a regular file: ${real}`);
   if (isApplePlatformPath(real)) {
-    throw new Error(`sealed ${label} ${real} is an Apple platform binary, which macOS kills when it runs from the per-instance clone (ADR X1-R); seal a non-platform build such as Homebrew's`);
+    refuse(
+      "platform-binary-in-toolchain",
+      `sealed ${label} ${real} is an Apple platform binary, which macOS kills when it runs from the per-instance clone (ADR X1-R); seal a non-platform build such as Homebrew's`,
+    );
   }
   return { path: real, sha256: fileSha256(real) };
+}
+
+function isSealedName(name: unknown): name is string {
+  return typeof name === "string" && SEALED_NAME_SHAPE.test(name) && name !== "." && name !== "..";
 }
 
 type ToolchainBody = Omit<CccSealedToolchain, "toolchainSha256">;
 
 function toolchainDigest(body: ToolchainBody): string {
-  const entry = (value: CccSealedExecutable) => ({ path: value.path, sha256: value.sha256 });
+  // A nameless entry hashes exactly as before E2-25, so earlier digests stay valid.
+  const entry = (value: CccSealedExecutable) => ({
+    path: value.path,
+    sha256: value.sha256,
+    ...(value.name !== undefined ? { name: value.name } : {}),
+  });
   return createHash("sha256").update(JSON.stringify({
     schema: "ccc-sealed-toolchain.v1",
     bash: entry(body.bash),
@@ -499,17 +606,25 @@ function toolchainDigest(body: ToolchainBody): string {
   })).digest("hex");
 }
 
+/** A utility to seal: its path, or its path and the PATH name its clone takes (E2-25). */
+export type CccToolchainUtilitySpec = string | Readonly<{ path: string; name?: string }>;
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 /**
  * Seals real-path executables with their sha256 and the toolchain digest. Never
  * pass Homebrew `bin/` shims or `/usr/bin/git` (an xcrun shim), and never an
  * Apple platform binary: only non-platform builds run from the per-instance clone.
+ * A utility given as `{ path, name }` appears in PATH as `name` (GNU `gcat` as `cat`).
  */
 export async function sealCccToolchain(i: Readonly<{
   bash: string;
   sh: string;
   node: string;
   git: string;
-  utilities: readonly string[];
+  utilities: readonly CccToolchainUtilitySpec[];
 }>): Promise<CccSealedToolchain> {
   const git = sealedExecutable(i.git, "git");
   const execPath = await captureSupervised(git.path, ["--exec-path"], {
@@ -521,15 +636,23 @@ export async function sealCccToolchain(i: Readonly<{
   }
   const utilities = new Map<string, CccSealedExecutable>();
   for (const utility of i.utilities) {
-    const sealed = sealedExecutable(utility, "utility");
-    utilities.set(sealed.path, sealed);
+    const spec = typeof utility === "string" ? { path: utility } : utility;
+    if (spec.name !== undefined && !isSealedName(spec.name)) {
+      refuse("toolchain-digest-drift", `sealed utility name ${JSON.stringify(spec.name)} must match ${SEALED_NAME_SHAPE.source} and not be . or ..`);
+    }
+    const sealed = sealedExecutable(spec.path, "utility");
+    const entry: CccSealedExecutable = spec.name === undefined ? sealed : { ...sealed, name: spec.name };
+    // The same file under the same name twice is one entry; anything else that shares a name refuses below.
+    utilities.set(`${entry.path}\u0000${entry.name ?? ""}`, entry);
   }
   const body: ToolchainBody = {
     bash: sealedExecutable(i.bash, "bash"),
     sh: sealedExecutable(i.sh, "sh"),
     node: sealedExecutable(i.node, "node"),
     git: { ...git, execPath: cccCanonicalExistingPath(execPath.stdout.trim(), "sealed git exec path") },
-    utilities: [...utilities.values()].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)),
+    utilities: [...utilities.values()].sort((left, right) => (
+      compareCodeUnits(left.path, right.path) || compareCodeUnits(left.name ?? "", right.name ?? "")
+    )),
   };
   const toolchain = { ...body, toolchainSha256: toolchainDigest(body) };
   toolchainPathNames(toolchain);
@@ -541,23 +664,37 @@ function toolchainExecutables(toolchain: CccSealedToolchain): CccSealedExecutabl
 }
 
 /**
- * The PATH names inside the sandbox: the four roles, then each utility under the
- * basename of its real path. Two different files under one name are refused.
+ * The PATH names inside the sandbox, each naming one clone file: the four roles
+ * under their role names, then each utility under `name ?? basename(path)`
+ * (E2-25). A duplicate effective name, a role carrying another name, or a
+ * malformed name is `toolchain-digest-drift`.
  */
-function toolchainPathNames(toolchain: CccSealedToolchain): Map<string, string> {
-  const names = new Map<string, string>();
-  const add = (name: string, path: string) => {
+function toolchainPathNames(toolchain: CccSealedToolchain): Map<string, CccSealedExecutable> {
+  const names = new Map<string, CccSealedExecutable>();
+  const add = (name: string, executable: CccSealedExecutable) => {
     const existing = names.get(name);
-    if (existing !== undefined && existing !== path) {
-      refuse("toolchain-digest-drift", `two sealed executables share the PATH name ${name}: ${existing} and ${path}`);
+    if (existing !== undefined) {
+      refuse("toolchain-digest-drift", `two sealed executables share the PATH name ${name}: ${existing.path} and ${executable.path}`);
     }
-    names.set(name, path);
+    names.set(name, executable);
   };
-  add("bash", toolchain.bash.path);
-  add("sh", toolchain.sh.path);
-  add("node", toolchain.node.path);
-  add("git", toolchain.git.path);
-  for (const utility of toolchain.utilities) add(basename(utility.path), utility.path);
+  const roles = [["bash", toolchain.bash], ["sh", toolchain.sh], ["node", toolchain.node], ["git", toolchain.git]] as const;
+  for (const [role, executable] of roles) {
+    if (executable.name !== undefined && executable.name !== role) {
+      refuse("toolchain-digest-drift", `the sealed ${role} appears under its role name, not ${JSON.stringify(executable.name)}`);
+    }
+    add(role, executable);
+  }
+  for (const utility of toolchain.utilities) {
+    if (utility.name !== undefined && !isSealedName(utility.name)) {
+      refuse("toolchain-digest-drift", `sealed utility name ${JSON.stringify(utility.name)} is malformed`);
+    }
+    const name = utility.name ?? basename(utility.path);
+    if (name === "" || name === "." || name === ".." || name.includes("\u0000")) {
+      refuse("toolchain-digest-drift", `sealed utility ${utility.path} has no usable PATH name`);
+    }
+    add(name, utility);
+  }
   return names;
 }
 
@@ -576,11 +713,14 @@ function fileIdentity(path: string, sha256: string): FileIdentity {
 function verifyToolchain(toolchain: CccSealedToolchain): FileIdentity[] {
   const identities: FileIdentity[] = [];
   for (const executable of toolchainExecutables(toolchain)) {
-    if (!isAbsolute(executable.path) || !SHA256_HEX.test(executable.sha256)) {
-      refuse("toolchain-digest-drift", `sealed executable record is malformed: ${executable.path}`);
+    if (
+      typeof executable.path !== "string" || !isAbsolute(executable.path) || typeof executable.sha256 !== "string"
+      || !SHA256_HEX.test(executable.sha256) || (executable.name !== undefined && !isSealedName(executable.name))
+    ) {
+      refuse("toolchain-digest-drift", `sealed executable record is malformed: ${String(executable.path)}`);
     }
     if (isApplePlatformPath(executable.path)) {
-      refuse("toolchain-digest-drift", `sealed executable ${executable.path} is an Apple platform binary, which cannot run from the per-instance clone`);
+      refuse("platform-binary-in-toolchain", `sealed executable ${executable.path} is an Apple platform binary, which cannot run from the per-instance clone`);
     }
     let real: string;
     try {
@@ -681,12 +821,103 @@ function canonicalPossiblyMissingPath(path: string, label: string): string {
   return join(canonicalPossiblyMissingPath(parent, label), basename(resolved));
 }
 
-function deniedNamePattern(name: string): string {
-  if (!/^[A-Za-z0-9._*-]+$/u.test(name) || name === "." || name === "..") {
-    throw new Error(`denied name must be a single path component of [A-Za-z0-9._*-]: ${name}`);
+function assertDeniedName(name: unknown): asserts name is string {
+  if (typeof name !== "string" || !DENIED_NAME_SHAPE.test(name) || name === "." || name === "..") {
+    throw new Error(`denied name must be a single path component of [A-Za-z0-9._*-]: ${String(name)}`);
   }
+}
+
+/** sandbox-exec regex for one denied name as any path segment (the sandbox already folds case on APFS). */
+function deniedNamePattern(name: string): string {
+  assertDeniedName(name);
   const body = [...name].map((character) => (character === "*" ? "[^/]*" : character === "." ? "\\." : character)).join("");
   return `#"/${body}(/.*)?$"`;
+}
+
+/**
+ * K1's path comparison fold (errata E2-40), applied to one name: on this
+ * host's APFS volume it merges every pair the filesystem merges (A/a, NFC/NFD,
+ * ß/ss, ς/σ, ﬁ/fi, ſ/s, Kelvin K/k); its one over-match, I/ı, fails closed.
+ */
+function cccConfinedFoldName(value: string): string {
+  return value.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC");
+}
+
+/**
+ * E2-23: the caller's denied names united with `CCC_CONFINED_DEFAULT_DENIED_NAMES`,
+ * folded, de-duplicated and sorted. Each name is one path component of
+ * `[A-Za-z0-9._*-]`, where `*` matches any run of characters within a segment.
+ * A caller can add names, never remove a default.
+ */
+export function cccConfinedEffectiveDeniedNames(callerNames: readonly string[]): readonly string[] {
+  for (const name of callerNames) assertDeniedName(name);
+  const folded = new Set([...CCC_CONFINED_DEFAULT_DENIED_NAMES, ...callerNames].map(cccConfinedFoldName));
+  return Object.freeze([...folded].sort(compareCodeUnits));
+}
+
+export type CccConfinedWriteRefusal = "outside-write-roots" | "git-segment" | "denied-name";
+
+/**
+ * The real path a write to `path` lands on: the longest existing ancestor
+ * resolved by the OS (`realpath(3)`, which also restores the on-disk case),
+ * then the missing tail. An entry that exists but does not resolve (a dangling
+ * or looping symlink) is null, because a write would follow it somewhere unknown.
+ */
+function writeLandingPath(path: string): string | null {
+  const resolved = resolve(path);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    // missing, or present but unresolvable; told apart below
+  }
+  try {
+    lstatSync(resolved);
+    return null;
+  } catch {
+    // missing: resolve the parent and keep this component
+  }
+  const parent = dirname(resolved);
+  if (parent === resolved) return null;
+  const landing = writeLandingPath(parent);
+  return landing === null ? null : join(landing, basename(resolved));
+}
+
+function pathSegments(path: string): string[] {
+  return path.split(sep).filter((segment) => segment.length > 0);
+}
+
+function deniedNameRegex(name: string): RegExp {
+  const body = [...name].map((character) => (character === "*" ? ".*" : character === "." ? "\\." : character)).join("");
+  return new RegExp(`^${body}$`, "su");
+}
+
+/**
+ * E2-23, the one write predicate both confined shells share (this profile's
+ * validation and C2's write, edit and grep paths). `path` must be absolute.
+ * It is refused when its real landing path is outside every write root, when
+ * its spelled or real path has a `.git` segment, or when any segment of
+ * either equals an effective denied name (the defaults always included), all
+ * names compared under K1's fold. Returns null when the write is admitted.
+ */
+export function cccConfinedWriteRefusal(i: Readonly<{
+  path: string;
+  writeRoots: readonly string[];
+  deniedNames: readonly string[];
+}>): null | CccConfinedWriteRefusal {
+  const deniedNames = cccConfinedEffectiveDeniedNames(i.deniedNames);
+  if (typeof i.path !== "string" || !isAbsolute(i.path)) return "outside-write-roots";
+  const landing = writeLandingPath(i.path);
+  const roots = i.writeRoots.flatMap((root) => {
+    if (typeof root !== "string" || !isAbsolute(root)) return [];
+    const canonicalRoot = writeLandingPath(root);
+    return canonicalRoot === null ? [] : [canonicalRoot];
+  });
+  if (landing === null || !roots.some((root) => cccIsSameOrWithin(landing, root))) return "outside-write-roots";
+  const segments = [...pathSegments(resolve(i.path)), ...pathSegments(landing)].map(cccConfinedFoldName);
+  if (segments.includes(".git")) return "git-segment";
+  const patterns = deniedNames.map(deniedNameRegex);
+  if (segments.some((segment) => patterns.some((pattern) => pattern.test(segment)))) return "denied-name";
+  return null;
 }
 
 type CanonicalShellInput = Readonly<{
@@ -712,11 +943,16 @@ function canonicalShellInput(input: CccConfinedShellInput): CanonicalShellInput 
   const writeRoots = cccUniqueSortedPaths(input.writeRoots.map((path) => cccCanonicalExistingPath(path, "confined-shell write root")));
   const deniedRoots = cccUniqueSortedPaths(input.deniedRoots.map((path) => canonicalPossiblyMissingPath(path, "confined-shell denied root")));
   const scratchRoot = cccCanonicalExistingPath(input.scratchRoot, "confined-shell scratch root");
+  // E1-20 and E2-23: the defaults always apply; a caller can add names, never remove `.env`.
+  const deniedNames = [...cccConfinedEffectiveDeniedNames(input.deniedNames)];
   const overlaps = (left: string, right: string) => cccIsSameOrWithin(left, right) || cccIsSameOrWithin(right, left);
   const toolchainPaths = [...toolchainExecutables(input.toolchain).map((entry) => entry.path), input.toolchain.git.execPath];
   for (const writeRoot of writeRoots) {
     if (!cccIsSameOrWithin(writeRoot, worktreeRoot)) refuse("root-overlap", `write root is outside the worktree: ${writeRoot}`);
     if (gitDirs.some((gitDir) => overlaps(writeRoot, gitDir))) refuse("root-overlap", `write root overlaps a git dir: ${writeRoot}`);
+    // E2-23: a root the shared write predicate refuses would be a root nothing can be written to.
+    const refusal = cccConfinedWriteRefusal({ path: writeRoot, writeRoots: [writeRoot], deniedNames });
+    if (refusal !== null) refuse("root-overlap", `write root ${writeRoot} is refused by the shared write predicate (${refusal})`);
   }
   for (const root of [worktreeRoot, ...gitDirs, ...deniedRoots]) {
     if (overlaps(scratchRoot, root)) refuse("root-overlap", `scratch root overlaps ${root}`);
@@ -737,8 +973,7 @@ function canonicalShellInput(input: CccConfinedShellInput): CanonicalShellInput 
     gitDirs,
     writeRoots,
     deniedRoots,
-    // E1-20: the defaults always apply; a caller can add names, never remove `.env`.
-    deniedNames: cccUniqueSortedPaths([...DEFAULT_DENIED_NAMES, ...input.deniedNames]),
+    deniedNames,
     scratchRoot,
     ...(input.loopbackPort !== undefined ? { loopbackPort: input.loopbackPort } : {}),
   };
@@ -768,9 +1003,18 @@ function linkedRuntimeFilesFor(toolchain: CccSealedToolchain): Promise<string[]>
   return files;
 }
 
+function toolchainsDir(scratchRoot: string): string {
+  return join(scratchRoot, TOOLCHAINS_DIR_NAME);
+}
+
+/** E2-24: every instance clone under the scratch root stays read-only to every confined command. */
+function toolchainsWriteDeny(scratchRoot: string): string {
+  return `(deny file-write* ${cccSbplSubpath(toolchainsDir(scratchRoot))})`;
+}
+
 /** Placeholder clone directory for a profile rendered without an operations instance. */
 function placeholderCloneDir(scratchRoot: string): string {
-  return join(scratchRoot, `${CLONE_DIR_PREFIX}instance`);
+  return join(toolchainsDir(scratchRoot), "instance");
 }
 
 async function writerProfile(
@@ -799,8 +1043,8 @@ async function writerProfile(
   const gitWriteDenied = cccUniqueSortedPaths([...canonical.gitDirs, join(canonical.worktreeRoot, ".git")]);
   deny.push(`(deny file-write* ${gitWriteDenied.map(cccSbplSubpath).join(" ")})`);
   deny.push(GIT_SEGMENT_WRITE_DENY);
-  // The clone lies inside the writable scratch root; this later deny makes it read-only (P9 order).
-  deny.push(`(deny file-write* ${cccSbplSubpath(cloneDir)})`);
+  // Every clone lies inside the writable scratch root; this later deny makes them all read-only (P9 order).
+  deny.push(toolchainsWriteDeny(canonical.scratchRoot));
   const profile = renderWriterProfile({
     EXEC: cccSbplSubpath(cloneDir),
     LOOPBACK: canonical.loopbackPort !== undefined ? cccSbplLoopbackPortRules(canonical.loopbackPort).join("\n") : "",
@@ -817,8 +1061,8 @@ async function writerProfile(
 
 /**
  * The profile for `input`, rendered with a placeholder per-instance clone
- * directory (`<scratch>/.ccc-exec-instance`); each operations instance renders
- * the same rules with its own random clone directory.
+ * directory (`<scratch>/toolchains/instance`); each operations instance renders
+ * the same rules with its own `<scratch>/toolchains/<instanceId>`.
  */
 export async function buildCccWriterShellDarwinProfile(
   input: CccConfinedShellInput,
@@ -834,7 +1078,7 @@ type SealedEnvironmentInput = Readonly<{
   taskEnv: Readonly<Record<string, string>>;
 }>;
 
-function sealedEnvironment(i: SealedEnvironmentInput): NodeJS.ProcessEnv {
+function sealedEnvironment(i: SealedEnvironmentInput): Record<string, string> {
   return {
     PATH: i.binDir,
     HOME: join(i.scratchRoot, "home"),
@@ -864,26 +1108,28 @@ const TEMPLATE_SENTINEL_PORT = 47_999;
 /**
  * Everything that decides what the sandbox admits apart from the per-run paths:
  * the profile template, the bash wrapper, the reaper, the denied-name pattern,
- * the `.git` segment rule, the sealed environment, the loopback rule and the
- * controller sweep. The functions are rendered for sentinel inputs, so a change
- * to any of their outputs changes the digest a qualification receipt binds and
- * every earlier qualification becomes stale (`qualification-missing`, E1-20).
+ * the `.git` segment rule, the toolchains write deny, the sealed environment,
+ * the loopback rule and the controller sweep. The functions are rendered for
+ * sentinel inputs, so a change to any of their outputs changes the digest a
+ * qualification receipt binds and every earlier qualification becomes stale
+ * (`qualification-missing`, E1-20).
  */
 export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL: readonly string[] = Object.freeze([
   PROFILE_ID,
   PROFILE_TEMPLATE,
   WRAPPER_SOURCE,
   REAPER_SOURCE,
-  `denied-names ${[...DEFAULT_DENIED_NAMES, "sample*.name"].map(deniedNamePattern).join(" ")}`,
+  `denied-names ${[...CCC_CONFINED_DEFAULT_DENIED_NAMES, "sample*.name"].map(deniedNamePattern).join(" ")}`,
   `git-segment ${GIT_SEGMENT_WRITE_DENY}`,
+  `toolchains-write-deny ${toolchainsWriteDeny("/ccc-sentinel/scratch")}`,
   `sealed-env ${JSON.stringify(sealedEnvironment({
-    binDir: "/ccc-sentinel/scratch/.ccc-exec-sentinel/bin",
+    binDir: "/ccc-sentinel/scratch/toolchains/sentinel/bin",
     scratchRoot: "/ccc-sentinel/scratch",
     worktreeRoot: "/ccc-sentinel/worktree",
     taskEnv: {},
   }))} shell-added ${SHELL_ADDED_ENV_KEYS.join(",")}`,
   `loopback ${cccSbplLoopbackPortRules(TEMPLATE_SENTINEL_PORT).join("\n")}`,
-  `controller-sweep lsof txt by clone inode; stop, rescan, kill, two empty scans; at most ${CONTROLLER_SWEEP_MAX_SCANS} scans`,
+  `controller-sweep ${LSOF_EXECUTABLE} txt by clone inode; stop, rescan, kill, two empty scans; at most ${CONTROLLER_SWEEP_MAX_SCANS} scans; killed lists only pids a scan saw`,
 ]);
 export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256 = createHash("sha256")
   .update(CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL.join("\u0000"))
@@ -901,60 +1147,72 @@ type ToolchainClone = Readonly<{
 }>;
 
 /**
- * Clones the sealed executables (and any dylib they load relative to their own
- * install root) into a fresh `<scratch>/.ccc-exec-<random>` directory, mirroring
- * absolute paths under `root/`, plus `bin/` role-named symlinks for PATH.
+ * E2-24 and E2-25: clones each sealed executable to
+ * `<scratch>/toolchains/<instanceId>/bin/<PATH name>` (APFS clonefile, a full
+ * copy across volumes), and each dylib an executable loads from inside its own
+ * install root to the same place relative to `bin/` (Homebrew node's
+ * `@loader_path/../lib/libnode` becomes `<instance>/lib/libnode`). Every clone
+ * of a sealed executable must hash to its sealed sha256 before the first exec.
  */
-async function cloneToolchain(toolchain: CccSealedToolchain, scratchRoot: string): Promise<ToolchainClone> {
-  const dir = join(scratchRoot, `${CLONE_DIR_PREFIX}${randomBytes(8).toString("hex")}`);
-  const root = join(dir, "root");
-  const binDir = join(dir, "bin");
-  await mkdir(dir);
-  await mkdir(binDir);
-  const clones = new Map<string, string>();
-  const cloneFile = async (original: string): Promise<string> => {
-    const existing = clones.get(original);
-    if (existing !== undefined) return existing;
-    const target = join(root, original);
-    await mkdir(dirname(target), { recursive: true });
-    await copyFile(original, target, fsConstants.COPYFILE_FICLONE);
-    await chmod(target, 0o555);
-    clones.set(original, target);
-    return target;
-  };
-  const executables = toolchainExecutables(toolchain);
-  for (const executable of executables) await cloneFile(executable.path);
-  const installRoots = executables.map((executable) => dirname(dirname(executable.path)));
-  for (const file of await linkedRuntimeFilesFor(toolchain)) {
-    if (isApplePlatformPath(file) || !installRoots.some((installRoot) => cccIsSameOrWithin(file, installRoot))) continue;
-    if (statSync(file).isFile()) await cloneFile(file);
+async function cloneToolchain(toolchain: CccSealedToolchain, instanceDir: string): Promise<ToolchainClone> {
+  const toolchains = dirname(instanceDir);
+  await mkdir(toolchains, { recursive: true });
+  const toolchainsStat = lstatSync(toolchains);
+  if (toolchainsStat.isSymbolicLink() || !toolchainsStat.isDirectory() || realpathSync(toolchains) !== toolchains) {
+    refuse("root-overlap", `the toolchains directory is not a real directory: ${toolchains}`);
   }
-  for (const [name, original] of toolchainPathNames(toolchain)) {
-    await symlink(clones.get(original)!, join(binDir, name));
+  await mkdir(instanceDir);
+  const binDir = join(instanceDir, "bin");
+  await mkdir(binDir);
+  const sources = new Map<string, string>();
+  const place = async (source: string, target: string): Promise<void> => {
+    if (target === instanceDir || !cccIsSameOrWithin(target, instanceDir)) {
+      refuse("toolchain-digest-drift", `${source} would be cloned outside the instance directory (${target})`);
+    }
+    const existing = sources.get(target);
+    if (existing === source) return;
+    if (existing !== undefined) refuse("toolchain-digest-drift", `${existing} and ${source} would both be cloned to ${target}`);
+    sources.set(target, source);
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(source, target, fsConstants.COPYFILE_FICLONE);
+    await chmod(target, 0o555);
+  };
+  const pathNames = toolchainPathNames(toolchain);
+  for (const [name, executable] of pathNames) await place(executable.path, join(binDir, name));
+  const linkedRuntimeFiles = await linkedRuntimeFilesFor(toolchain);
+  for (const executable of new Set([...pathNames.values()].map((entry) => entry.path))) {
+    const installRoot = dirname(dirname(executable));
+    for (const file of linkedRuntimeFiles) {
+      if (file === executable || isApplePlatformPath(file) || !cccIsSameOrWithin(file, installRoot)) continue;
+      if (!statSync(file).isFile()) continue;
+      await place(file, resolve(binDir, relative(dirname(executable), file)));
+    }
   }
   const identities: FileIdentity[] = [];
-  for (const executable of executables) {
-    const target = clones.get(executable.path)!;
-    if (identities.some((identity) => identity.path === target)) continue;
+  for (const [name, executable] of pathNames) {
+    const target = join(binDir, name);
     if (fileSha256(target) !== executable.sha256) {
-      refuse("toolchain-digest-drift", `the per-instance clone of ${executable.path} does not carry the sealed bytes`);
+      refuse("toolchain-digest-drift", `the per-instance clone ${target} of ${executable.path} does not carry the sealed bytes`);
     }
     identities.push(fileIdentity(target, executable.sha256));
   }
   const inodes = new Set<string>();
-  for (const target of clones.values()) {
+  for (const target of sources.keys()) {
     const stat = statSync(target, { bigint: true });
     inodes.add(`${stat.dev.toString()}:${stat.ino.toString()}`);
   }
-  return { dir, binDir, node: clones.get(toolchain.node.path)!, bash: clones.get(toolchain.bash.path)!, identities, inodes };
+  return { dir: instanceDir, binDir, node: join(binDir, "node"), bash: join(binDir, "bash"), identities, inodes };
 }
+
+/** The reaper's report: `stopped` is every pid its signal-0 sweep stopped (it may include a foreign zombie, P7). */
+type ReaperRecord = Readonly<{ passes: number; stopped: readonly number[]; persistent: readonly number[] }>;
 
 type ClosureFrame = Readonly<{
   sandboxed: boolean;
   converged: boolean;
   outputCapped: boolean;
   exit: Readonly<{ code: number | null; signal: string | null }> | null;
-  record: CccClosureRecord;
+  record: ReaperRecord;
 }>;
 
 function isPidList(value: unknown): value is number[] {
@@ -962,18 +1220,18 @@ function isPidList(value: unknown): value is number[] {
 }
 
 /**
- * fd 3 carries at most one exited frame and exactly one closure frame, in that
- * order, and nothing else; any other shape is unconfirmed.
+ * fd 3 carries at most one started frame, at most one exited frame and exactly
+ * one closure frame, in that order, and nothing else; any other shape is
+ * unconfirmed.
  */
 function parseClosureFrame(text: string): ClosureFrame | null {
   if (!text.endsWith("\n")) return null;
   const lines = text.slice(0, -1).split("\n");
-  const closureLine = lines.at(-1) ?? "";
-  if (
-    lines.length > 2
-    || (lines.length === 2 && !lines[0]!.startsWith(EXITED_FRAME_PREFIX))
-    || !closureLine.startsWith(CLOSURE_FRAME_PREFIX)
-  ) {
+  let index = 0;
+  if (lines[index]?.startsWith(STARTED_FRAME_PREFIX)) index += 1;
+  if (lines[index]?.startsWith(EXITED_FRAME_PREFIX)) index += 1;
+  const closureLine = lines[index] ?? "";
+  if (index !== lines.length - 1 || !closureLine.startsWith(CLOSURE_FRAME_PREFIX)) {
     return null;
   }
   let parsed: unknown;
@@ -987,13 +1245,13 @@ function parseClosureFrame(text: string): ClosureFrame | null {
   const record = frame.record as Record<string, unknown> | undefined;
   const exit = frame.exit as Record<string, unknown> | null | undefined;
   if (
-    frame.v !== 1
+    frame.v !== 2
     || typeof frame.sandboxed !== "boolean"
     || typeof frame.converged !== "boolean"
     || typeof frame.outputCapped !== "boolean"
     || record === null || typeof record !== "object"
     || !Number.isSafeInteger(record.passes) || (record.passes as number) < 0
-    || !isPidList(record.killed) || !isPidList(record.persistent)
+    || !isPidList(record.stopped) || !isPidList(record.persistent)
     || (exit !== null && (typeof exit !== "object" || exit === undefined
       || !(exit.code === null || Number.isSafeInteger(exit.code))
       || !(exit.signal === null || typeof exit.signal === "string")))
@@ -1005,31 +1263,64 @@ function parseClosureFrame(text: string): ClosureFrame | null {
     converged: frame.converged,
     outputCapped: frame.outputCapped,
     exit: exit === null ? null : { code: exit.code as number | null, signal: exit.signal as string | null },
-    record: { passes: record.passes as number, killed: record.killed, persistent: record.persistent },
+    record: { passes: record.passes as number, stopped: record.stopped, persistent: record.persistent },
   };
 }
 
 /**
- * Outside the sandbox: every same-uid pid whose lsof txt mapping is one of the
- * clone's inodes. The scan must list the controller itself, or it is not trusted.
+ * E2-22: the sweep's lsof must be an absolute executable file, checked when an
+ * instance is created; without it no closure could ever be confirmed.
  */
-async function scanCloneProcesses(clone: ToolchainClone): Promise<number[]> {
+function assertSweepExecutable(lsofPath: string): void {
+  let usable = false;
+  try {
+    usable = typeof lsofPath === "string" && isAbsolute(lsofPath) && statSync(lsofPath).isFile();
+    if (usable) accessSync(lsofPath, fsConstants.X_OK);
+  } catch {
+    usable = false;
+  }
+  if (!usable) {
+    refuse("closure-sweep-unavailable", `the controller sweep needs ${String(lsofPath)} as an absolute executable file, so no closure could be confirmed`);
+  }
+}
+
+const LSOF_FIELD_VALUE: Readonly<Record<string, RegExp>> = {
+  p: /^[1-9][0-9]*$/u,
+  f: /^\S+$/u,
+  D: /^0x[0-9a-f]+$/iu,
+  i: /^[0-9]+$/u,
+};
+
+/**
+ * Outside the sandbox: every same-uid pid whose lsof txt mapping is one of the
+ * clone's inodes, from the absolute lsof spawned through the supervised async
+ * capture. Any line that is not one of the requested fields, a failed or
+ * signalled spawn, or a scan that does not list the controller itself is
+ * untrusted (E2-22): it throws, so the closure stays unconfirmed.
+ */
+async function scanCloneProcesses(clone: ToolchainClone, lsofPath: string): Promise<number[]> {
   const uid = typeof process.getuid === "function" ? process.getuid() : -1;
   const scan = await captureSupervised(
-    LSOF_EXECUTABLE,
+    lsofPath,
     ["-n", "-P", "-w", "-a", "-u", String(uid), "-d", "txt", "-F", "pDi"],
     { label: "ccc-confined-shell-sweep" },
   );
-  if (scan.timedOut || scan.overLimit || scan.spawnError !== null) {
-    throw new Error(`lsof scan failed (${scan.spawnError ?? (scan.timedOut ? "timed out" : "output over limit")})`);
+  if (scan.timedOut || scan.overLimit || scan.spawnError !== null || scan.signal !== null) {
+    throw new Error(`lsof scan failed (${scan.spawnError ?? (scan.timedOut ? "timed out" : scan.overLimit ? "output over limit" : `signal ${String(scan.signal)}`)})`);
   }
   const found = new Set<number>();
   let sawSelf = false;
   let pid = -1;
   let dev: string | null = null;
   for (const line of scan.stdout.split("\n")) {
+    if (line === "") continue;
+    const field = line[0]!;
     const value = line.slice(1);
-    switch (line[0]) {
+    const shape = LSOF_FIELD_VALUE[field];
+    if (!shape || !shape.test(value) || (field !== "p" && pid < 0)) {
+      throw new Error(`lsof printed a line that is not a requested field (exit ${String(scan.code)}), so its scan cannot be trusted`);
+    }
+    switch (field) {
       case "p":
         pid = Number(value);
         dev = null;
@@ -1039,14 +1330,12 @@ async function scanCloneProcesses(clone: ToolchainClone): Promise<number[]> {
         dev = null;
         break;
       case "D":
-        dev = /^0x[0-9a-f]+$/iu.test(value) ? BigInt(value).toString() : null;
+        dev = BigInt(value).toString();
         break;
-      case "i":
+      default:
         if (dev !== null && clone.inodes.has(`${dev}:${value}`) && Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid) {
           found.add(pid);
         }
-        break;
-      default:
         break;
     }
   }
@@ -1058,6 +1347,8 @@ type ControllerSweep = Readonly<{
   converged: boolean;
   scans: number;
   killed: readonly number[];
+  /** Every pid any scan listed: the processes the controller confirmed ran from the clone. */
+  seen: readonly number[];
   remaining: readonly number[];
   failure: string | null;
 }>;
@@ -1077,7 +1368,7 @@ function signalClonePid(pid: number, signal: NodeJS.Signals): void {
  * change its executable, so its pid cannot be recycled meanwhile), then require
  * two consecutive empty scans. Never kill(-1), never a pid the scan did not list.
  */
-async function sweepCloneProcesses(clone: ToolchainClone): Promise<ControllerSweep> {
+async function sweepCloneProcesses(clone: ToolchainClone, lsofPath: string): Promise<ControllerSweep> {
   const stopped = new Set<number>();
   const killed = new Set<number>();
   let scans = 0;
@@ -1087,13 +1378,14 @@ async function sweepCloneProcesses(clone: ToolchainClone): Promise<ControllerSwe
     converged,
     scans,
     killed: [...killed].sort((left, right) => left - right),
+    seen: [...stopped].sort((left, right) => left - right),
     remaining: converged ? [] : last,
     failure,
   });
   try {
     while (scans < CONTROLLER_SWEEP_MAX_SCANS) {
       scans += 1;
-      const found = await scanCloneProcesses(clone);
+      const found = await scanCloneProcesses(clone, lsofPath);
       last = found;
       if (found.length === 0) {
         clean += 1;
@@ -1126,10 +1418,17 @@ function exitCodeOf(exit: ClosureFrame["exit"]): number | null {
   return typeof signalNumber === "number" ? 128 + signalNumber : null;
 }
 
+/**
+ * E2-26c: `killed` lists only pids the controller confirmed as instance
+ * processes (a scan saw their txt mapping in the clone): the ones it killed,
+ * plus any the reaper stopped that a scan saw before they went. A pid only the
+ * reaper reported, such as a foreign zombie answering signal 0 (P7), is left out.
+ */
 function mergedClosureRecord(frame: ClosureFrame | null, sweep: ControllerSweep): CccClosureRecord {
+  const seen = new Set(sweep.seen);
   return {
     passes: (frame?.record.passes ?? 0) + sweep.scans,
-    killed: cccUniqueSortedNumbers([...(frame?.record.killed ?? []), ...sweep.killed]),
+    killed: cccUniqueSortedNumbers([...sweep.killed, ...(frame?.record.stopped ?? []).filter((pid) => seen.has(pid))]),
     persistent: sweep.converged ? [] : [...sweep.remaining],
   };
 }
@@ -1138,10 +1437,9 @@ function cccUniqueSortedNumbers(values: readonly number[]): number[] {
   return [...new Set(values)].sort((left, right) => left - right);
 }
 
-const QUARANTINE_NOTE = "descendants may still be running with write access to the write roots and the scratch root and network access to the admitted loopback port; quarantine means moving the write roots out of place and closing the admitted loopback listener, not only flagging the worktree";
+const QUARANTINE_NOTE = "descendants may still be running with write access to the write roots and the scratch root and network access to the admitted loopback port; the caller must quarantine (move the write roots out of place), not only flag the worktree";
 
 const lastClosures = new WeakMap<BashOperations, CccClosureRecord | null>();
-const instanceSweeps = new WeakMap<BashOperations, () => Promise<ControllerSweep | null>>();
 
 /** The closure record of the most recent command run through these operations, or null when it was not confirmed. */
 export function cccConfinedShellLastClosure(operations: BashOperations): CccClosureRecord | null {
@@ -1179,17 +1477,25 @@ function assertLimits(limits: CccConfinementLimits): void {
   }
 }
 
-function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ requireQualification: boolean }>): BashOperations {
+function confinedOperations(
+  input: CccConfinedShellInput,
+  options: Readonly<{ requireQualification: boolean; testOnly?: CccConfinedShellTestOnly }>,
+): CccConfinedBashOperations {
   assertBackendReady();
   if (options.requireQualification) assertQualified(input);
   assertLimits(input.limits);
+  const lsofPath = options.testOnly?.lsofPath ?? LSOF_EXECUTABLE;
+  assertSweepExecutable(lsofPath);
   const identities = verifyToolchain(input.toolchain);
   const canonical = canonicalShellInput(input);
   const limits = input.limits;
   const reapBudgetMs = REAP_BASE_BUDGET_MS + limits.maxReapPasses * REAP_PASS_BUDGET_MS;
+  const instanceDir = join(toolchainsDir(canonical.scratchRoot), randomBytes(8).toString("hex"));
   let clone: Promise<ToolchainClone> | undefined;
   let profile: Promise<Readonly<{ profile: string; profileSha256: string }>> | undefined;
   let queue: Promise<unknown> = Promise.resolve();
+  let disposed = false;
+  let disposal: Promise<void> | undefined;
 
   // E1-20: one exec at a time per instance, so the last-closure record and the
   // shared scratch home and tmp are never shared by two commands.
@@ -1198,13 +1504,10 @@ function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ re
     queue = next.catch(() => undefined);
     return next;
   };
+  // A failed clone stays failed: the instance directory may be half made, and
+  // only `dispose` removes it. The caller creates a new instance.
   const ensureClone = (): Promise<ToolchainClone> => {
-    if (!clone) {
-      clone = cloneToolchain(input.toolchain, canonical.scratchRoot);
-      clone.catch(() => {
-        clone = undefined;
-      });
-    }
+    clone ??= cloneToolchain(input.toolchain, instanceDir);
     return clone;
   };
 
@@ -1235,26 +1538,34 @@ function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ re
       mkdir(join(canonical.scratchRoot, "home"), { recursive: true }),
       mkdir(join(canonical.scratchRoot, "tmp"), { recursive: true }),
     ]);
-    const env = sealedEnvironment({
+    const sealed = sealedEnvironment({
       binDir: instanceClone.binDir,
       scratchRoot: canonical.scratchRoot,
       worktreeRoot: canonical.worktreeRoot,
       taskEnv: input.taskEnv,
     });
+    const env: NodeJS.ProcessEnv = options.testOnly?.sealedEnvironment ? { ...options.testOnly.sealedEnvironment(sealed) } : sealed;
 
-    // The wall limit covers the model command only, not the reaper's sweep
-    // after it: the command timer stops at the reaper's exited frame, and the
-    // runner's own timeout is a backstop that also covers the reap budget.
+    // The wall limit covers the model command only. The command timer starts
+    // at the reaper's started frame, so the reaper's own launch (including the
+    // first-launch check macOS makes of a fresh clone, measured at 1-3 s on a
+    // loaded host) is not charged to the command, and stops at its exited
+    // frame, so the sweep after it is not either. The runner's own timeout,
+    // counted from spawn, is a backstop that also covers the reap budget.
     const closureChunks: Buffer[] = [];
     const stop = new AbortController();
     let commandExited = false;
     let commandTimedOut = false;
-    const commandTimer = setTimeout(() => {
-      if (commandExited) return;
-      commandTimedOut = true;
-      stop.abort();
-    }, wallMs);
-    commandTimer.unref?.();
+    let commandTimer: NodeJS.Timeout | undefined;
+    const startCommandTimer = (): void => {
+      if (commandTimer !== undefined || commandExited) return;
+      commandTimer = setTimeout(() => {
+        if (commandExited) return;
+        commandTimedOut = true;
+        stop.abort();
+      }, wallMs);
+      commandTimer.unref?.();
+    };
     const onCallerAbort = (): void => stop.abort();
     signal?.addEventListener("abort", onCallerAbort, { once: true });
     let reaperStdin: Writable | null = null;
@@ -1293,9 +1604,11 @@ function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ re
           const closurePipe = supervised.child.stdio[3] as Readable | null | undefined;
           closurePipe?.on("data", (chunk: Buffer | string) => {
             closureChunks.push(Buffer.from(chunk));
-            if (!commandExited && Buffer.concat(closureChunks).toString("utf8").startsWith(EXITED_FRAME_PREFIX)) {
+            const frames = Buffer.concat(closureChunks).toString("utf8").split("\n").slice(0, -1);
+            if (frames.some((line) => line.startsWith(STARTED_FRAME_PREFIX))) startCommandTimer();
+            if (!commandExited && frames.some((line) => line.startsWith(EXITED_FRAME_PREFIX))) {
               commandExited = true;
-              clearTimeout(commandTimer);
+              if (commandTimer !== undefined) clearTimeout(commandTimer);
             }
           });
           closurePipe?.on("error", () => undefined);
@@ -1311,13 +1624,13 @@ function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ re
       runnerError = error;
     } finally {
       if (forceKill) clearTimeout(forceKill);
-      clearTimeout(commandTimer);
+      if (commandTimer !== undefined) clearTimeout(commandTimer);
       signal?.removeEventListener("abort", onCallerAbort);
     }
 
     // E1-18: the controller sweep is the closure authority on every path that
     // may have started a process, whatever the reaper managed to report.
-    const sweep = await sweepCloneProcesses(instanceClone);
+    const sweep = await sweepCloneProcesses(instanceClone, lsofPath);
     const frame = outcome === null ? null : parseClosureFrame(Buffer.concat(closureChunks).toString("utf8"));
     const record = mergedClosureRecord(frame, sweep);
     if (!sweep.converged) {
@@ -1346,22 +1659,44 @@ function confinedOperations(input: CccConfinedShellInput, options: Readonly<{ re
     return { exitCode: exitCodeOf(frame.exit) };
   };
 
-  const operations: BashOperations = {
-    exec: (command, cwd, execOptions) => serialized(() => execOnce(command, cwd, execOptions)),
+  const operations: CccConfinedBashOperations = {
+    exec: (command, cwd, execOptions) => {
+      if (disposed) {
+        return Promise.reject(new CccConfinementRefusedError("instance-disposed", "these confined-shell operations were disposed and their toolchain clone removed"));
+      }
+      return serialized(() => execOnce(command, cwd, execOptions));
+    },
+    // E2-24: after the execs already queued, sweep once more (best effort: an exec
+    // whose sweep failed has already thrown CLOSURE_UNCONFIRMED), then remove
+    // exactly this instance's clone directory. Idempotent.
+    dispose: () => {
+      disposed = true;
+      disposal ??= serialized(async () => {
+        const made = clone ? await clone.catch(() => undefined) : undefined;
+        if (made) await sweepCloneProcesses(made, lsofPath);
+        await rm(instanceDir, { recursive: true, force: true });
+      });
+      return disposal;
+    },
   };
-  instanceSweeps.set(operations, () => serialized(async () => (clone ? sweepCloneProcesses(await clone) : null)));
   return operations;
 }
 
 /**
  * The confined bash operations for one writer session. Refuses, before any
  * process exists, on a non-Darwin host, a missing sandbox-exec, a qualification
- * for another profile template or OS build, toolchain drift (including an Apple
- * platform binary), a root layout the profile cannot enforce, or a taskEnv key
- * no allowlist may admit. The per-instance toolchain clone is made on first exec.
+ * for another profile template or OS build, a missing `/usr/sbin/lsof`
+ * (`closure-sweep-unavailable`), toolchain drift, an Apple platform binary, a
+ * root layout the profile cannot enforce, or a taskEnv key no allowlist may
+ * admit. The per-instance toolchain clone is made on first exec under
+ * `<scratch>/toolchains/<instanceId>/`; call `dispose()` to remove it.
+ * `testOnly` is the documented test seam of E2-22; production never passes it.
  */
-export function createCccConfinedBashOperations(input: CccConfinedShellInput): BashOperations {
-  return confinedOperations(input, { requireQualification: true });
+export function createCccConfinedBashOperations(
+  input: CccConfinedShellInput,
+  testOnly?: CccConfinedShellTestOnly,
+): CccConfinedBashOperations {
+  return confinedOperations(input, { requireQualification: true, ...(testOnly ? { testOnly } : {}) });
 }
 
 const QUALIFICATION_LIMITS: CccConfinementLimits = {
@@ -1466,12 +1801,18 @@ async function killRecordedEscaper(pid: number, marker: string): Promise<void> {
  *
  * E1-19: the env probe plants its canary in the controller's own environment
  * and requires every name inside to be sealed or added by bash. E1-20: escaper
- * pids are recorded outside the throwing helper, and `finally` sweeps the
- * instance and kills any recorded pid that still runs from this scratch.
+ * pids are recorded outside the throwing helper, and `finally` disposes the
+ * instance (one more sweep, then the clone is removed) and kills any recorded
+ * pid that still runs from this scratch.
+ *
+ * E2-11/E2-21: `testOnly` lets a test swap the sealed-environment builder (to
+ * prove env-scrubbed fails on a leak) or the sweep's lsof. Production never
+ * passes it; a qualification receipt made with it proves nothing.
  */
 export async function qualifyCccConfinedShell(i: Readonly<{
   toolchain: CccSealedToolchain;
   scratchRoot: string;
+  testOnly?: CccConfinedShellTestOnly;
 }>): Promise<CccConfinementQualificationV1> {
   const base = realpathSync(await mkdtemp(join(cccCanonicalExistingPath(i.scratchRoot, "qualification scratch root"), "ccc-qual-")));
   const worktree = join(base, "worktree");
@@ -1496,7 +1837,7 @@ export async function qualifyCccConfinedShell(i: Readonly<{
   const listeners: CountingListener[] = [];
   let sleeper: SupervisedChild | undefined;
   const escapers: number[] = [];
-  let operations: BashOperations | undefined;
+  let operations: CccConfinedBashOperations | undefined;
   try {
     const admitted = await countingListener(await acquireCccSemanticProofLoopbackPort());
     listeners.push(admitted);
@@ -1507,7 +1848,7 @@ export async function qualifyCccConfinedShell(i: Readonly<{
       worktreeRoot: worktree,
       gitDirs: [],
       writeRoots: [join(worktree, "src")],
-      deniedNames: DEFAULT_DENIED_NAMES,
+      deniedNames: CCC_CONFINED_DEFAULT_DENIED_NAMES,
       deniedRoots: [],
       scratchRoot: shellScratch,
       toolchain: i.toolchain,
@@ -1515,7 +1856,7 @@ export async function qualifyCccConfinedShell(i: Readonly<{
       loopbackPort: admitted.port,
       limits: QUALIFICATION_LIMITS,
       qualification: { receiptSha256: "0".repeat(64), profileTemplateSha256: CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256, osBuild: readCccConfinementOsBuild() },
-    }, { requireQualification: false });
+    }, { requireQualification: false, ...(i.testOnly ? { testOnly: i.testOnly } : {}) });
     operations = confined;
     // Never throws: output gathered before a failure is still scanned for escaper pids.
     const run = async (command: string): Promise<Readonly<{ output: string; error: unknown }>> => {
@@ -1605,7 +1946,8 @@ export async function qualifyCccConfinedShell(i: Readonly<{
       }
     });
     const escaperReaped = await probe(async () => {
-      // First line: the in-sandbox reaper kills a detached escaper and lists it.
+      // A detached escaper: the in-sandbox reaper stops it, the controller sees it running from the clone,
+      // kills it and lists it.
       const first = await run(escaperProbeCommand("src/qualification-escaper-1.pid"));
       const firstPid = recordedPid(first.output, "src/qualification-escaper-1.pid");
       if (first.error !== null || !Number.isSafeInteger(firstPid) || firstPid <= 1) return false;
@@ -1635,7 +1977,7 @@ export async function qualifyCccConfinedShell(i: Readonly<{
     };
   } finally {
     sleeper?.kill("SIGKILL");
-    if (operations) await instanceSweeps.get(operations)?.().catch(() => null);
+    if (operations) await operations.dispose().catch(() => undefined);
     for (const pid of new Set(escapers)) await killRecordedEscaper(pid, base);
     await Promise.all(listeners.map((listener) => new Promise<void>((resolveClose) => listener.server.close(() => resolveClose()))));
     await rm(base, { recursive: true, force: true });

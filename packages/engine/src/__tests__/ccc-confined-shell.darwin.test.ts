@@ -24,25 +24,40 @@ override the bash and git lookups. Commands use bash builtins and node where a
 platform utility used to serve, because coreutils' sealed names carry their `g`
 prefix. Escapers carry a per-run token so cleanup kills only processes this file
 started, and their pids are recorded outside any throwing helper (E1-20).
+
+FNXC:CccConfinedShell 2026-10-14-13:36:
+Errata E2 (final repair). The env probe's ability to catch a leak is proven with
+the test-only `sealedEnvironment` seam (E2-21). The sweep's lsof is absolute and
+a missing, failing or garbled lsof can never confirm a closure (E2-22, through
+the test-only `lsofPath` seam). One exported write predicate decides `.git`
+segments and denied names for both shells (E2-23). The clone lives at
+`<scratch>/toolchains/<instance>/bin`, is write-denied, and `dispose` removes it
+(E2-24). Sealed utilities may carry a PATH name, so `gcat` runs as `cat`, and
+platform binaries refuse with their own reason (E2-25). The closure record lists
+only processes the controller saw running from the clone, so the foreign zombie
+the in-sandbox reaper can signal (P7) never appears in it (E2-26c).
 */
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { acquireCccSemanticProofLoopbackPort } from "../ccc-campaign-proof-sandbox.js";
 import {
+  CCC_CONFINED_DEFAULT_DENIED_NAMES,
   CCC_CONFINED_SHELL_SEALED_ENV_KEYS,
   CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL,
   CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256,
   CccConfinementClosureError,
   CccConfinementRefusedError,
   buildCccWriterShellDarwinProfile,
+  cccConfinedEffectiveDeniedNames,
   cccConfinedShellLastClosure,
+  cccConfinedWriteRefusal,
   createCccConfinedBashOperations,
   qualifyCccConfinedShell,
   readCccConfinementOsBuild,
@@ -268,6 +283,34 @@ function fileSize(path: string): number {
   } catch {
     return -1;
   }
+}
+
+/** The per-instance clone node the command ran, as printed by `EXEC <path>`. */
+const PRINT_EXEC = `node -e 'console.log("EXEC "+process.execPath)'`;
+function printedExec(output: string): string {
+  return /EXEC (\S+)/u.exec(output)?.[1] ?? "";
+}
+
+/**
+ * A zombie outside the sandbox: bash forks a child that exits at once, then
+ * execs sleep, which never waits for it. The holder is returned for cleanup.
+ */
+async function holdForeignZombie(): Promise<{ holder: ChildProcess; zombie: number }> {
+  const holder = spawn("/bin/bash", ["-c", `(exit 0) & echo "ZOMBIE $!"; exec /bin/sleep 60 # ${RUN_TOKEN}`], { stdio: ["ignore", "pipe", "ignore"] });
+  const zombie = await new Promise<number>((resolveZombie, reject) => {
+    let text = "";
+    holder.stdout!.on("data", (chunk: Buffer) => {
+      text += chunk.toString("utf8");
+      const match = /ZOMBIE (\d+)/u.exec(text);
+      if (match) resolveZombie(Number(match[1]));
+    });
+    holder.once("exit", () => reject(new Error("zombie holder exited early")));
+  });
+  const deadline = Date.now() + 2_000;
+  while (processState(zombie) !== "zombie" && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  return { holder, zombie };
 }
 
 type Fixture = {
@@ -537,6 +580,24 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     ]);
   });
 
+  it("fails env-scrubbed, and so the qualification, when a test-only sealed-environment builder spreads process.env, while the other six probes still pass", async () => {
+    const root = realpathSync(await mkdtemp(join(tmpdir(), "ccc-confined-shell-qual-leak-")));
+    roots.push(root);
+    // E2-21: the builder runs at exec time, after the probe planted its canary in process.env.
+    const receipt = await qualifyCccConfinedShell({
+      toolchain,
+      scratchRoot: root,
+      testOnly: { sealedEnvironment: (sealed) => ({ ...(process.env as Record<string, string>), ...sealed }) },
+    });
+    const passed = new Map(receipt.probes.map((entry) => [entry.probe, entry.passed]));
+    expect(passed.get("env-scrubbed")).toBe(false);
+    expect(receipt.probes.every((entry) => entry.passed)).toBe(false);
+    // Non-vacuity: node still runs under the leaked environment, so only the leak decides env-scrubbed.
+    for (const probe of ["network-denied", "loopback-port-allowed", "outside-read-denied", "sibling-signal-denied", "denied-name-in-root", "escaper-reaped"] as const) {
+      expect(passed.get(probe)).toBe(true);
+    }
+  });
+
   it("writes inside a write root and scratch, and is refused in the worktree outside the write roots", async () => {
     const fx = await fixture();
     // The scratch write is guarded so an unconfined shell (the stub) cannot write into the host TMPDIR.
@@ -577,6 +638,27 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(existsSync(join(fx.worktree, "src", "pre", ".git", "config"))).toBe(false);
     expect(existsSync(join(fx.worktree, "src", "sub", ".git"))).toBe(false);
     expect(existsSync(join(fx.worktree, "src", "pre", "x.txt"))).toBe(true);
+  });
+
+  it("denies .envrc, a default name, and a caller-added name inside the sandbox, while README reads", async () => {
+    const fx = await fixture({ deniedNames: ["custom.key"] });
+    const envrcToken = `envrc-${randomBytes(6).toString("hex")}`;
+    const customToken = `custom-${randomBytes(6).toString("hex")}`;
+    await writeFile(join(fx.worktree, ".envrc"), `export X=${envrcToken}\n`);
+    await writeFile(join(fx.worktree, "custom.key"), `${customToken}\n`);
+    const command = `${readCommand(".envrc", "envrc")}; ${readCommand("custom.key", "custom")}; ${readCommand("README", "readme")}`;
+    const control = outside(command, fx.worktree);
+    expect(control.output).toContain(envrcToken);
+    expect(control.output).toContain(customToken);
+
+    const ops = createCccConfinedBashOperations(fx.input);
+    const confined = await run(ops, command, fx.worktree);
+    expect(confined.output).not.toContain(envrcToken);
+    expect(confined.output).toContain("envrc-rc=1");
+    expect(confined.output).not.toContain(customToken);
+    expect(confined.output).toContain("custom-rc=1");
+    expect(confined.output).toContain(fx.readmeToken);
+    expect(confined.output).toContain("readme-rc=0");
   });
 
   it("keeps .env unreadable when the caller passes no denied names, while README reads", async () => {
@@ -637,6 +719,96 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(launched).not.toBe(toolchain.node.path);
   });
 
+  it("lays the per-instance clone out at <scratch>/toolchains/<instance>/bin and denies writes anywhere under toolchains from inside, while the scratch home writes", async () => {
+    const fx = await fixture();
+    const ops = createCccConfinedBashOperations(fx.input);
+    const command = [
+      PRINT_EXEC,
+      `echo planted > "$(dirname "$(command -v node)")/planted"; echo "bin-write-rc=$?"`,
+      `mkdir "$HOME/../toolchains/other"; echo "toolchains-mkdir-rc=$?"`,
+      `echo home > "$HOME/ok.txt"; echo "home-rc=$?"`,
+    ].join("; ");
+    const confined = await run(ops, command, fx.worktree);
+    const execPath = printedExec(confined.output);
+    const toolchains = join(fx.input.scratchRoot, "toolchains");
+    expect(execPath).toMatch(new RegExp(`^${toolchains.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[0-9a-f]{16}/bin/node$`, "u"));
+    expect(confined.output).toContain("bin-write-rc=1");
+    expect(confined.output).toContain("toolchains-mkdir-rc=1");
+    expect(confined.output).toContain("home-rc=0");
+    expect(existsSync(join(dirname(execPath), "planted"))).toBe(false);
+    expect(existsSync(join(toolchains, "other"))).toBe(false);
+    expect(readFileSync(join(fx.input.scratchRoot, "home", "ok.txt"), "utf8")).toBe("home\n");
+  });
+
+  it("dispose removes only its own instance clone, is idempotent, and makes a later exec refuse, while another instance on the same scratch keeps running", async () => {
+    const fx = await fixture();
+    const ops = createCccConfinedBashOperations(fx.input);
+    const sibling = createCccConfinedBashOperations(fx.input);
+    const instanceDir = dirname(dirname(printedExec((await run(ops, PRINT_EXEC, fx.worktree)).output)));
+    const siblingDir = dirname(dirname(printedExec((await run(sibling, PRINT_EXEC, fx.worktree)).output)));
+    expect(instanceDir).not.toBe(siblingDir);
+    expect(existsSync(instanceDir)).toBe(true);
+
+    await ops.dispose();
+    await ops.dispose();
+    expect(existsSync(instanceDir)).toBe(false);
+    expect(existsSync(siblingDir)).toBe(true);
+    const after = await settle(ops, "echo after-dispose", fx.worktree);
+    expect(after.error).toBeInstanceOf(CccConfinementRefusedError);
+    expect((after.error as CccConfinementRefusedError).reason).toBe("instance-disposed");
+    expect(after.output).toBe("");
+    expect((await run(sibling, "echo sibling-runs", fx.worktree)).output).toBe("sibling-runs\n");
+    await sibling.dispose();
+    expect(existsSync(siblingDir)).toBe(false);
+  });
+
+  it("runs a utility sealed from gcat under the name cat, while without the name only gcat is on PATH", async () => {
+    const gcat = hostCoreutil("cat");
+    const named = await sealCccToolchain({
+      bash: toolchain.bash.path,
+      sh: toolchain.sh.path,
+      node: process.execPath,
+      git: toolchain.git.path,
+      utilities: [{ path: gcat, name: "cat" }],
+    });
+    expect(named.utilities).toEqual([{ path: gcat, sha256: createHash("sha256").update(readFileSync(gcat)).digest("hex"), name: "cat" }]);
+    expect(named.toolchainSha256).not.toBe(toolchain.toolchainSha256);
+    const command = `cat README; echo "cat-rc=$?"; command -v gcat; echo "gcat-lookup-rc=$?"`;
+
+    const fx = await fixture({ toolchain: named });
+    const confined = await run(createCccConfinedBashOperations(fx.input), command, fx.worktree);
+    expect(confined.output).toContain(fx.readmeToken);
+    expect(confined.output).toContain("cat-rc=0");
+    expect(confined.output).toContain("gcat-lookup-rc=1");
+
+    // Control: the unnamed seal of the same binary appears only as gcat.
+    const plain = await fixture();
+    const unnamed = await run(createCccConfinedBashOperations(plain.input), command, plain.worktree);
+    expect(unnamed.output).not.toContain(plain.readmeToken);
+    expect(unnamed.output).toContain("cat-rc=127");
+    expect(unnamed.output).toContain("gcat-lookup-rc=0");
+  });
+
+  it("keeps a foreign zombie the in-sandbox reaper can signal out of the closure record, while a real escaper in the same command is listed", async () => {
+    const fx = await fixture();
+    const { holder, zombie } = await holdForeignZombie();
+    sleepers.push(holder);
+    expect(processState(zombie)).toBe("zombie");
+    const ops = createCccConfinedBashOperations(fx.input);
+    // Positive control for P7: from inside, the foreign zombie answers signal 0, so the reaper's sweep sees it,
+    // while its live parent outside the sandbox does not.
+    const confined = await settle(ops, `kill -0 ${zombie}; echo "zombie-rc=$?"; kill -0 ${holder.pid}; echo "holder-rc=$?"; node esc.js src/hb-z`, fx.worktree);
+    const [escaperPid] = track(confined.output);
+    expect(confined.error).toBeNull();
+    expect(confined.output).toContain("zombie-rc=0");
+    expect(confined.output).toContain("holder-rc=1");
+    expect(escaperPid).toBeGreaterThan(1);
+    expect(confined.closure!.killed).toContain(escaperPid);
+    expect(confined.closure!.killed).not.toContain(zombie);
+    expect(processState(zombie)).toBe("zombie");
+    expect(await waitUntilNotAlive(escaperPid!, 2_000)).not.toBe("alive");
+  });
+
   it("caps output at maxOutputBytes with a truncation marker and still confirms closure", async () => {
     const fx = await fixture({ limits: { ...LIMITS, maxOutputBytes: 4_096 } });
     const ops = createCccConfinedBashOperations(fx.input);
@@ -677,11 +849,30 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     // bash's job report echoes the command text, so match the program's own output line only.
     expect(busy.output).not.toMatch(/^loop-finished$/mu);
     expect(busy.output).toContain("loop-rc=152");
+    // E2-26a: a pure user-mode loop that never ends by itself is also stopped by SIGXCPU (128 + 24),
+    // well before the 20 s wall bound this exec sets.
+    const pure = await run(ops, `node -e 'for(;;){}'; echo "pure-rc=$?"`, fx.worktree, { timeout: 20 });
+    expect(pure.output).toContain("pure-rc=152");
 
     const control = createCccConfinedBashOperations({ ...fx.input, limits: LIMITS });
     const short = await run(control, `node -e '${cpuLoop(1.5e6)}'; echo "loop-rc=$?"`, fx.worktree);
     expect(short.output).toMatch(/^loop-finished$/mu);
     expect(short.output).toContain("loop-rc=0");
+  });
+
+  it("stops a loop that makes a syscall on every pass, which RLIMIT_CPU does not stop on macOS, at the wall timeout with closure confirmed", async () => {
+    const fx = await fixture({ limits: { ...LIMITS, cpuSeconds: 1 } });
+    const ops = createCccConfinedBashOperations(fx.input);
+    const started = Date.now();
+    const result = await settle(ops, `node -e 'console.log("BURNER "+process.pid);for(;;){process.getuid()}'`, fx.worktree, { timeout: 3 });
+    expect(result.error).toBeInstanceOf(Error);
+    expect(String((result.error as Error).message)).toBe("timeout:3");
+    expect(Date.now() - started).toBeLessThan(20_000);
+    const burner = Number(/BURNER (\d+)/u.exec(result.output)?.[1]);
+    expect(burner).toBeGreaterThan(1);
+    expect(result.closure).not.toBeNull();
+    expect(result.closure!.killed).toContain(burner);
+    expect(await waitUntilNotAlive(burner, 2_000)).not.toBe("alive");
   });
 
   it("confirms a normal command's closure with zero survivors", async () => {
@@ -692,9 +883,30 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(confined.closure).not.toBeNull();
     expect(confined.closure!.passes).toBeGreaterThanOrEqual(2);
     expect(confined.closure!.persistent).toEqual([]);
-    // The in-sandbox reaper can list a foreign zombie, which answers signal 0 (review probe P7);
-    // what matters is that nothing it or the controller listed is still running.
+    // The record lists only processes the controller saw running from the clone (E2-26c); none survives.
     for (const pid of confined.closure!.killed) expect(processState(pid)).not.toBe("alive");
+  });
+
+  it("reports CLOSURE_UNCONFIRMED when the sweep's lsof exits 1 or prints unparseable output, while the real lsof confirms the same command", async () => {
+    const fx = await fixture();
+    const exitOne = join(fx.root, "lsof-exit-1");
+    const garbled = join(fx.root, "lsof-garbled");
+    await writeFile(exitOne, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    await writeFile(garbled, `#!/bin/sh\necho "p$PPID"\necho "not an lsof field"\nexit 1\n`, { mode: 0o755 });
+
+    const control = await settle(createCccConfinedBashOperations(fx.input), "echo sweep-real", fx.worktree);
+    expect(control.error).toBeNull();
+    expect(control.output).toBe("sweep-real\n");
+    expect(control.closure).not.toBeNull();
+
+    for (const lsofPath of [exitOne, garbled]) {
+      const ops = createCccConfinedBashOperations(fx.input, { lsofPath });
+      const result = await settle(ops, "echo sweep-stub", fx.worktree);
+      expect(result.output).toBe("sweep-stub\n");
+      expect(result.error).toBeInstanceOf(CccConfinementClosureError);
+      expect((result.error as CccConfinementClosureError).code).toBe("CCC_CONFINEMENT_CLOSURE_UNCONFIRMED");
+      expect(result.closure).toBeNull();
+    }
   });
 
   it("kills a setsid escaper, an argv[0]-spoofed escaper and a symlink-launched escaper from outside the sandbox after the command kills its reaper", async () => {
@@ -792,6 +1004,68 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(material.some((part) => part.includes('#"/\\.env(/.*)?$"'))).toBe(true);
     expect(material.some((part) => part.includes('"GIT_CONFIG_GLOBAL":"/dev/null"'))).toBe(true);
     expect(material.some((part) => part.includes("(allow network-outbound (remote tcp \"localhost:"))).toBe(true);
+    expect(material.some((part) => part.includes('(deny file-write* (subpath "/ccc-sentinel/scratch/toolchains"))'))).toBe(true);
+  });
+
+  describe("shared write predicate", () => {
+    let root: string;
+    let srcRoot: string;
+
+    beforeAll(async () => {
+      root = realpathSync(await mkdtemp(join(tmpdir(), "ccc-confined-shell-predicate-")));
+      roots.push(root);
+      srcRoot = join(root, "wt", "src");
+      await Promise.all([mkdir(srcRoot, { recursive: true }), mkdir(join(root, "outside"), { recursive: true })]);
+      await symlink(join(root, "outside"), join(srcRoot, "escape"));
+    });
+
+    it("exports the default denied names as a frozen superset of the planning list plus .envrc", () => {
+      expect([...CCC_CONFINED_DEFAULT_DENIED_NAMES]).toEqual([".agentsecrets", ".env", ".env.*", ".envrc", ".npmrc", "_secrets"]);
+      expect(Object.isFrozen(CCC_CONFINED_DEFAULT_DENIED_NAMES)).toBe(true);
+    });
+
+    it("unions caller names with the defaults, folding case and de-duplicating, so a caller cannot drop .env", () => {
+      expect(cccConfinedEffectiveDeniedNames([])).toEqual(CCC_CONFINED_DEFAULT_DENIED_NAMES);
+      expect(cccConfinedEffectiveDeniedNames([".ENV", "Custom.Key", "custom.key", ".npmrc"]))
+        .toEqual([".agentsecrets", ".env", ".env.*", ".envrc", ".npmrc", "_secrets", "custom.key"]);
+      expect(() => cccConfinedEffectiveDeniedNames(["a/b"])).toThrow(/single path component/u);
+      expect(() => cccConfinedEffectiveDeniedNames([".."])).toThrow(/single path component/u);
+    });
+
+    it("refuses a path outside the write roots, including through .., a symlink or a relative spelling, while a path inside a root is admitted", () => {
+      const refusal = (path: string) => cccConfinedWriteRefusal({ path, writeRoots: [srcRoot], deniedNames: [] });
+      expect(refusal(join(srcRoot, "a.mjs"))).toBeNull();
+      expect(refusal(join(srcRoot, "new-dir", "b.mjs"))).toBeNull();
+      expect(refusal(join(root, "wt", "SRC", "case.mjs"))).toBeNull();
+      expect(refusal(join(root, "wt", "docs", "a.md"))).toBe("outside-write-roots");
+      expect(refusal(`${srcRoot}/../docs/a.md`)).toBe("outside-write-roots");
+      expect(refusal(join(srcRoot, "escape", "a.txt"))).toBe("outside-write-roots");
+      expect(refusal("src/a.mjs")).toBe("outside-write-roots");
+      expect(cccConfinedWriteRefusal({ path: join(srcRoot, "a.mjs"), writeRoots: [], deniedNames: [] })).toBe("outside-write-roots");
+    });
+
+    it("refuses a .git segment in any case, while a sibling ordinary file is admitted", () => {
+      const refusal = (path: string) => cccConfinedWriteRefusal({ path, writeRoots: [srcRoot], deniedNames: [] });
+      expect(refusal(join(srcRoot, "sub", ".git", "config"))).toBe("git-segment");
+      expect(refusal(join(srcRoot, ".git"))).toBe("git-segment");
+      expect(refusal(join(srcRoot, "sub", ".GIT", "hooks", "post-checkout"))).toBe("git-segment");
+      expect(refusal(join(srcRoot, "sub", "config"))).toBeNull();
+      expect(refusal(join(srcRoot, ".gitignore"))).toBeNull();
+      expect(refusal(join(srcRoot, "x.git"))).toBeNull();
+    });
+
+    it("refuses every effective denied name as the basename or any segment, folding case like K1, while near-miss names are admitted", () => {
+      const refusal = (path: string, deniedNames: readonly string[] = []) => cccConfinedWriteRefusal({ path, writeRoots: [srcRoot], deniedNames });
+      for (const denied of [".env", ".env.local", ".ENV.Production", ".envrc", ".npmrc", ".NPMRC", ".agentsecrets", "_secrets/x", "_SECRETS/deep/x", "_ſecrets/x"]) {
+        expect(refusal(join(srcRoot, denied))).toBe("denied-name");
+      }
+      expect(refusal(join(srcRoot, "keys", "custom.key"), ["custom.key"])).toBe("denied-name");
+      expect(refusal(join(srcRoot, "keys", "CUSTOM.KEY"), ["custom.key"])).toBe("denied-name");
+      for (const admitted of ["env.mjs", "secrets-guide.md", ".environment", "my.env", "npmrc.txt", "_secrets_note.md"]) {
+        expect(refusal(join(srcRoot, admitted))).toBeNull();
+      }
+      expect(refusal(join(srcRoot, "keys", "custom.key"))).toBeNull();
+    });
   });
 
   describe("refuses before any spawn", () => {
@@ -832,6 +1106,71 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       expect((await sealCccToolchain(inputs)).toolchainSha256).toBe(toolchain.toolchainSha256);
       await expect(sealCccToolchain({ ...inputs, bash: "/bin/bash" })).rejects.toThrow(/platform binary/u);
       await expect(sealCccToolchain({ ...inputs, utilities: ["/bin/cat"] })).rejects.toThrow(/platform binary/u);
+      await expect(sealCccToolchain({ ...inputs, utilities: ["/bin/cat"] })).rejects.toMatchObject({
+        code: "CCC_CONFINEMENT_REFUSED",
+        reason: "platform-binary-in-toolchain",
+      });
+    });
+
+    it("refuses a sealed record naming an Apple platform binary as platform-binary-in-toolchain, while the Homebrew toolchain is admitted", async () => {
+      const fx = await fixture();
+      expect(refusalReason(() => createCccConfinedBashOperations(fx.input))).toBeNull();
+      const platformCat = { path: "/bin/cat", sha256: createHash("sha256").update(readFileSync("/bin/cat")).digest("hex") };
+      const forged: CccSealedToolchain = { ...toolchain, utilities: [...toolchain.utilities, platformCat] };
+      expect(refusalReason(() => createCccConfinedBashOperations({ ...fx.input, toolchain: forged })))
+        .toBe("platform-binary-in-toolchain");
+    });
+
+    it("refuses a duplicate effective PATH name, a role collision and a malformed name as toolchain-digest-drift, while distinct names seal", async () => {
+      const inputs = {
+        bash: toolchain.bash.path,
+        sh: toolchain.sh.path,
+        node: process.execPath,
+        git: toolchain.git.path,
+      };
+      const gcat = hostCoreutil("cat");
+      const gls = hostCoreutil("ls");
+      const distinct = await sealCccToolchain({ ...inputs, utilities: [{ path: gcat, name: "cat" }, { path: gls, name: "ls" }, gcat] });
+      expect(distinct.utilities.map((utility) => utility.name ?? utility.path)).toEqual(expect.arrayContaining(["cat", "ls", gcat]));
+      for (const utilities of [
+        [{ path: gcat, name: "ls" }, { path: gls, name: "ls" }],
+        [{ path: gcat, name: "gls" }, gls],
+        [{ path: gcat, name: "bash" }],
+      ]) {
+        await expect(sealCccToolchain({ ...inputs, utilities })).rejects.toMatchObject({ reason: "toolchain-digest-drift" });
+      }
+      for (const name of ["", ".", "..", "a/b", "x".repeat(65), "cat\u0000"]) {
+        await expect(sealCccToolchain({ ...inputs, utilities: [{ path: gcat, name }] })).rejects.toMatchObject({ reason: "toolchain-digest-drift" });
+      }
+    });
+
+    it("refuses creation as closure-sweep-unavailable when the sweep's lsof is missing, relative or not executable, while the absolute /usr/sbin/lsof is admitted", async () => {
+      const fx = await fixture();
+      expect(refusalReason(() => createCccConfinedBashOperations(fx.input))).toBeNull();
+      const notExecutable = join(fx.root, "lsof-not-executable");
+      await writeFile(notExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+      for (const lsofPath of [join(fx.root, "lsof-missing"), "lsof", notExecutable, fx.root]) {
+        expect(refusalReason(() => createCccConfinedBashOperations(fx.input, { lsofPath }))).toBe("closure-sweep-unavailable");
+      }
+      const qualificationRoot = realpathSync(await mkdtemp(join(tmpdir(), "ccc-confined-shell-qual-nolsof-")));
+      roots.push(qualificationRoot);
+      await expect(qualifyCccConfinedShell({ toolchain, scratchRoot: qualificationRoot, testOnly: { lsofPath: join(fx.root, "lsof-missing") } }))
+        .rejects.toMatchObject({ reason: "closure-sweep-unavailable" });
+    });
+
+    it("refuses a write root that carries a denied-name or .git segment as root-overlap, while an ordinary write root is admitted", async () => {
+      const fx = await fixture();
+      await Promise.all([
+        mkdir(join(fx.worktree, "src", "_secrets"), { recursive: true }),
+        mkdir(join(fx.worktree, "src", "pkg", ".GIT"), { recursive: true }),
+        mkdir(join(fx.worktree, "src", "pkg", "lib"), { recursive: true }),
+      ]);
+      expect(refusalReason(() => createCccConfinedBashOperations({ ...fx.input, writeRoots: [join(fx.worktree, "src", "pkg", "lib")] })))
+        .toBeNull();
+      expect(refusalReason(() => createCccConfinedBashOperations({ ...fx.input, writeRoots: [join(fx.worktree, "src", "_secrets")] })))
+        .toBe("root-overlap");
+      expect(refusalReason(() => createCccConfinedBashOperations({ ...fx.input, writeRoots: [join(fx.worktree, "src", "pkg", ".GIT")] })))
+        .toBe("root-overlap");
     });
 
     it("refuses a qualification for another OS build or profile template, while the live one is admitted", async () => {
