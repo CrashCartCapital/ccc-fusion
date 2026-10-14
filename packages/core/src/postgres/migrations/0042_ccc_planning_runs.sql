@@ -54,10 +54,14 @@ CREATE TABLE IF NOT EXISTS project.ccc_planning_runs (
   -- 0006 rebuilt tasks' key as (project_id, id) (0006_project_ownership.sql:329-356); a single-column FK cannot be
   -- created and the boot ownership audit (schema-applier.ts:640-706) refuses any key without project_id.
   -- Precedent for the deferrable composite form: 0037_ccc_campaign_governance.sql:103.
+  -- FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-60): the import key is deferrable for the same reason, and for
+  -- project-partition promotion (migration-stamping.ts rekeyFallbackProjectPartition): it treats a non-deferrable,
+  -- non-CASCADE key between two re-keyed tables as unsafe whenever either side holds a row under the stand-in project
+  -- id, so a plain ccc_prd_imports row, with no planning run at all, would make the whole project unpromotable.
   CONSTRAINT ccc_planning_runs_task_fkey FOREIGN KEY (project_id, planning_task_id)
     REFERENCES project.tasks(project_id, id) DEFERRABLE INITIALLY IMMEDIATE,
   CONSTRAINT ccc_planning_runs_import_fkey FOREIGN KEY (project_id, import_id)
-    REFERENCES project.ccc_prd_imports(project_id, import_id),
+    REFERENCES project.ccc_prd_imports(project_id, import_id) DEFERRABLE INITIALLY IMMEDIATE,
   CONSTRAINT ccc_planning_runs_run_id_check CHECK (run_id ~ '^ccc-plan:[0-9a-f]{24}$'),
   CONSTRAINT ccc_planning_runs_mode_check CHECK (mode IN ('spec', 'build')),
   CONSTRAINT ccc_planning_runs_budget_profile_check CHECK (budget_profile IN ('standard', 'large')),
@@ -69,6 +73,11 @@ CREATE TABLE IF NOT EXISTS project.ccc_planning_runs (
     AND (import_intent_digest IS NULL OR import_intent_digest ~ '^[a-f0-9]{64}$')),
   CONSTRAINT ccc_planning_runs_base_check CHECK (admitted_base ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'),
   CONSTRAINT ccc_planning_runs_request_bytes_check CHECK (request_bytes BETWEEN 1 AND 4194304),
+  -- FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-64): the guard casts deadline_at with ::timestamptz, and PostgreSQL
+  -- reads 'tomorrow' and 'infinity' as valid timestamps, which would make the spend and amendment checks a moving or
+  -- absent backstop. Only the ISO-8601 UTC form that Date.prototype.toISOString writes is stored.
+  CONSTRAINT ccc_planning_runs_deadline_check CHECK (
+    deadline_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$'),
   CONSTRAINT ccc_planning_runs_sequence_check CHECK (
     revision BETWEEN 1 AND 999 AND amendment_seq >= 0 AND control_seq >= 0),
   CONSTRAINT ccc_planning_runs_state_check CHECK (state IN (
@@ -166,15 +175,21 @@ BEGIN
     RAISE EXCEPTION 'CCC_PLANNING_RUN_TERMINAL: run % is %', OLD.run_id, OLD.state USING ERRCODE = 'check_violation';
   END IF;
 
-  IF NEW.project_id <> OLD.project_id OR NEW.run_id <> OLD.run_id OR NEW.planning_task_id <> OLD.planning_task_id
-     OR NEW.mode <> OLD.mode OR NEW.budget_profile <> OLD.budget_profile OR NEW.role_profile <> OLD.role_profile
-     OR NEW.policy_version <> OLD.policy_version OR NEW.policy_digest <> OLD.policy_digest
-     OR NEW.request_digest <> OLD.request_digest OR NEW.request_bytes <> OLD.request_bytes
-     OR NEW.target_repository <> OLD.target_repository OR NEW.admitted_base <> OLD.admitted_base
-     OR NEW.authority_receipt_sha256 <> OLD.authority_receipt_sha256
-     OR NEW.authority_receipt_json <> OLD.authority_receipt_json
-     OR NEW.runtime_dist_manifest_sha256 <> OLD.runtime_dist_manifest_sha256
-     OR NEW.created_at <> OLD.created_at THEN
+  -- FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-63): IS DISTINCT FROM, never <>. An explicit NULL makes <> evaluate
+  -- to NULL, not true, and 0006 notes that legacy stores do send NULL project ids. Every column here is NOT NULL, so a
+  -- NULL is refused by its column constraint anyway; project_id is the one that was not, because fusion_assign_project_id
+  -- replaces a NULL with the session's project. That is also why this trigger is named zz_ccc_planning_runs_guard.
+  IF NEW.project_id IS DISTINCT FROM OLD.project_id OR NEW.run_id IS DISTINCT FROM OLD.run_id
+     OR NEW.planning_task_id IS DISTINCT FROM OLD.planning_task_id
+     OR NEW.mode IS DISTINCT FROM OLD.mode OR NEW.budget_profile IS DISTINCT FROM OLD.budget_profile
+     OR NEW.role_profile IS DISTINCT FROM OLD.role_profile
+     OR NEW.policy_version IS DISTINCT FROM OLD.policy_version OR NEW.policy_digest IS DISTINCT FROM OLD.policy_digest
+     OR NEW.request_digest IS DISTINCT FROM OLD.request_digest OR NEW.request_bytes IS DISTINCT FROM OLD.request_bytes
+     OR NEW.target_repository IS DISTINCT FROM OLD.target_repository OR NEW.admitted_base IS DISTINCT FROM OLD.admitted_base
+     OR NEW.authority_receipt_sha256 IS DISTINCT FROM OLD.authority_receipt_sha256
+     OR NEW.authority_receipt_json IS DISTINCT FROM OLD.authority_receipt_json
+     OR NEW.runtime_dist_manifest_sha256 IS DISTINCT FROM OLD.runtime_dist_manifest_sha256
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
     RAISE EXCEPTION 'CCC_PLANNING_ANCHOR_IMMUTABLE: run % identity is immutable', OLD.run_id
       USING ERRCODE = 'check_violation';
   END IF;
@@ -252,8 +267,10 @@ BEGIN
   RETURN NEW;
 END $$;
 
+-- BEFORE row triggers fire in name order; 'zz_' runs after fusion_assign_project_id, as 0043's guard does (errata E2-63).
 DROP TRIGGER IF EXISTS ccc_planning_runs_guard ON project.ccc_planning_runs;
-CREATE TRIGGER ccc_planning_runs_guard
+DROP TRIGGER IF EXISTS zz_ccc_planning_runs_guard ON project.ccc_planning_runs;
+CREATE TRIGGER zz_ccc_planning_runs_guard
   BEFORE INSERT OR UPDATE ON project.ccc_planning_runs
   FOR EACH ROW EXECUTE FUNCTION project.ccc_planning_runs_guard();
 

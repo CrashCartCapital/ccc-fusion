@@ -237,6 +237,70 @@ pgDescribe("run-audit deterministic planning event ids (PostgreSQL)", () => {
     expect(await auditRows(campaignEvent.runId)).toEqual([expect.objectContaining({ id: recorded.id, timestamp: T1 })]);
   });
 
+  /*
+  FNXC:CccPlanningAuditEventId 2026-10-14-13:36 (errata E2-62):
+  The planning events carry optional metadata keys (evidenceDigest, effectiveRoute,
+  refusal) that a writer sets to undefined when it has nothing to say. jsonb drops
+  them on the first write, so the first write has to drop them from the compared
+  event too; otherwise an exact crash-recovery replay throws a plain Error from the
+  canonical-JSON check instead of returning the persisted event. Any other value
+  that is not JSON is refused on the first write, before an INSERT, so a replay can
+  never meet a payload the first write accepted.
+  */
+  it("replays an exact event whose optional metadata fields are undefined as the persisted event, with those fields dropped as jsonb drops them", async () => {
+    const first = planningEvent({
+      metadata: {
+        outcome: "committed",
+        evidenceDigest: undefined,
+        refusal: undefined,
+        nested: { effectiveRoute: undefined, kept: 1 },
+        list: [{ dropped: undefined, kept: 2 }],
+      },
+    });
+    const recorded = await recordRunAuditEvent(h.layer(), first);
+    const stored = { outcome: "committed", nested: { kept: 1 }, list: [{ kept: 2 }] };
+    expect(recorded.metadata).toStrictEqual(stored);
+
+    const replayed = await recordRunAuditEvent(h.layer(), { ...first, timestamp: T2 });
+    expect(replayed).toStrictEqual(recorded);
+    expect(replayed.timestamp).toBe(T1);
+    const rows = await auditRows(first.runId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.metadata).toStrictEqual(stored);
+
+    // Control: a field that is defined is a different payload, not an ignored one.
+    const collision = recordRunAuditEvent(h.layer(), {
+      ...first,
+      metadata: { ...first.metadata, evidenceDigest: "d".repeat(64) },
+    });
+    await expect(collision).rejects.toBeInstanceOf(RunAuditEventCollisionError);
+    expect(await auditRows(first.runId)).toHaveLength(1);
+  });
+
+  it.each([
+    ["a Date", () => ({ publishedAt: new Date(T1) })],
+    ["a BigInt", () => ({ amount: BigInt(10) })],
+    ["a non-finite number", () => ({ ratio: Number.NaN })],
+    ["an undefined array element", () => ({ list: [1, undefined] })],
+    ["a class instance", () => ({ holder: new (class Holder { readonly value = 1; })() })],
+  ] as const)(
+    "refuses %s in metadata on the first write with no row written; the same event with JSON values is admitted",
+    async (_label, badMetadata) => {
+      const event = planningEvent();
+      const refusal = recordRunAuditEvent(h.layer(), { ...event, metadata: badMetadata() as Record<string, unknown> });
+      await expect(refusal).rejects.toBeInstanceOf(TypeError);
+      await expect(refusal).rejects.toThrow(/run-audit planning event metadata must be canonical JSON/);
+      expect(await auditRows(event.runId)).toEqual([]);
+
+      // Control: the same id and run with plain JSON metadata is written once and replays.
+      const admitted = await recordRunAuditEvent(h.layer(), { ...event, metadata: { list: [1, null], at: T1 } });
+      expect(admitted.id).toBe(event.eventId);
+      await expect(recordRunAuditEvent(h.layer(), { ...event, metadata: { list: [1, null], at: T1 }, timestamp: T2 }))
+        .resolves.toStrictEqual(admitted);
+      expect(await auditRows(event.runId)).toHaveLength(1);
+    },
+  );
+
   it("without an eventId the legacy path is unchanged: each call writes its own random id", async () => {
     const { eventId: _eventId, ...legacy } = planningEvent();
     const first = await recordRunAuditEvent(h.layer(), legacy);

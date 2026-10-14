@@ -33,6 +33,11 @@ import {
   getAppliedMigrations,
   SCHEMA_BASELINE_VERSION,
 } from "../../postgres/schema-applier.js";
+import {
+  ProjectPartitionRekeyError,
+  rekeyFallbackProjectPartition,
+  selectDegradedBindTarget,
+} from "../../postgres/migration-stamping.js";
 import { projectTableNames } from "../../postgres/schema/project.js";
 import {
   cccPlanningRuns,
@@ -151,16 +156,25 @@ async function expectRefused(statement: Promise<unknown>, sqlState: string, pref
 }
 
 /**
- * FNXC:CccPlanningRuns 2026-10-14-09:24:
- * A refused privilege is SQLSTATE 42501 with PostgreSQL's own message, which
- * carries no CCC_PLANNING_ prefix because no trigger or function raised it.
+ * FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-65):
+ * A refused privilege is SQLSTATE 42501 raised by PostgreSQL itself, so it
+ * carries no CCC_PLANNING_ prefix. The match is the SQLSTATE plus the table
+ * name, never the English words around it: a server with another lc_messages
+ * still names the table in the same message and gives the same code.
  */
 async function expectPermissionDenied(statement: Promise<unknown>): Promise<void> {
   await expect(statement).rejects.toMatchObject({
     cause: expect.objectContaining({
       code: "42501",
-      message: "permission denied for table ccc_planning_runs",
+      message: expect.stringContaining("ccc_planning_runs"),
     }),
+  });
+}
+
+/** A CHECK violation raised by a named table constraint (no CCC_PLANNING_ message prefix). */
+async function expectCheckViolation(statement: Promise<unknown>, constraint: string): Promise<void> {
+  await expect(statement).rejects.toMatchObject({
+    cause: expect.objectContaining({ code: "23514", constraint_name: constraint }),
   });
 }
 
@@ -313,7 +327,8 @@ pgDescribe("ccc planning migrations 0042 and 0043 (PostgreSQL)", () => {
     return rows[0]!;
   }
 
-  function publish(a: Artifact, options: { publisher?: boolean } = {}): Promise<unknown> {
+  function publish(a: Artifact, options: { publisher?: boolean; projectId?: string } = {}): Promise<unknown> {
+    const projectId = options.projectId ?? PROJECT_A;
     return db.transaction(async (tx) => {
       if (options.publisher !== false) {
         await tx.execute(sql`SELECT set_config('fusion.ccc_planning_publication', 'on', true)`);
@@ -321,10 +336,45 @@ pgDescribe("ccc planning migrations 0042 and 0043 (PostgreSQL)", () => {
       await tx.execute(sql`
         INSERT INTO project.task_documents
           (project_id, id, task_id, key, content, revision, author, metadata, created_at, updated_at)
-        VALUES (${PROJECT_A}, ${`doc-${a.taskId}-${a.key}`}, ${a.taskId}, ${a.key}, ${a.content}, 1,
+        VALUES (${projectId}, ${`doc-${a.taskId}-${a.key}`}, ${a.taskId}, ${a.key}, ${a.content}, 1,
                 ${a.author}, ${JSON.stringify(a.metadata)}::jsonb, ${NOW}, ${NOW})
       `);
     });
+  }
+
+  /** A `ccc_prd_imports` row under any project id, with the columns the table requires. */
+  async function insertImportRow(projectId: string, importId: string, idempotencyKey: string): Promise<void> {
+    const digest = sha(`import:${projectId}:${importId}`);
+    await db.execute(sql`
+      INSERT INTO project.ccc_prd_imports (
+        project_id, idempotency_key, import_id, identity_hash, bundle_hash, packet_hash, sidecar_hash,
+        source_version, target_repository, target_base, root_dir, staging_relative_path, state,
+        canonical_bundle, transaction_witness, projection_digest, created_at, updated_at,
+        execution_policy, campaign_manifest, campaign_manifest_hash, campaign_started_at, campaign_deadline_at
+      ) VALUES (
+        ${projectId}, ${idempotencyKey}, ${importId}, ${digest}, ${digest}, ${digest}, ${digest},
+        'v1', '/private/tmp/r2c-s0-target', ${"b".repeat(40)}, '/private/tmp/r2c-s0-root', 'stage', 'prepared',
+        '{}'::jsonb, '{}'::jsonb, ${digest}, ${NOW}, ${NOW},
+        '{}'::jsonb, '{}'::jsonb, ${digest}, ${NOW}, ${FAR}
+      )
+    `);
+  }
+
+  /**
+   * Run `work` in a transaction that is always rolled back, so a test can disable a
+   * trigger or change a session role without leaving that change in the shared
+   * database. The outcome of `work` is returned either way.
+   */
+  async function inRolledBackTransaction<T>(work: (tx: Transaction) => Promise<T>): Promise<T> {
+    const rollback = new Error("rolled back by the test");
+    let outcome: { value: T } | undefined;
+    await db.transaction(async (tx) => {
+      outcome = { value: await work(tx) };
+      throw rollback;
+    }).catch((error: unknown) => {
+      if (error !== rollback) throw error;
+    });
+    return outcome!.value;
   }
 
   async function insertWorkItem(input: {
@@ -447,6 +497,218 @@ pgDescribe("ccc planning migrations 0042 and 0043 (PostgreSQL)", () => {
          WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
       `);
       expect(await readRun(runId)).toMatchObject({ review_epochs: 1, stagnant_epochs: 1 });
+    });
+
+    /*
+    FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-63):
+    `NEW.project_id <> OLD.project_id` is NULL, not true, when a writer sends an
+    explicit NULL, and the guard used to sort before fusion_assign_project_id,
+    which then replaced that NULL with the session's project. Together they let
+    `SET project_id = NULL` move an anchor into whatever project the session
+    named. The guard now compares with IS DISTINCT FROM and is named
+    zz_ccc_planning_runs_guard so it runs after the assign trigger, as 0043's does.
+    */
+    it("refuses SET project_id = NULL that the assign trigger resolves to another project with ANCHOR_IMMUTABLE; the explicit project change is refused alike and NULL under the anchor's own project is admitted", async () => {
+      const { runId, taskId } = await admittedRun();
+      // The foreign key is satisfied in project B, so only the guard can stop the move.
+      await db.execute(sql`
+        INSERT INTO project.tasks (project_id, id, description, "column", created_at, updated_at)
+        VALUES (${PROJECT_B}, ${taskId}, 'same task id in another project', 'todo', ${NOW}, ${NOW})
+      `);
+      const underSession = (sessionProject: string, assignment: ReturnType<typeof sql>) => inRolledBackTransaction(async (tx) => {
+        await tx.execute(sql`
+          SELECT set_config('fusion.project_bypass', 'on', true), set_config('fusion.project_id', ${sessionProject}, true)
+        `);
+        await tx.execute(sql`
+          UPDATE project.ccc_planning_runs SET ${assignment}, updated_at = ${NOW}
+           WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+        `);
+        return (await tx.execute(sql`
+          SELECT project_id FROM project.ccc_planning_runs WHERE run_id = ${runId}
+        `)) as unknown as Array<{ project_id: string }>;
+      });
+
+      await expectRefused(underSession(PROJECT_B, sql`project_id = NULL`), "23514", "CCC_PLANNING_ANCHOR_IMMUTABLE");
+      await expectRefused(underSession(PROJECT_B, sql`project_id = ${PROJECT_B}`), "23514", "CCC_PLANNING_ANCHOR_IMMUTABLE");
+      // Control: the same NULL, with the session on the anchor's own project, resolves back to that project.
+      expect(await underSession(PROJECT_A, sql`project_id = NULL`)).toEqual([{ project_id: PROJECT_A }]);
+
+      const rows = (await db.execute(sql`
+        SELECT project_id FROM project.ccc_planning_runs WHERE run_id = ${runId}
+      `)) as unknown as Array<{ project_id: string }>;
+      expect(rows).toEqual([{ project_id: PROJECT_A }]);
+    });
+
+    it("refuses a NULL project_id that reaches the guard with ANCHOR_IMMUTABLE even when no trigger fills it in; the unchanged project_id is admitted", async () => {
+      const { runId } = await admittedRun();
+      const withoutAssignTrigger = (assignment: ReturnType<typeof sql>) => inRolledBackTransaction(async (tx) => {
+        await tx.execute(sql`ALTER TABLE project.ccc_planning_runs DISABLE TRIGGER fusion_assign_project_id`);
+        await tx.execute(sql`
+          UPDATE project.ccc_planning_runs SET ${assignment}, updated_at = ${NOW}
+           WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+        `);
+        return (await tx.execute(sql`
+          SELECT project_id FROM project.ccc_planning_runs WHERE run_id = ${runId}
+        `)) as unknown as Array<{ project_id: string }>;
+      });
+
+      await expectRefused(withoutAssignTrigger(sql`project_id = NULL`), "23514", "CCC_PLANNING_ANCHOR_IMMUTABLE");
+      expect(await withoutAssignTrigger(sql`project_id = ${PROJECT_A}`)).toEqual([{ project_id: PROJECT_A }]);
+
+      const triggers = (await db.execute(sql`
+        SELECT tgname, tgenabled FROM pg_trigger
+         WHERE tgrelid = 'project.ccc_planning_runs'::regclass AND tgname = 'fusion_assign_project_id'
+      `)) as unknown as Array<{ tgname: string; tgenabled: string }>;
+      expect(triggers).toEqual([{ tgname: "fusion_assign_project_id", tgenabled: "O" }]);
+    });
+  });
+
+  describe("0042 deadline check", () => {
+    /*
+    FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-64):
+    deadline_at is text, and the spend and amendment checks cast it with
+    ::timestamptz. PostgreSQL reads 'tomorrow' and 'infinity' as valid
+    timestamps, so an unchecked deadline would be a moving or absent backstop.
+    The column now accepts only the ISO-8601 UTC form toISOString() writes.
+    */
+    it.each(["tomorrow", "infinity"] as const)(
+      "refuses the relative or unbounded deadline_at '%s' on insert with the deadline check; an ISO toISOString() deadline is admitted",
+      async (deadline) => {
+        const taskId = await insertTask();
+        await expectCheckViolation(
+          db.insert(cccPlanningRuns).values(anchorValues(nextRunId(), taskId, { deadlineAt: deadline })),
+          "ccc_planning_runs_deadline_check",
+        );
+
+        const runId = nextRunId();
+        const iso = new Date(Date.now() + 86_400_000).toISOString();
+        await db.insert(cccPlanningRuns).values(anchorValues(runId, taskId, { deadlineAt: iso }));
+        const rows = (await db.execute(sql`
+          SELECT deadline_at FROM project.ccc_planning_runs WHERE run_id = ${runId}
+        `)) as unknown as Array<{ deadline_at: string }>;
+        expect(rows).toEqual([{ deadline_at: iso }]);
+      },
+    );
+
+    it("refuses an enlarging amendment whose deadline_at is 'infinity' with the deadline check; the same amendment with an ISO deadline is admitted", async () => {
+      const { runId } = await admittedRun();
+      await move(runId, "running");
+      const amend = (deadline: string) => db.execute(sql`
+        UPDATE project.ccc_planning_runs
+           SET deadline_at = ${deadline}, amendment_seq = amendment_seq + 1, grant_digest = ${sha(`amend:${runId}:${deadline}`)},
+               updated_at = ${NOW}
+         WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+      `);
+
+      await expectCheckViolation(amend("infinity"), "ccc_planning_runs_deadline_check");
+      expect(await readRun(runId)).toMatchObject({ state: "running" });
+      await amend("2999-06-01T00:00:00.000Z");
+      const rows = (await db.execute(sql`
+        SELECT deadline_at, amendment_seq FROM project.ccc_planning_runs WHERE run_id = ${runId}
+      `)) as unknown as Array<{ deadline_at: string; amendment_seq: number }>;
+      expect(rows).toEqual([{ deadline_at: "2999-06-01T00:00:00.000Z", amendment_seq: 1 }]);
+    });
+  });
+
+  describe("0042 partition promotion", () => {
+    /*
+    FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-60, E2-61):
+    A project first used from an unregistered folder keeps its rows under a
+    stand-in project id until it is registered; startup then promotes them to the
+    registered id with rekeyFallbackProjectPartition. That function treats a
+    foreign key between two re-keyed tables as unsafe unless it is DEFERRABLE or
+    ON UPDATE CASCADE, so ccc_planning_runs_import_fkey has to be DEFERRABLE.
+    Planning rows themselves are never promoted: the anchor guard and the
+    cccplan- document guard are insert-once by design, so promotion refuses them
+    with a typed reason that startup answers by binding the stand-in partition.
+    */
+    function promote(standIn: string, registered: string): Promise<boolean> {
+      return rekeyFallbackProjectPartition(
+        db as unknown as Parameters<typeof rekeyFallbackProjectPartition>[0],
+        standIn,
+        registered,
+      );
+    }
+    let partitionOrdinal = 0;
+    function partitionIds(): { standIn: string; registered: string } {
+      partitionOrdinal += 1;
+      return { standIn: `r2c-s0-standin-${partitionOrdinal}`, registered: `r2c-s0-registered-${partitionOrdinal}` };
+    }
+
+    async function projectOf(table: "tasks" | "ccc_prd_imports" | "ccc_planning_runs", idColumn: string, id: string): Promise<string[]> {
+      const rows = (await db.execute(sql.raw(
+        `SELECT project_id FROM project.${table} WHERE ${idColumn} = '${id}' ORDER BY project_id`,
+      ))) as unknown as Array<{ project_id: string }>;
+      return rows.map((row) => row.project_id);
+    }
+
+    it("promotes a stand-in partition holding one ccc_prd_imports row and no planning run, with 0042 and 0043 present; the row moves to the registered id", async () => {
+      const { standIn, registered } = partitionIds();
+      const importId = `r2c-s0-import-${standIn}`;
+      await insertImportRow(standIn, importId, `${standIn}:key`);
+      expect(await projectOf("ccc_prd_imports", "import_id", importId)).toEqual([standIn]);
+
+      await expect(promote(standIn, registered)).resolves.toBe(true);
+      expect(await projectOf("ccc_prd_imports", "import_id", importId)).toEqual([registered]);
+    });
+
+    it("refuses to promote a stand-in partition holding a planning anchor with planning-rows-present and moves nothing; the same partition without the anchor is promoted", async () => {
+      const { standIn, registered } = partitionIds();
+      const taskId = await insertTask(standIn);
+      const runId = nextRunId();
+      await db.insert(cccPlanningRuns).values(anchorValues(runId, taskId, { projectId: standIn }));
+
+      const refused = await promote(standIn, registered).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(refused).toBeInstanceOf(ProjectPartitionRekeyError);
+      expect(refused).toMatchObject({ name: "ProjectPartitionRekeyError", reason: "planning-rows-present" });
+      expect(String((refused as ProjectPartitionRekeyError).details)).toContain("ccc_planning_runs");
+      // The refusal keeps the pre-write ownership, so startup binds the stand-in partition instead of refusing the project.
+      expect(selectDegradedBindTarget((refused as ProjectPartitionRekeyError).ownership)).toBe("fallback");
+      expect(await projectOf("ccc_planning_runs", "run_id", runId)).toEqual([standIn]);
+      expect(await projectOf("tasks", "id", taskId)).toEqual([standIn]);
+
+      // Control: remove only the anchor (an administrative delete; the runtime role cannot) and the partition promotes.
+      await db.execute(sql`DELETE FROM project.ccc_planning_runs WHERE project_id = ${standIn} AND run_id = ${runId}`);
+      await expect(promote(standIn, registered)).resolves.toBe(true);
+      expect(await projectOf("tasks", "id", taskId)).toEqual([registered]);
+    });
+
+    it("refuses to promote a stand-in partition holding a cccplan- document and no anchor with planning-rows-present; the same partition without the document is promoted", async () => {
+      const { standIn, registered } = partitionIds();
+      const taskId = await insertTask(standIn);
+      const runId = nextRunId();
+      await db.insert(cccPlanningRuns).values(anchorValues(runId, taskId, { projectId: standIn }));
+      const request = originalRequest(runId, taskId);
+      await publish(request, { projectId: standIn });
+      // An ordinary document must not trip the check on its own.
+      await db.execute(sql`
+        INSERT INTO project.task_documents (project_id, id, task_id, key, content, created_at, updated_at)
+        VALUES (${standIn}, ${`doc-${taskId}-notes`}, ${taskId}, 'notes.md', 'draft', ${NOW}, ${NOW})
+      `);
+      await db.execute(sql`DELETE FROM project.ccc_planning_runs WHERE project_id = ${standIn} AND run_id = ${runId}`);
+
+      await expect(promote(standIn, registered)).rejects.toMatchObject({
+        name: "ProjectPartitionRekeyError",
+        reason: "planning-rows-present",
+      } satisfies Partial<ProjectPartitionRekeyError>);
+      expect(await projectOf("tasks", "id", taskId)).toEqual([standIn]);
+
+      // Control: drop only the reserved document (triggers off, as an operator repair would) and the partition promotes.
+      await db.transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL session_replication_role = replica`);
+        await tx.execute(sql`
+          DELETE FROM project.task_documents WHERE project_id = ${standIn} AND key = ${request.key}
+        `);
+      });
+      await expect(promote(standIn, registered)).resolves.toBe(true);
+      expect(await projectOf("tasks", "id", taskId)).toEqual([registered]);
+      const documents = (await db.execute(sql`
+        SELECT project_id, key FROM project.task_documents WHERE task_id = ${taskId} ORDER BY key
+      `)) as unknown as Array<{ project_id: string; key: string }>;
+      expect(documents).toEqual([{ project_id: registered, key: "notes.md" }]);
     });
   });
 
@@ -694,8 +956,10 @@ pgDescribe("ccc planning migration 0042: fresh database ownership audit", () => 
           EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid AND p.polname = 'fusion_project_isolation') AS policy,
           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'fusion_assign_project_id'
                   AND NOT g.tgisinternal) AS assign_trigger,
-          EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'ccc_planning_runs_guard'
+          EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'zz_ccc_planning_runs_guard'
                   AND NOT g.tgisinternal) AS guard_trigger,
+          NOT EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'ccc_planning_runs_guard'
+                  AND NOT g.tgisinternal) AS no_unprefixed_guard_trigger,
           has_table_privilege('fusion_runtime', c.oid, 'SELECT') AS runtime_select,
           has_table_privilege('fusion_runtime', c.oid, 'INSERT') AS runtime_insert,
           has_table_privilege('fusion_runtime', c.oid, 'UPDATE') AS runtime_update,
@@ -707,6 +971,7 @@ pgDescribe("ccc planning migration 0042: fresh database ownership audit", () => 
       // One privilege per column: a multi-privilege has_table_privilege passes when any one is held.
       expect(ownership).toEqual([{
         rls: true, forced: true, policy: true, assign_trigger: true, guard_trigger: true,
+        no_unprefixed_guard_trigger: true,
         runtime_select: true, runtime_insert: true, runtime_update: true,
         runtime_delete: false, runtime_truncate: false,
       }]);
@@ -736,6 +1001,20 @@ pgDescribe("ccc planning migration 0042: fresh database ownership audit", () => 
         condeferred: false,
         definition: expect.stringContaining("REFERENCES project.tasks(project_id, id)"),
       });
+      // Errata E2-60: deferrable like the task key, or partition promotion refuses every project that holds an import.
+      expect(keys.find(({ conname }) => conname === "ccc_planning_runs_import_fkey")).toMatchObject({
+        condeferrable: true,
+        condeferred: false,
+        definition: expect.stringContaining("REFERENCES project.ccc_prd_imports(project_id, import_id)"),
+      });
+
+      // Errata E2-63: BEFORE row triggers fire in name order, and the guard has to see the project id the assign trigger settled on.
+      const triggerOrder = (await fresh.execute(sql`
+        SELECT tgname FROM pg_trigger
+         WHERE tgrelid = 'project.ccc_planning_runs'::regclass AND NOT tgisinternal AND (tgtype & 2) = 2
+         ORDER BY tgname
+      `)) as unknown as Array<{ tgname: string }>;
+      expect(triggerOrder.map(({ tgname }) => tgname)).toEqual(["fusion_assign_project_id", "zz_ccc_planning_runs_guard"]);
 
       const guard = (await fresh.execute(sql`
         SELECT tgname FROM pg_trigger

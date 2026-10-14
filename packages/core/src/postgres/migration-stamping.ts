@@ -61,6 +61,7 @@ export type ProjectPartitionRekeyReason =
   | "unreplaced-fk-dependent"
   | "unsupported-unique-metadata"
   | "unsafe-fk-update-graph"
+  | "planning-rows-present"
   | "unique-violation"
   | "unknown";
 
@@ -96,6 +97,25 @@ function relationName(target: RekeyTarget): string { return `${quoteIdentifier(t
 function relationKey(target: RekeyTarget): string { return `${target.schema}.${target.table}`; }
 // Project identifiers originate from central storage, but quote them here because catalog-driven SQL cannot bind identifiers and must remain injection-safe.
 function quoteLiteral(value: string): string { return `'${value.replaceAll("'", "''")}'`; }
+
+/** Names the planning relation that holds stand-in rows, or undefined when the stand-in partition has none. */
+async function standInPlanningRows(
+  tx: MigrationTransaction,
+  fallbackProjectId: string,
+  ownershipByRelation: Record<string, { fallback: boolean; registered: boolean }>,
+): Promise<string | undefined> {
+  if (ownershipByRelation["project.ccc_planning_runs"]?.fallback) return "project.ccc_planning_runs";
+  if (ownershipByRelation["project.task_documents"]?.fallback) {
+    const documents = (await tx.execute(sql`
+      SELECT EXISTS (
+        SELECT 1 FROM project.task_documents
+         WHERE project_id = ${fallbackProjectId} AND starts_with(key, 'cccplan-')
+      ) AS found
+    `)) as unknown as Array<{ found: boolean }>;
+    if (documents[0]?.found) return "project.task_documents (cccplan- keys)";
+  }
+  return undefined;
+}
 
 /**
  * FNXC:ProjectPartitionMerge 2026-07-20-12:00:
@@ -146,6 +166,15 @@ export async function rekeyFallbackProjectPartition(
       ownershipByRelation,
     };
     if (!ownership.fallbackOwnedRows) return false;
+
+    /*
+    FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-61):
+    Request-to-code planning rows are insert-once: the 0042 anchor guard refuses to change a run's identity, and the 0043 document guard refuses to update any cccplan- artifact. `fn plan start` requires a registered project, so none should sit under a stand-in id. If one does, promotion would fail inside a guard with an untyped CCC_PLANNING_* error, which startup answers by refusing the project outright. Refuse here instead, before any write, with a typed reason and the ownership snapshot so startup falls back to binding the stand-in partition.
+    */
+    const planningRowsIn = await standInPlanningRows(tx, fallbackProjectId, ownershipByRelation);
+    if (planningRowsIn) {
+      throw new ProjectPartitionRekeyError("planning-rows-present", ownership, `${planningRowsIn} holds request-to-code planning rows under ${fallbackProjectId}; planning rows are never promoted`);
+    }
 
     const uniqueRules = (await tx.execute(sql`
       SELECT ns.nspname AS schema, cls.relname AS table, idx.relname AS name,

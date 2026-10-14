@@ -467,10 +467,11 @@ const CCC_PLANNING_EVENT_ID_PATTERN = /^ccc-plan-event-[0-9a-f]{64}$/;
  */
 async function recordPlanningRunAuditEvent(
   tx: DbTransaction,
-  event: RunAuditEvent,
+  requested: RunAuditEvent,
   eventId: string,
   explicitProjectId: string | undefined,
 ): Promise<RunAuditEvent> {
+  const event = normalizePlanningRunAuditEvent(requested);
   const inserted = await tx.insert(schema.project.runAuditEvents).values({
     id: event.id,
     timestamp: event.timestamp,
@@ -500,6 +501,49 @@ async function recordPlanningRunAuditEvent(
     throw new RunAuditEventCollisionError(eventId);
   }
   return existingEvent;
+}
+
+/**
+ * FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-62):
+ * Make the first write and an exact replay agree about metadata. jsonb stores an
+ * object property whose value is `undefined` as if it were absent, so the first
+ * write drops those properties here, recursively, and the compared event is the
+ * stored event. The result is then canonicalized before the INSERT: any other
+ * value that is not plain JSON (a Date, a BigInt, NaN, a class instance, an
+ * undefined array element) is refused on the first write, with no row written,
+ * the same way a malformed eventId is, instead of surfacing as a plain Error when
+ * a crash-recovery replay compares it.
+ */
+function normalizePlanningRunAuditEvent(event: RunAuditEvent): RunAuditEvent {
+  const normalized: RunAuditEvent = {
+    ...event,
+    metadata: dropUndefinedProperties(event.metadata, new Set<object>()) as RunAuditEvent["metadata"],
+  };
+  try {
+    canonicalCccPrdJson(planningRunAuditComparable(normalized));
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    throw new TypeError(`run-audit planning event metadata must be canonical JSON: ${reason}`, { cause });
+  }
+  return normalized;
+}
+
+function dropUndefinedProperties(value: unknown, ancestors: Set<object>): unknown {
+  if (typeof value !== "object" || value === null || ancestors.has(value)) return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return value;
+  ancestors.add(value);
+  try {
+    // Array.from reads a hole as undefined, so a sparse array is refused like an undefined element instead of canonicalizing as invalid JSON.
+    if (Array.isArray(value)) return Array.from(value, (entry) => dropUndefinedProperties(entry, ancestors));
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, dropUndefinedProperties(entry, ancestors)]),
+    );
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function planningRunAuditComparable(event: RunAuditEvent): Record<string, unknown> {

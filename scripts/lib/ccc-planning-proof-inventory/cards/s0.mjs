@@ -6,7 +6,7 @@ TARGETED is file-closed over the six files of the card's check command: the five
 
 Every entry needs PostgreSQL: each file declares `pgDescribe` blocks, and the pure registration and literal tests ride in the same files. The field is `needsPostgres` (errata E1-1 replaces the contract's `needsPg` everywhere).
 
-Measured on the M5 Max under a load average near 15 (parallel agents), FNXC:CccPlanningProof 2026-10-14-09:26 (repair pass, errata E1-15 and E1-16): 39 s wall for the six files (116 tests) and 5 s for the two new files (26 tests). The first build measured 70.8 s and 11 s under a load average near 20. The command timeouts are hang bounds over those measurements; no test timeout is raised anywhere.
+Measured on the M5 Max under a load average near 15 (parallel agents), FNXC:CccPlanningProof 2026-10-14-13:56 (final repair, errata E2-60 to E2-65): 41 s wall for the six files (130 tests) and 12 s for the two new files (40 tests). The repair before it measured 39 s and 5 s for 116 and 26 tests, and the first build 70.8 s and 11 s under a load average near 20. The command timeouts are hang bounds over those measurements; no test timeout is raised anywhere.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -57,6 +57,14 @@ export const OFFLINE = Object.freeze([
       `${MIGRATION} > 0042 anchor guard > refuses cancelled -> running with RUN_TERMINAL; paused -> running is admitted`,
       `${MIGRATION} > 0042 anchor guard > refuses running -> importing with STATE_TRANSITION_REFUSED; admitted -> blocked_prerequisite and spec_ready -> importing -> budget_exhausted are admitted`,
       `${MIGRATION} > 0042 anchor guard > refuses stagnant_epochs +1 without review_epochs +1 with REVIEW_EPOCH_INVALID; both +1 is admitted`,
+      `${MIGRATION} > 0042 anchor guard > refuses SET project_id = NULL that the assign trigger resolves to another project with ANCHOR_IMMUTABLE; the explicit project change is refused alike and NULL under the anchor's own project is admitted`,
+      `${MIGRATION} > 0042 anchor guard > refuses a NULL project_id that reaches the guard with ANCHOR_IMMUTABLE even when no trigger fills it in; the unchanged project_id is admitted`,
+      `${MIGRATION} > 0042 deadline check > refuses the relative or unbounded deadline_at 'tomorrow' on insert with the deadline check; an ISO toISOString() deadline is admitted`,
+      `${MIGRATION} > 0042 deadline check > refuses the relative or unbounded deadline_at 'infinity' on insert with the deadline check; an ISO toISOString() deadline is admitted`,
+      `${MIGRATION} > 0042 deadline check > refuses an enlarging amendment whose deadline_at is 'infinity' with the deadline check; the same amendment with an ISO deadline is admitted`,
+      `${MIGRATION} > 0042 partition promotion > promotes a stand-in partition holding one ccc_prd_imports row and no planning run, with 0042 and 0043 present; the row moves to the registered id`,
+      `${MIGRATION} > 0042 partition promotion > refuses to promote a stand-in partition holding a planning anchor with planning-rows-present and moves nothing; the same partition without the anchor is promoted`,
+      `${MIGRATION} > 0042 partition promotion > refuses to promote a stand-in partition holding a cccplan- document and no anchor with planning-rows-present; the same partition without the document is promoted`,
       `${MIGRATION} > 0042 runtime privileges > refuses a delete-and-reinsert counter reset as fusion_runtime with SQLSTATE 42501; the same role's spend UPDATE on the same row is admitted`,
       `${MIGRATION} > 0042 runtime privileges > refuses DELETE and TRUNCATE of the anchor as fusion_runtime with SQLSTATE 42501; SELECT, INSERT and UPDATE by the same role are admitted`,
       `${MIGRATION} > 0043 artifact guard > refuses a reserved-key insert without the publisher GUC with PUBLISHER_REQUIRED; the same insert with it is admitted`,
@@ -75,6 +83,12 @@ export const OFFLINE = Object.freeze([
       `${EVENT_ID} > replays inside one caller transaction under an explicit projectId and re-reads that project's row`,
       `${EVENT_ID} > refuses a malformed eventId before writing anything; the well-formed id is admitted`,
       `${EVENT_ID} > refuses an eventId combined with a campaign event key; the campaign path alone is unchanged and still compares timestamps`,
+      `${EVENT_ID} > replays an exact event whose optional metadata fields are undefined as the persisted event, with those fields dropped as jsonb drops them`,
+      `${EVENT_ID} > refuses a Date in metadata on the first write with no row written; the same event with JSON values is admitted`,
+      `${EVENT_ID} > refuses a BigInt in metadata on the first write with no row written; the same event with JSON values is admitted`,
+      `${EVENT_ID} > refuses a non-finite number in metadata on the first write with no row written; the same event with JSON values is admitted`,
+      `${EVENT_ID} > refuses an undefined array element in metadata on the first write with no row written; the same event with JSON values is admitted`,
+      `${EVENT_ID} > refuses a class instance in metadata on the first write with no row written; the same event with JSON values is admitted`,
       `${EVENT_ID} > without an eventId the legacy path is unchanged: each call writes its own random id`,
     ]),
     platform: "any",

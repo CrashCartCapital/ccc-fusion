@@ -24,8 +24,12 @@ const cccPlanningSchema = pgSchema(PROJECT_SCHEMA);
  * append-only in project.run_audit_events. Every key and foreign key starts
  * with project_id, because 0006 rebuilt the task key as (project_id, id) and
  * the boot ownership audit refuses any globally scoped key. The SQL also makes
- * the task foreign key DEFERRABLE INITIALLY IMMEDIATE and adds the row guard
- * trigger, which Drizzle cannot express; the migration file is authoritative.
+ * both the task and the import foreign keys DEFERRABLE INITIALLY IMMEDIATE (the
+ * 0037 precedent; project-partition promotion refuses a non-deferrable key
+ * between two re-keyed tables, errata E2-60) and adds the row guard trigger,
+ * named zz_ccc_planning_runs_guard so it fires after fusion_assign_project_id
+ * (errata E2-63). Drizzle cannot express either; the migration file is
+ * authoritative.
  */
 export const cccPlanningRuns = cccPlanningSchema.table(
   "ccc_planning_runs",
@@ -116,6 +120,11 @@ export const cccPlanningRuns = cccPlanningSchema.table(
     ),
     check("ccc_planning_runs_base_check", sql`${t.admittedBase} ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'`),
     check("ccc_planning_runs_request_bytes_check", sql`${t.requestBytes} BETWEEN 1 AND 4194304`),
+    // FNXC:CccPlanningRuns 2026-10-14-13:36 (errata E2-64): deadline_at is cast with ::timestamptz by the guard, so only the toISOString() form is stored.
+    check(
+      "ccc_planning_runs_deadline_check",
+      sql`${t.deadlineAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$'`,
+    ),
     check(
       "ccc_planning_runs_sequence_check",
       sql`${t.revision} BETWEEN 1 AND 999 AND ${t.amendmentSeq} >= 0 AND ${t.controlSeq} >= 0`,
