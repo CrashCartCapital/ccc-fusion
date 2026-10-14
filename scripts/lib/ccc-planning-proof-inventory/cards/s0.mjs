@@ -2,11 +2,11 @@
 FNXC:CccPlanningProof 2026-10-14-09:00:
 Proof inventory for request-to-code v3 card S0 (migrations 0042 and 0043, applier registration, Drizzle mirror, run-audit `eventId`, D4/D6/D7/D39). One module per card keeps the inventory files disjoint (contract 0.18); `index.mjs` (owned by P0) loads `cards/*.mjs` in sorted order and rejects duplicate command ids.
 
-TARGETED is file-closed over the five files of the card's check command, which includes the three existing registry files whose ceiling pins S0 moves to 0043. OFFLINE is name-closed over the two new files: the names below are exactly their tests, built the way `assertionName` in `scripts/run-ccc-pg-proof.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command.
+TARGETED is file-closed over the six files of the card's check command: the five of the contract plus `ccc-prd-import-migration.pg.test.ts`, which errata E1-16 hands to S0 because it drops `project.ccc_prd_imports` and replays the migrations after it. The check includes the three existing registry files whose ceiling pins S0 moves to 0043. OFFLINE is name-closed over the two new files: the names below are exactly their tests, built the way `assertionName` in `scripts/run-ccc-pg-proof.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command.
 
-Every entry needs PostgreSQL: each file declares `pgDescribe` blocks, and the pure registration and literal tests ride in the same files. Field naming follows the landed sibling modules (`needsPostgres`); contract §2.20 spells it `needsPg`, which P0 reconciles.
+Every entry needs PostgreSQL: each file declares `pgDescribe` blocks, and the pure registration and literal tests ride in the same files. The field is `needsPostgres` (errata E1-1 replaces the contract's `needsPg` everywhere).
 
-Measured on the M5 Max under a load average near 20 (parallel agents): 70.8 s wall for the five files (111 tests) and 11 s for the two new files (24 tests). The command timeouts are hang bounds over those measurements; no test timeout is raised anywhere.
+Measured on the M5 Max under a load average near 15 (parallel agents), FNXC:CccPlanningProof 2026-10-14-09:26 (repair pass, errata E1-15 and E1-16): 39 s wall for the six files (116 tests) and 5 s for the two new files (26 tests). The first build measured 70.8 s and 11 s under a load average near 20. The command timeouts are hang bounds over those measurements; no test timeout is raised anywhere.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -15,6 +15,7 @@ const CHECK_FILES = Object.freeze([
   "src/__tests__/postgres/schema-applier.test.ts",
   "src/__tests__/postgres/ccc-campaign-semantic-proof-v2-migration.pg.test.ts",
   "src/__tests__/postgres/ccc-campaign-execution-authorization-migration.pg.test.ts",
+  "src/__tests__/postgres/ccc-prd-import-migration.pg.test.ts",
 ]);
 
 const MIGRATION = "ccc planning migrations 0042 and 0043 (PostgreSQL)";
@@ -56,6 +57,8 @@ export const OFFLINE = Object.freeze([
       `${MIGRATION} > 0042 anchor guard > refuses cancelled -> running with RUN_TERMINAL; paused -> running is admitted`,
       `${MIGRATION} > 0042 anchor guard > refuses running -> importing with STATE_TRANSITION_REFUSED; admitted -> blocked_prerequisite and spec_ready -> importing -> budget_exhausted are admitted`,
       `${MIGRATION} > 0042 anchor guard > refuses stagnant_epochs +1 without review_epochs +1 with REVIEW_EPOCH_INVALID; both +1 is admitted`,
+      `${MIGRATION} > 0042 runtime privileges > refuses a delete-and-reinsert counter reset as fusion_runtime with SQLSTATE 42501; the same role's spend UPDATE on the same row is admitted`,
+      `${MIGRATION} > 0042 runtime privileges > refuses DELETE and TRUNCATE of the anchor as fusion_runtime with SQLSTATE 42501; SELECT, INSERT and UPDATE by the same role are admitted`,
       `${MIGRATION} > 0043 artifact guard > refuses a reserved-key insert without the publisher GUC with PUBLISHER_REQUIRED; the same insert with it is admitted`,
       `${MIGRATION} > 0043 artifact guard > refuses a design_alternative whose closure holds another one with DESIGN_SEAL_BROKEN, directly and through a review; a closure without one is admitted`,
       `${MIGRATION} > 0043 artifact guard > refuses UPDATE and DELETE of a planning artifact with IMMUTABLE; the same writes on an ordinary document are admitted`,

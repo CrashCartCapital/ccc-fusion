@@ -150,6 +150,22 @@ async function expectRefused(statement: Promise<unknown>, sqlState: string, pref
   });
 }
 
+/**
+ * FNXC:CccPlanningRuns 2026-10-14-09:24:
+ * A refused privilege is SQLSTATE 42501 with PostgreSQL's own message, which
+ * carries no CCC_PLANNING_ prefix because no trigger or function raised it.
+ */
+async function expectPermissionDenied(statement: Promise<unknown>): Promise<void> {
+  await expect(statement).rejects.toMatchObject({
+    cause: expect.objectContaining({
+      code: "42501",
+      message: "permission denied for table ccc_planning_runs",
+    }),
+  });
+}
+
+type Transaction = Parameters<Parameters<PostgresJsDatabase["transaction"]>[0]>[0];
+
 interface ArtifactSpec {
   readonly runId: string;
   readonly taskId: string;
@@ -270,6 +286,22 @@ pgDescribe("ccc planning migrations 0042 and 0043 (PostgreSQL)", () => {
              control_requested_at = ${NOW}, updated_at = ${NOW}
        WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
     `);
+  }
+
+  /**
+   * One transaction as the application's own role: `fusion_runtime`, bound to
+   * PROJECT_A with the bypass off. The harness connection is a superuser with
+   * the bypass on, so only this wrapper exercises the grants the migration sets.
+   */
+  function asRuntime<T>(work: (tx: Transaction) => Promise<T>): Promise<T> {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL ROLE fusion_runtime`);
+      await tx.execute(sql`
+        SELECT set_config('fusion.project_bypass', 'off', true),
+               set_config('fusion.project_id', ${PROJECT_A}, true)
+      `);
+      return work(tx);
+    });
   }
 
   async function readRun(runId: string): Promise<Record<string, unknown>> {
@@ -415,6 +447,62 @@ pgDescribe("ccc planning migrations 0042 and 0043 (PostgreSQL)", () => {
          WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
       `);
       expect(await readRun(runId)).toMatchObject({ review_epochs: 1, stagnant_epochs: 1 });
+    });
+  });
+
+  describe("0042 runtime privileges", () => {
+    /*
+    FNXC:CccPlanningRuns 2026-10-14-09:24 (errata E1-15):
+    The anchor guard fires on INSERT and UPDATE only, and 0006's default
+    privileges hand fusion_runtime DELETE on every project table. A DELETE then
+    a fresh INSERT would therefore reset planning_spent and the epoch counters
+    to zero. 0042 revokes DELETE and TRUNCATE from the runtime role, so the
+    reset is a privilege refusal before any row changes.
+    */
+    it("refuses a delete-and-reinsert counter reset as fusion_runtime with SQLSTATE 42501; the same role's spend UPDATE on the same row is admitted", async () => {
+      const { runId, taskId } = await admittedRun();
+      await move(runId, "running");
+      for (let spend = 0; spend < 5; spend += 1) await spendPlanning(runId);
+      expect(await readRun(runId)).toMatchObject({ state: "running", planning_spent: 5 });
+
+      await expectPermissionDenied(asRuntime(async (tx) => {
+        await tx.execute(sql`
+          DELETE FROM project.ccc_planning_runs WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+        `);
+        await tx.insert(cccPlanningRuns).values(anchorValues(runId, taskId));
+      }));
+      expect(await readRun(runId)).toMatchObject({ state: "running", planning_spent: 5 });
+
+      await asRuntime((tx) => tx.execute(sql`
+        UPDATE project.ccc_planning_runs SET planning_spent = planning_spent + 1, updated_at = ${NOW}
+         WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+      `));
+      expect(await readRun(runId)).toMatchObject({ state: "running", planning_spent: 6 });
+    });
+
+    it("refuses DELETE and TRUNCATE of the anchor as fusion_runtime with SQLSTATE 42501; SELECT, INSERT and UPDATE by the same role are admitted", async () => {
+      const { runId } = await admittedRun();
+
+      await expectPermissionDenied(asRuntime((tx) => tx.execute(sql`
+        DELETE FROM project.ccc_planning_runs WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+      `)));
+      await expectPermissionDenied(asRuntime((tx) => tx.execute(sql`TRUNCATE project.ccc_planning_runs`)));
+      expect(await readRun(runId)).toMatchObject({ state: "admitted", planning_spent: 0 });
+
+      const selected = await asRuntime((tx) => tx.execute(sql`
+        SELECT state FROM project.ccc_planning_runs WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+      `)) as unknown as Array<{ state: string }>;
+      expect(selected).toEqual([{ state: "admitted" }]);
+      await asRuntime((tx) => tx.execute(sql`
+        UPDATE project.ccc_planning_runs SET state = 'running', updated_at = ${NOW}
+         WHERE project_id = ${PROJECT_A} AND run_id = ${runId}
+      `));
+      expect(await readRun(runId)).toMatchObject({ state: "running" });
+
+      const insertedTask = await insertTask();
+      const insertedRun = nextRunId();
+      await asRuntime((tx) => tx.insert(cccPlanningRuns).values(anchorValues(insertedRun, insertedTask)));
+      expect(await readRun(insertedRun)).toMatchObject({ state: "admitted", planning_spent: 0 });
     });
   });
 
@@ -608,12 +696,19 @@ pgDescribe("ccc planning migration 0042: fresh database ownership audit", () => 
                   AND NOT g.tgisinternal) AS assign_trigger,
           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid AND g.tgname = 'ccc_planning_runs_guard'
                   AND NOT g.tgisinternal) AS guard_trigger,
-          has_table_privilege('fusion_runtime', c.oid, 'SELECT,INSERT,UPDATE') AS runtime_grants
+          has_table_privilege('fusion_runtime', c.oid, 'SELECT') AS runtime_select,
+          has_table_privilege('fusion_runtime', c.oid, 'INSERT') AS runtime_insert,
+          has_table_privilege('fusion_runtime', c.oid, 'UPDATE') AS runtime_update,
+          has_table_privilege('fusion_runtime', c.oid, 'DELETE') AS runtime_delete,
+          has_table_privilege('fusion_runtime', c.oid, 'TRUNCATE') AS runtime_truncate
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'project' AND c.relname = 'ccc_planning_runs'
       `)) as unknown as Array<Record<string, boolean>>;
+      // One privilege per column: a multi-privilege has_table_privilege passes when any one is held.
       expect(ownership).toEqual([{
-        rls: true, forced: true, policy: true, assign_trigger: true, guard_trigger: true, runtime_grants: true,
+        rls: true, forced: true, policy: true, assign_trigger: true, guard_trigger: true,
+        runtime_select: true, runtime_insert: true, runtime_update: true,
+        runtime_delete: false, runtime_truncate: false,
       }]);
 
       const keys = (await fresh.execute(sql`

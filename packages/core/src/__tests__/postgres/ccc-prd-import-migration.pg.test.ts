@@ -41,6 +41,14 @@ describe("CCC PRD import migration registry", () => {
   });
 });
 
+/** The regclass text of the 0042 planning anchor, or null while the table is absent. */
+async function planningAnchorRegclass(target: PgTestHarness): Promise<string | null> {
+  const rows = (await target.adminDb.execute(sql`
+    SELECT to_regclass('project.ccc_planning_runs')::text AS anchor
+  `)) as unknown as Array<{ anchor: string | null }>;
+  return rows[0]?.anchor ?? null;
+}
+
 pgDescribe("CCC PRD import migration 0034 to 0035", () => {
   let upgraded: PgTestHarness | null = null;
   let fresh: PgTestHarness | null = null;
@@ -67,14 +75,18 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
         DROP CONSTRAINT approval_requests_campaign_import_fkey;
       ALTER TABLE project.ccc_effect_receipts
         DROP CONSTRAINT ccc_effect_receipts_campaign_import_fkey;
+      -- FNXC:CccPlanningRuns 2026-10-14-09:24: the 0042 planning anchor holds a
+      -- composite foreign key to ccc_prd_imports, so it has to go first.
+      DROP TABLE project.ccc_planning_runs;
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
       -- 0041 widens ccc_prd_imports_state_check, so it has to be replayed
       -- alongside the 0035 that recreates the table it constrains. Leaving it
       -- recorded would rebuild the table with the pre-0041 check, and this
-      -- upgrade would no longer match a fresh baseline.
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038', '0039', '0041');
+      -- upgrade would no longer match a fresh baseline. 0042 and 0043 are
+      -- replayed too: the anchor was dropped above and 0042 recreates it.
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038', '0039', '0041', '0042', '0043');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
@@ -83,6 +95,9 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0038");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0039");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0041");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0042");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0043");
+    await expect(planningAnchorRegclass(upgraded)).resolves.toBeNull();
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
@@ -92,6 +107,9 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0038");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0039");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0041");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0042");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0043");
+    await expect(planningAnchorRegclass(upgraded)).resolves.toBe("project.ccc_planning_runs");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,

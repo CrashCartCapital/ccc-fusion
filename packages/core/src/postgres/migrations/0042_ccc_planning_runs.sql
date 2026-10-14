@@ -272,6 +272,8 @@ DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fusion_runtime') THEN
     GRANT SELECT, INSERT, UPDATE ON project.ccc_planning_runs TO fusion_runtime;
+    -- FNXC:CccPlanningRuns 2026-10-14-09:24: 0006's default privileges also hand the runtime role DELETE, and the guard above fires on INSERT and UPDATE only. A delete then a fresh insert would reset planning_spent and the epoch counters, so the runtime never deletes or truncates an anchor row. The tasks FK is NO ACTION, so no cascade needs the privilege.
+    REVOKE DELETE, TRUNCATE ON project.ccc_planning_runs FROM fusion_runtime;
   END IF;
 END
 $$;
