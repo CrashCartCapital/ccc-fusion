@@ -37,6 +37,7 @@ import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, upsertTaskRow
 import {beginTaskMoveDisposal} from "../task-move-disposer.js";
 import {resolveTaskSymbolsForTask} from "../task-symbol-resolution.js";
 import {cancelActiveWorkflowWorkItemsForTaskSyncInCurrentTransaction} from "./task-mutation-ops.js";
+import {assertCccPlanningTaskNotHeld} from "./ccc-planning-custody.js";
 
 /*
 FNXC:PostgresCutover 2026-07-05-19:50:
@@ -142,6 +143,11 @@ export async function moveTaskImpl(store: TaskStore, id: string, toColumn: Colum
     // ColumnId admits workflow-defined custom column ids (KTD-1). Both paths
     // runtime-validate: flag-ON against the task's resolved workflow, flag-OFF
     // via the VALID_TRANSITIONS lookup (non-legacy ids reject as before).
+    /*
+    FNXC:CccPlanningCustody 2026-10-14-13:41:
+    A held request-to-code planning task (K1 marker plus anchor row) never moves through the generic store, whatever the caller (dashboard, `fn task`, triage, self-healing, scheduler). Refuse before the move-policy preflight so the custody error wins over any column-rule error; moveTaskInternal repeats the check under the task lock for every other move entry point.
+    */
+    await assertCccPlanningTaskNotHeld(store.asyncLayer, await store.readTaskForMove(id), "move");
     const movePolicyPreflight = await store.prepareWorkflowMovePolicyPreflight(id, toColumn, options, { fromHandoff: false });
     return store.withTaskLock(id, () => store.moveTaskInternal(id, toColumn, options, { fromHandoff: false, movePolicyPreflight }));
   }
@@ -250,6 +256,8 @@ export async function handoffToReviewImpl(store: TaskStore, taskId: string, opts
 export async function moveTaskInternalImpl(store: TaskStore, id: string, toColumn: ColumnId, options: MoveTaskOptions | undefined, internal: MoveTaskInternalOptions, currentTask?: Task,): Promise<Task> {
     const dir = store.taskDir(id);
     const task = currentTask ?? await store.readTaskForMove(id);
+    // FNXC:CccPlanningCustody 2026-10-14-13:41: every move entry point (moveTask, moveTaskIf, handoffToReview, direct moveTaskInternal callers) refuses a held planning task here, under the task lock.
+    await assertCccPlanningTaskNotHeld(store.asyncLayer, task, "move");
     /*
     FNXC:TaskMovement 2026-06-22-18:20:
     Public moveTask calls without an explicit source keep the legacy emitted source of "engine", but they do not inherit workflow guard bypass. Engine, scheduler, handoff, and recovery call sites opt into bypass semantics with an explicit moveSource or skipMergeBlocker.

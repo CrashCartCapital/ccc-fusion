@@ -50,6 +50,7 @@ import {
   detectContentLanguage,
   localeDisplayName,
   parsePlanningPlanMd,
+  isCccPlanningRunId,
   type NearDuplicateCandidate,
 } from "@fusion/core";
 
@@ -1106,14 +1107,19 @@ export class TriageProcessor {
    * union include cards before their planner writes status:"planning".
    */
   private async discoverReadyPlanningTasks(allTasks: Task[], now: number): Promise<Task[]> {
-    const eligibleTriageTasks = allTasks.filter(
+    /*
+    FNXC:CccPlanningCustody 2026-10-14-13:41:
+    A request-to-code planning task (lineage is a `ccc-plan:` run id) is never specified by the generic planner, even if its `paused` flag was cleared by a path the store guards do not cover (D22, critic 1). The check uses the lineage alone, not the full custody marker, because the marker needs `paused` and this is the defence for exactly the case where `paused` is gone.
+    */
+    const candidateTasks = allTasks.filter((t) => !isCccPlanningRunId(t.lineageId));
+    const eligibleTriageTasks = candidateTasks.filter(
       (t) => t.column === "triage" && isTaskStillInPlanningStage(t)
         && !this.advancedRecoveryReservations.has(t.id)
         && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
         && t.status !== "awaiting-approval" && t.status !== "failed" && t.status !== "stuck-killed"
         && !(t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now),
     );
-    const eligibleTodoTasksRaw = allTasks.filter(
+    const eligibleTodoTasksRaw = candidateTasks.filter(
       (t) => t.column === "todo" && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
         && t.status !== "awaiting-approval" && t.status !== "failed" && t.status !== "stuck-killed"
         && t.status !== "planning"

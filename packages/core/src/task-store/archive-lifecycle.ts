@@ -16,6 +16,7 @@ import {toJson} from "../db-helpers.js";
 import {getErrorMessage} from "../error-message.js";
 import {ArchiveWorkspaceDisposalError, ArchiveWorkspaceDisposalIncompleteError, ArchiveWorkspaceWorktreeDisposerMissingError, getArchiveWorkspaceWorktreeDisposer, getArchiveWorktreeDisposer, type ArchiveWorkspaceDisposalResult, type WorkspaceDisposalPlanEntry} from "../archive-worktree-disposer.js";
 import {acquireWorktreePathReservation, canonicalizeWorktreePath} from "../worktree-path-reservation.js";
+import {assertCccPlanningTaskIdNotHeld} from "./ccc-planning-custody.js";
 import {basename, join, resolve} from "node:path";
 import {homedir} from "node:os";
 
@@ -203,6 +204,11 @@ export async function deleteTaskImpl(store: TaskStore, id: string, options?: { r
     if (options?.auditContext?.taskId === id) {
         throw new TaskSelfDeleteError(id);
     }
+    /*
+    FNXC:CccPlanningCustody 2026-10-14-13:41:
+    A held request-to-code planning task (K1 marker plus anchor row) is never soft-deleted through the generic store: its anchor, artifacts and work item would be orphaned. The guard runs before the backend dispatch, so every deleteTask caller inherits it before any mutation or audit.
+    */
+    await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "delete");
     if (store.backendMode) {
       return store.deleteTaskBackend(id, options);
     }
@@ -340,6 +346,8 @@ export async function deleteTaskIfImpl(
   options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: { agentId: string; runId: string; sessionId?: string; taskId?: string } },
 ): Promise<DeleteTaskIfResult> {
   if (options?.auditContext?.taskId === id) throw new TaskSelfDeleteError(id);
+  // FNXC:CccPlanningCustody 2026-10-14-13:41: conditional deletion refuses a held planning task like deleteTask, before the predicate runs.
+  await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "delete");
   if (store.backendMode) return store.deleteTaskIf(id, predicate, options);
   const result = await store.withTaskLock(id, async () => {
     store.flushAgentLogBuffer();
@@ -393,6 +401,8 @@ export async function archiveTaskImpl(store: TaskStore, id: string, optionsOrCle
     // async archive-lineage helper (archiveParentTaskWithLineageGate) to perform
     // the lineage gate + lineage clear + archive snapshot + soft-delete in one
     // transaction (VAL-CROSS-014/015). The SQLite path below is unchanged.
+    // FNXC:CccPlanningCustody 2026-10-14-13:41: archiving a held request-to-code planning task would release it from its run, so every archive caller (single, archive-all-done) is refused here before the backend dispatch.
+    await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "archive");
     if (store.backendMode) {
       return store.archiveTaskBackend(id, optionsOrCleanup);
     }

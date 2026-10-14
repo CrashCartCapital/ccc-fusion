@@ -1,3 +1,4 @@
+import { isCccPlanningCustodyTask } from "@fusion/core";
 import { isCccCampaignTask } from "@fusion/engine";
 import { ApiError, conflict } from "../api-error.js";
 import type { ApiRoutesContext } from "./types.js";
@@ -44,6 +45,51 @@ export function cccCampaignTaskMutationConflict(taskIds: string[]): ApiError {
 }
 
 /*
+FNXC:CccPlanningCustody 2026-10-14-13:41 (card G1, D22):
+A held request-to-code planning task (K1 marker: `ccc-plan:` run-id lineage, paused, not user-paused) is owned by the `fn plan` CLI the same way an imported campaign task is owned by `fn prd`, so the same guard refuses it with the same stable code; `custody: "planning"` and the message tell the operator which CLI to use. The predicate is composed here from `isCccCampaignTask` and core's `isCccPlanningCustodyTask`, which is exactly the engine's guard-only `isCccCustodyGuardedTask`: the engine barrel that would export that name is parent-owned (D34) and not yet re-exported.
+*/
+export const CCC_TASK_CUSTODY_LOOKUP_FAILED_CODE = "CCC_TASK_CUSTODY_LOOKUP_FAILED";
+
+function planningRefusalMessage(taskId: string): string {
+  return (
+    `Task ${taskId} is held by a request-to-code planning run and cannot be mutated from the dashboard. `
+    + "Operate on the run from the CLI instead: `fn plan status <run-id>`, then "
+    + "`fn plan pause|resume|cancel <run-id>`."
+  );
+}
+
+export function cccPlanningTaskMutationConflict(taskIds: string[]): ApiError {
+  return conflict(planningRefusalMessage(taskIds.join(", ")), {
+    code: CCC_CAMPAIGN_TASK_MUTATION_BLOCKED_CODE,
+    taskIds,
+    custody: "planning",
+  });
+}
+
+/**
+ * A read that says the task does not exist: the real store's `Task <id> not found`, an ENOENT-coded error
+ * (the file-era store and the route-level 404 mapping), or an ApiError 404.
+ */
+function isTaskNotFoundError(error: unknown, taskId: string): boolean {
+  if (error instanceof ApiError) return error.statusCode === 404;
+  if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT") return true;
+  return error instanceof Error && error.message === `Task ${taskId} not found`;
+}
+
+/**
+ * Same status and message the error middleware gives the raw error (500 and its message), so routes keep their
+ * tested response, plus a stable code saying the custody check, not the route, refused the mutation.
+ */
+function custodyLookupFailed(taskId: string, error: unknown): ApiError {
+  return new ApiError(
+    500,
+    error instanceof Error ? error.message : "Internal server error",
+    { code: CCC_TASK_CUSTODY_LOOKUP_FAILED_CODE, taskIds: [taskId] },
+    error,
+  );
+}
+
+/*
 FNXC:CccCampaignTaskGuard 2026-08-11-00:00:
 Registered at the TOP of registerTaskWorkflowRoutes — the first registrar in
 createApiRoutes that touches `/tasks` paths — so this middleware layer precedes
@@ -66,27 +112,44 @@ export function registerCccCampaignTaskMutationGuard(ctx: ApiRoutesContext): voi
       next();
       return;
     }
-    let campaignTaskId: string | undefined;
+    const taskId = String(req.params.id);
+    /*
+    FNXC:CccPlanningCustody 2026-10-14-13:41 (card G1, D22):
+    Supersedes the 2026-08-11 fall-through on lookup failure. A transient failure here followed by a successful read in the route let an unchecked mutation through, which D22 forbids, so the guard now fails closed without inventing a custody 409:
+    - a project-context failure is forwarded unchanged, so the response is the error mapping the route would have produced and the route never runs;
+    - a store read that says the task does not exist passes through, because a missing task holds no custody, the route owns its 404, and the `/tasks/:id` prefix also matches collection routes (`/tasks/batch-update-models`), where the real store throws "Task <segment> not found";
+    - any other read failure is refused before the route runs, with the 500 and message the error middleware gives the raw error plus the stable code CCC_TASK_CUSTODY_LOOKUP_FAILED;
+    - a store with no `getTask` at all (only partial test stores) passes through: a store without a task read is not a lookup that failed.
+    */
+    let scopedStore: Awaited<ReturnType<typeof getProjectContext>>["store"];
     try {
-      const { store: scopedStore } = await getProjectContext(req);
-      const task = await scopedStore.getTask(req.params.id);
-      if (task && isCccCampaignTask(task)) {
-        campaignTaskId = String(req.params.id);
-      }
-    } catch {
-      /*
-      FNXC:CccCampaignTaskGuard 2026-08-11-00:00:
-      A guard-side lookup failure (project context or store read) falls through
-      to the route handler, which resolves the SAME context/store and will
-      surface the same failure with its route-specific error mapping. Refusing
-      here on infrastructure errors would turn every store hiccup into a
-      misleading campaign-custody 409.
-      */
+      ({ store: scopedStore } = await getProjectContext(req));
+    } catch (error) {
+      next(error);
+      return;
+    }
+    if (typeof scopedStore.getTask !== "function") {
+      // A partial store (route tests build them) has no task read, so it can hold no custody. The real TaskStore always has one.
       next();
       return;
     }
-    if (campaignTaskId !== undefined) {
-      next(cccCampaignTaskMutationConflict([campaignTaskId]));
+    let task: Awaited<ReturnType<typeof scopedStore.getTask>> | undefined;
+    try {
+      task = await scopedStore.getTask(taskId);
+    } catch (error) {
+      if (isTaskNotFoundError(error, taskId)) {
+        next();
+        return;
+      }
+      next(custodyLookupFailed(taskId, error));
+      return;
+    }
+    if (task && isCccPlanningCustodyTask(task)) {
+      next(cccPlanningTaskMutationConflict([taskId]));
+      return;
+    }
+    if (task && isCccCampaignTask(task)) {
+      next(cccCampaignTaskMutationConflict([taskId]));
       return;
     }
     next();

@@ -18,6 +18,7 @@ import type {ArtifactRow} from "../task-store/row-types.js";
 import {listArtifacts as listArtifactsAsync} from "./async-comments-attachments.js";
 import { and, eq, isNull, ne, sql } from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
+import {assertCccPlanningTaskNotHeld} from "./ccc-planning-custody.js";
 
 export async function saveWorkflowRunBranchImpl(store: TaskStore, state: { taskId: string; runId: string; branchId: string; currentNodeId: string; status: string; }): Promise<void> {
     /*
@@ -258,6 +259,13 @@ export async function pauseTaskImpl(store: TaskStore, id: string, paused: boolea
     return store.withTaskLock(id, async () => {
       const dir = store.taskDir(id);
       const task = await store.readTaskJson(dir);
+      /*
+      FNXC:CccPlanningCustody 2026-10-14-13:41:
+      Unpausing a held request-to-code planning task would hand its repository to the generic triage and executor agents (critic 1), so the store refuses it for every caller; only the planning operations own that task's pause. Pausing an already-held task changes no custody field and stays allowed.
+      */
+      if (!paused) {
+        await assertCccPlanningTaskNotHeld(store.asyncLayer, task, "unpause");
+      }
 
       // Initialize log array if missing (for legacy tasks)
       if (!task.log) {

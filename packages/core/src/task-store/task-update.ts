@@ -23,6 +23,8 @@ import {__setTaskActivityLogLimitsForTesting, isBootstrapPromptStub, rewriteHead
 import {applyOriginalDescription} from "../original-description-policy.js";
 import {normalizeTaskReviewState} from "../task-store/review-state.js";
 import {hasOwnDeclaredSymbols, normalizeDeclaredSymbols, extractDeclaredSymbolsFromPrompt, resolveTaskSymbolsForTask} from "../task-symbol-resolution.js";
+import {CccPlanningTaskCustodyError} from "../ccc-planning/errors.js";
+import {assertCccPlanningCustodyPreserved, cccPlanningCustodyReleasingUpdate, cccPlanningCustodySnapshot, isCccPlanningTaskHeld} from "./ccc-planning-custody.js";
 
 export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext,): Promise<Task> {
     {
@@ -38,6 +40,18 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       const dir = store.taskDir(id);
       const task = await store.readTaskJson(dir);
       const wasFailed = task.status === "failed";
+
+      /*
+      FNXC:CccPlanningCustody 2026-10-14-13:41:
+      This is the one write path under updateTask and updateTaskAtomic (task-mutation-ops.ts updateTaskAtomicImpl calls updateTaskUnlocked directly and skips updateTaskImpl), so the custody guard lives here (D22, challenge 11). A held planning task still takes non-custody fields such as a summary; inputs that release or move it are refused before any field or side effect is written, and the custody fields are compared again just before the write as the backstop for any path not listed.
+      */
+      const cccPlanningCustodyBefore = await isCccPlanningTaskHeld(store.asyncLayer, task)
+        ? cccPlanningCustodySnapshot(task)
+        : null;
+      if (cccPlanningCustodyBefore) {
+        const refused = cccPlanningCustodyReleasingUpdate(task, updates);
+        if (refused) throw new CccPlanningTaskCustodyError(id, refused);
+      }
 
       // Capture title/description before mutation so the PROMPT.md stub
       // detector below can compare against the exact wrapper bytes that the
@@ -740,6 +754,9 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         task.sliceId = updates.sliceId;
       }
       task.updatedAt = new Date().toISOString();
+      if (cccPlanningCustodyBefore) {
+        assertCccPlanningCustodyPreserved(id, cccPlanningCustodyBefore, task);
+      }
 
       // FNXC:TaskDetailPromptResilience 2026-07-10-17:00 (merge port from main):
       // Perform the explicit PROMPT.md write (and its File Scope validation)

@@ -40,6 +40,7 @@ import {
   TASK_JSONB_COLUMNS,
   type TaskPersistSerializationContext,
 } from "./persistence.js";
+import { assertCccPlanningTaskColumnsPreserveCustody } from "./ccc-planning-custody.js";
 
 /**
  *FNXC:TaskStorePersistence 2026-06-24-13:05:
@@ -467,6 +468,11 @@ export async function updateTaskColumns(
   updates: Record<string, unknown>,
 ): Promise<void> {
   if (Object.keys(updates).length === 0) return;
+  /*
+  FNXC:CccPlanningCustody 2026-10-14-13:41:
+  The raw column writer skips every store-level custody guard, so a write that changes a custody column (paused, userPaused, column, lineageId, deletedAt) of a held request-to-code planning task is refused here (D22). Writes that touch none of those columns, such as audit-ops' log append, pay no extra query.
+  */
+  await assertCccPlanningTaskColumnsPreserveCustody(layer, id, updates);
   await layer.db
     .update(schema.project.tasks)
     .set(updates as never)
