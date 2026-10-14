@@ -157,6 +157,19 @@ export type {
   CccCampaignProviderDispatchInput,
   AtomicCccCampaignProviderDispatchInput,
 } from "./provider-controller.js";
+// FNXC:CccPlanning 2026-10-14-15:15: card K1's planning view types (contract section 2.12),
+// exported so the Pi seam (card P1) imports one definition instead of keeping copies.
+export type {
+  CccProviderAttemptLimitReason,
+  CccProviderAttemptRefusalReason,
+  CccProviderAttemptRouteBindingView,
+  CccProviderAttemptScopeView,
+  CccProviderAttemptSettlementInputOf,
+} from "./types.js";
+export type {
+  CccProviderAttemptControllerView,
+  CccProviderControllerDecisionView,
+} from "./provider-controller.js";
 export {
   listCccProviderAttemptsForCampaign,
   assertCccProviderAttemptEffectiveRoute,

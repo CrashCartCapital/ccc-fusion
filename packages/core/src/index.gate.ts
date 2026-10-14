@@ -2298,3 +2298,7 @@ export { promoteResearchFinding } from "./research-feature-promotion.js";
 export type { ResearchFeaturePromotionInput } from "./research-feature-promotion.js";
 export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types.js";
 export * from "./task-document-concurrency.js";
+// FNXC:CccPlanning 2026-10-14-15:15: mirrors index.ts so engine code that imports the
+// planning contracts (custody guards in triage.ts and ccc-campaign-routing.ts) resolves
+// them under the engine-core gate alias too, instead of reading undefined.
+export * from "./ccc-planning/index.js";
