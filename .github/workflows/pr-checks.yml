@@ -308,6 +308,14 @@ jobs:
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
+      # Request-to-code planning proof, Linux lane: the PostgreSQL-free,
+      # macOS-free subset of the closed planning-proof inventory. One extra
+      # step in this job (not a fifth job, not part of `test:gate`). It carries
+      # no PostgreSQL env on purpose: the runner selects no PostgreSQL-backed
+      # command in this mode and drops any PG settings it inherits.
+      - name: Planning proof (Linux lane)
+        run: node scripts/run-ccc-planning-proof.mjs --mode ci-linux
+
   # Advisory desktop-packaging validation lives in its OWN workflow (desktop-packaging.yml) so this
   # thin gate stays exactly [Lint, Typecheck, Build, Gate] — the job set here maps 1:1 to the
   # branch-protection required checks (CI-shape test enforces the invariant).

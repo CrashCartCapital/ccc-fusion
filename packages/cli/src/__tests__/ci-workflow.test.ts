@@ -281,6 +281,26 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(toolchainIndex).toBeLessThan(readinessIndex);
   });
 
+  /*
+  FNXC:CccPlanningProof 2026-10-14-08:30:
+  Request-to-code card P0 (CONTRACT-v2 D51, section 2.20): the Linux Gate job runs the PostgreSQL-free, macOS-free subset of the planning proof inventory, after `pnpm test:gate`, as ONE extra step. It is not a fifth job, it is not folded into `test:gate` (the pins below stay exact), and the step carries no PostgreSQL environment because `--mode ci-linux` selects only PostgreSQL-free entries.
+  */
+  it("runs the planning proof's Linux lane as one Gate step after test:gate", () => {
+    const gateSteps = workflow.jobs?.gate?.steps ?? [];
+    const planningSteps = gateSteps.filter(
+      (step: any) => typeof step.run === "string" && step.run.includes("scripts/run-ccc-planning-proof.mjs"),
+    );
+    expect(planningSteps).toHaveLength(1);
+    expect(planningSteps[0].run).toBe("node scripts/run-ccc-planning-proof.mjs --mode ci-linux");
+    expect(planningSteps[0].env?.FUSION_PG_TEST_URL_BASE).toBeUndefined();
+    const gateTestsIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Gate tests (engine-core + CCC PRD safety + CI-shape)",
+    );
+    expect(gateTestsIndex).toBeGreaterThan(-1);
+    expect(gateSteps.indexOf(planningSteps[0])).toBeGreaterThan(gateTestsIndex);
+    expect(rootPackageJson.scripts?.["test:gate"] ?? "").not.toContain("ccc-planning");
+  });
+
   it("caps every PostgreSQL service container's memory and CPU", () => {
     expectPostgresServiceCapped(workflow);
   });
