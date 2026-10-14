@@ -150,6 +150,31 @@ function validateHeaders(value: unknown): Record<string, string> | undefined {
   return Object.fromEntries(entries as Array<[string, string]>);
 }
 
+/*
+FNXC:CustomProviders 2026-10-14-06:58:
+Request-to-code v3 card C6b (D27). `modelSync: "disabled"` pins a provider's `models` list: the serve-start and Settings refresh skip it and the single-provider refresh answers 409. The literal is the only accepted value (there is no "enabled"; absence is the default), so a typo cannot silently look like an opt-in or opt-out. Like `headers`, both parsers must carry it or the next dashboard edit would erase the pin with a 200.
+*/
+function validateModelSync(value: unknown): "disabled" | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value !== "disabled") {
+    throw badRequest("modelSync must be 'disabled' when provided");
+  }
+
+  return value;
+}
+
+/** True only for the exact opt-out token; any other stored value keeps the historical refresh behavior. */
+function isModelSyncDisabled(provider: Pick<CustomProvider, "modelSync">): boolean {
+  return provider.modelSync === "disabled";
+}
+
+function modelSyncDisabledError(providerId: string): ApiError {
+  return new ApiError(409, `Custom provider '${providerId}' model sync is disabled; its model list is pinned in settings`);
+}
+
 /**
  * Validates and normalizes a models array from a request body.
  * Returns undefined if models is omitted, or an array preserving the supported
@@ -240,6 +265,12 @@ function parseCreateBody(body: unknown): Omit<CustomProvider, "id"> {
   const headers = validateHeaders(row.headers);
   if (headers) {
     provider.headers = headers;
+  }
+
+  // FNXC:CustomProviders 2026-10-14-06:58: see validateModelSync — omitting this would erase the pin.
+  const modelSync = validateModelSync(row.modelSync);
+  if (modelSync) {
+    provider.modelSync = modelSync;
   }
 
   const models = validateModels(row.models);
@@ -594,6 +625,13 @@ export async function refreshCustomProviderModels(
   }
 
   const targetProvider = providers[targetIndex];
+  /*
+   * FNXC:CustomProviders 2026-10-14-06:58:
+   * A provider with `modelSync: "disabled"` is refused before any probe, so its endpoint sees no request and its row is never rewritten (D27: an exact pin must survive the serve-start refresh).
+   */
+  if (isModelSyncDisabled(targetProvider)) {
+    throw modelSyncDisabledError(providerId);
+  }
   const models = await discoverUsableProviderModels(targetProvider);
 
   /*
@@ -611,6 +649,10 @@ export async function refreshCustomProviderModels(
   }
 
   const latestTargetProvider = latestProviders[latestTargetIndex];
+  // FNXC:CustomProviders 2026-10-14-06:58: an opt-out saved while the probe was in flight wins; never persist a catalog onto a pin.
+  if (isModelSyncDisabled(latestTargetProvider)) {
+    throw modelSyncDisabledError(providerId);
+  }
   if (
     latestTargetProvider.baseUrl !== targetProvider.baseUrl ||
     latestTargetProvider.apiType !== targetProvider.apiType ||
@@ -647,7 +689,14 @@ export async function refreshAllCustomProviderModels(
 
   let refreshed = 0;
   let failed = 0;
+  let skipped = 0;
   for (const provider of providers) {
+    // FNXC:CustomProviders 2026-10-14-06:58: opt-out providers are skipped and counted, never probed or rewritten.
+    if (isModelSyncDisabled(provider)) {
+      skipped += 1;
+      logFn(`Skipped model refresh for custom provider "${provider.name}" (id=${provider.id}): modelSync is disabled`);
+      continue;
+    }
     try {
       const result = await refreshCustomProviderModels(store, provider.id);
       refreshed += 1;
@@ -659,7 +708,7 @@ export async function refreshAllCustomProviderModels(
     }
   }
 
-  return { refreshed, failed, skipped: 0 };
+  return { refreshed, failed, skipped };
 }
 
 /**
@@ -706,6 +755,11 @@ function parseUpdateBody(body: unknown): Partial<Omit<CustomProvider, "id">> {
   // (partial update); an explicit `{}` clears it. Without this branch every UI edit stripped it.
   if (row.headers !== undefined) {
     updates.headers = validateHeaders(row.headers);
+  }
+  // FNXC:CustomProviders 2026-10-14-06:58: absent means "leave the stored pin alone" (partial update).
+  // There is deliberately no value that clears it here: the pin is removed by editing settings.json.
+  if (row.modelSync !== undefined) {
+    updates.modelSync = validateModelSync(row.modelSync);
   }
   if (row.models !== undefined) {
     updates.models = validateModels(row.models);

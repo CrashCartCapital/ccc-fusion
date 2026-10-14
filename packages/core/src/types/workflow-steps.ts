@@ -217,6 +217,16 @@ export interface CustomProvider {
    */
   headers?: Record<string, string>;
   /**
+   * FNXC:CustomProviders 2026-10-14-06:50:
+   * Opt-out from catalog sync. `"disabled"` means the `models` list is an exact, operator-pinned
+   * list: startup and Settings refresh must leave this provider's row byte-identical (they skip it
+   * and count it), and a manual single-provider refresh is refused with 409. Absent means the
+   * historical behavior (refresh merges the provider's `/models` catalog). Declared here so the
+   * dashboard create/update parsers, which rebuild rows from a field allowlist, carry it instead
+   * of erasing it on the next edit.
+   */
+  modelSync?: "disabled";
+  /**
    * Per-model generation limits. When absent, the model registry falls back to
    * its historical defaults (maxTokens 16384, contextWindow 128000); declare
    * them when the backend's real window differs, or long structured responses
