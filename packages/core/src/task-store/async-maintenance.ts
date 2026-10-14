@@ -90,11 +90,17 @@ export async function pruneOperationalLogsAsync(
   are NEVER pruned by this maintenance job. campaign_import_id is the canonical
   marker — the binding check constraint makes campaign columns all-or-nothing,
   and it is the FK linkage to project.ccc_prd_imports.
+
+  FNXC:CccPlanningRetention 2026-10-14-14:14:
+  Request-to-code planning audit rows (run_id ccc-plan:<24 hex>, D5) are never pruned either. The planning call
+  ledger, operator control history and repair/review counters are folded from them, and they carry no campaign
+  binding before (or after) the import link, so the campaign_import_id marker alone would let them expire.
   */
   await count("runAuditEvents", sql`
     DELETE FROM project.run_audit_events AS events
     WHERE events.timestamp < ${cutoff}
       AND events.campaign_import_id IS NULL
+      AND events.run_id NOT LIKE 'ccc-plan:%'
       AND events.task_id IN (
         SELECT id FROM project.tasks WHERE project_id = ${projectId}
       )
