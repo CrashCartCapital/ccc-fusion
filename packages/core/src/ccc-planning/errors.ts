@@ -58,6 +58,8 @@ export const CCC_PLANNING_REFUSAL_CODES = [
   "CCC_PLANNING_CANCELLED",
   // CLI
   "CCC_PLANNING_CLI_USAGE", "CCC_PLANNING_COMMAND_NOT_SUPPORTED", "CCC_PLANNING_INTERNAL_ERROR",
+  /* FNXC:CccPlanningErrors 2026-10-14-15:05: card K1b (errata E3-4, E4-K item 1) appends this terminal code: a writer session whose confined shell cannot prove every descendant process is gone is quarantined by the writer card, and the build-follow card maps it to the run state blocked_prerequisite (E4-2). It is the last entry, so no earlier code changes position. */
+  "CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED",
 ] as const;
 
 export type CccPlanningRefusalCode = (typeof CCC_PLANNING_REFUSAL_CODES)[number];

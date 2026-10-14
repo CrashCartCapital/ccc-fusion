@@ -19,6 +19,8 @@ FNXC:CccPlanningSchemas 2026-10-14-09:21:
 Errata E1 tightens three shapes. Proof results follow CONTRACT-v3 section 2.17 (item 46): one settled proof attempt per proof id, with its attempt key, state and stored terminal digests (E1-8). Owned paths are compared on a case- and normalization-folded key because the I2 host's APFS volume folds both, and a task may not list a path twice, own anything inside `.git` or own an `.env` file (E1-10). A verifier proof id is its Taskfile name and each proof names its own `verify:<id>` target; the bundle has no root-level task (E1-12, item 41).
 FNXC:CccPlanningSchemas 2026-10-14-13:26:
 Errata E2 (the K1 final repair). The path key folds case fully, as APFS does (E2-40), and also decides write-root containment (E2-46). Owned paths, write roots, verifier files and control files refuse every denied name as well as `.git` and `.env` (E2-41, E2-42), and bundle and control files are de-duplicated on the key (E2-41). Proof ids in a task plan and in proof results match the Taskfile proof-id pattern, and a committed proof result has exit code 0, as the proof-attempt store requires (E2-43).
+FNXC:CccPlanningSchemas 2026-10-14-15:05:
+Card K1b (errata E4-K, the K1 residual). The path key lower-cases before it upper-cases, so the capital sharp s keys with the sharp s and `ss` (E2-40a). A control file may not equal or lie inside a verifier bundle file on that key, so a control can never replace the verifier (item 4). The spec-ready baseline files get the verifier-file refusals and key de-duplication, and a requirement's proof ids must be Taskfile-safe proof ids, as defence in depth (item 5).
 */
 
 export const CCC_PLANNING_CONTENT_SCHEMAS = {
@@ -243,9 +245,13 @@ The I2 host is Darwin, whose default APFS volume ignores letter case and Unicode
 FNXC:CccPlanningOwnedPaths 2026-10-14-13:26:
 Errata E2-40 replaces the E1-10 formula. APFS folds case fully, so `straße`/`strasse`, final/medial sigma and the `ﬁ` ligature/`fi` are also one file there, and simple lower-casing missed all three. The key is now the posix-normalized `p.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC")`, without a trailing slash: upper-casing first expands ß to SS and ﬁ to FI and maps both sigmas to Σ, and lower-casing then lands every APFS-equal spelling on one string. Its one over-refusal is capital I against dotless ı, which APFS keeps apart; that is accepted as fail-closed. The key normalizes the spelling itself (`./`, `..`, `//`, a trailing slash), so every card that compares paths (GG under E2-13, for one) gets the same identity from any spelling.
 */
+/*
+FNXC:CccPlanningOwnedPaths 2026-10-14-15:05:
+Card K1b (errata E4-K item 2, E2-40a) amends the E2-40 formula. U+1E9E (capital sharp s) is already upper case, so upper-casing first left it alone and the following lower-casing turned it into the sharp s, while the sharp s and `ss` both came out as `ss`: the three spellings open one file on APFS but had two keys. The key now lower-cases first, so the capital sharp s becomes the sharp s before the upper-casing expands it: `p.normalize("NFC").toLowerCase().toUpperCase().toLowerCase().normalize("NFC")`, posix-normalized. The extra pass keeps the rest of E2-40 as it was (ß/ss, ς/σ, ﬁ/fi, Kelvin K/k, İ/i̇, NFC/NFD, A/a) and the key is still idempotent; I against dotless ı remains the accepted over-refusal.
+*/
 /** The one comparison key of a worktree path on the I2 host's case- and normalization-insensitive volume. */
 export function cccPlanningPathComparisonKey(path: string): string {
-  let key = posix.normalize(path.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC"));
+  let key = posix.normalize(path.normalize("NFC").toLowerCase().toUpperCase().toLowerCase().normalize("NFC"));
   while (key.length > 1 && key.endsWith("/")) key = key.slice(0, -1);
   return key;
 }
@@ -267,6 +273,8 @@ const DENIED_NAME_RULES: readonly Readonly<{ name: string; folded: string; prefi
 /*
 FNXC:CccPlanningOwnedPaths 2026-10-14-13:26:
 Errata E2-41 and E2-42: one reason helper refuses a path a task may never own or write, and a verifier or control file may never be: a `.git` segment, an `.env` or `.env.*` file, or any segment that folds to a `CCC_PLANNING_DENIED_NAMES` entry (`.npmrc`, `_secrets/x`, `.agentsecrets`, `.envrc`, ...). Names that merely mention one, such as `src/env.mjs` or `docs/secrets-guide.md`, stay admissible.
+FNXC:CccPlanningOwnedPaths 2026-10-14-15:05:
+Accepted residual (card K1b, errata E4-K item 6; no test pins it): a denied name matches a whole path segment, or the part before the `*` of an `.env.*` entry, so `.envrc.bak` is admitted. A writer can create such a file, but no tool reads it by that name (direnv reads `.envrc` itself, which is refused).
 */
 /** Why a relative path can never be owned or written by a task, or carried by a verifier bundle, or null. */
 function forbiddenOwnedPathReason(path: string): string | null {
@@ -489,7 +497,7 @@ export const validateCccPlanningRequirementMapV1: CccPlanningContentValidator = 
     if (id !== null) requirementIds.push(id);
     p.text(requirement.title, `${at}.title`);
     p.text(requirement.statement, `${at}.statement`);
-    p.texts(requirement.proofIds, `${at}.proofIds`, 1);
+    p.proofIds(requirement.proofIds, `${at}.proofIds`, 1); // Taskfile names like every proof id (card K1b, errata E4-K item 5)
     const clauseIds: string[] = [];
     p.array(requirement.clauses, `${at}.clauses`, 1).forEach((clauseEntry, clauseIndex) => {
       const clauseAt = `${at}.clauses[${clauseIndex}]`;
@@ -722,6 +730,24 @@ function samePathProblem(label: string, path: string, first: string): string {
   return first === path ? `${label} ${path} is declared more than once` : `${label} ${path} is the same path as ${first}`;
 }
 
+/*
+FNXC:CccPlanningSchemas 2026-10-14-15:05:
+Card K1b (errata E4-K item 4): a control is written over the baseline to prove the verifier fails a defective implementation, so it may replace an implementation file and never the verifier. This finds the verifier bundle file, if any, whose comparison key equals the control path's key or is a directory prefix of it (`Taskfile.yml/x` lies below `taskfile.yml`), walking the key's ancestors from the full path upward so the nearest match is reported first.
+*/
+/** The bundle file a control path equals or lies inside, on the comparison key, and which of the two; null when the path is outside the bundle. */
+function bundleFileAtOrAbove(bundleKeys: ReadonlyMap<string, string>, path: string): Readonly<{ file: string; inside: boolean }> | null {
+  let key = cccPlanningPathComparisonKey(path);
+  let inside = false;
+  for (;;) {
+    const file = bundleKeys.get(key);
+    if (file !== undefined) return { file, inside };
+    const slash = key.lastIndexOf("/");
+    if (slash < 0) return null;
+    key = key.slice(0, slash);
+    inside = true;
+  }
+}
+
 export const validateCccPlanningVerifierBundleV1: CccPlanningContentValidator = (value) => validated((p) => {
   const root = p.object(value, "verifier bundle", ["schema", "files", "proofs", "controls"]);
   if (!root) return;
@@ -780,6 +806,8 @@ export const validateCccPlanningVerifierBundleV1: CccPlanningContentValidator = 
       if (path !== null) {
         const first = firstSpelling(controlKeys, path);
         if (first !== null) p.add(samePathProblem(`control ${id} file`, path, first));
+        const verifier = bundleFileAtOrAbove(fileKeys, path);
+        if (verifier !== null) p.add(`control ${id} file ${path} ${verifier.inside ? "lies inside" : "replaces"} verifier file ${verifier.file}`);
       }
       if (typeof file.content !== "string") p.add(`${fileAt}.content must be a string`);
     });
@@ -863,18 +891,22 @@ export const validateCccPlanningSpecReadyV1: CccPlanningContentValidator = (valu
     ["parent", "files", "treeOid", "author", "committer", "message", "predictedCommitOid"]);
   if (baseline) {
     p.pattern(baseline.parent, "verifierBaseline.parent", GIT_OID, "a git object id");
-    const paths: string[] = [];
+    // Defence in depth (card K1b, errata E4-K item 5): the baseline files are the verifier bundle's files, so they get the same
+    // refusals (`.git`, `.env`, denied names) and the same de-duplication on the comparison key (E2-41).
+    const baselineKeys = new Map<string, string>();
     p.array(baseline.files, "verifierBaseline.files", 1).forEach((entry, index) => {
       const at = `verifierBaseline.files[${index}]`;
       const file = p.object(entry, at, ["path", "mode", "blobOid", "sha256"]);
       if (!file) return;
-      const path = canonicalPath(p, file.path, `${at}.path`);
-      if (path !== null) paths.push(path);
+      const path = bundleFilePath(p, file.path, `${at}.path`);
+      if (path !== null) {
+        const first = firstSpelling(baselineKeys, path);
+        if (first !== null) p.add(samePathProblem("verifier baseline file", path, first));
+      }
       p.oneOf(file.mode, `${at}.mode`, FILE_MODES);
       p.pattern(file.blobOid, `${at}.blobOid`, GIT_OID, "a git object id");
       p.pattern(file.sha256, `${at}.sha256`, HEX64, "a lowercase sha256");
     });
-    for (const path of duplicates(paths)) p.add(`verifier baseline file ${path} is listed more than once`);
     p.pattern(baseline.treeOid, "verifierBaseline.treeOid", GIT_OID, "a git object id");
     signature(p, baseline.author, "verifierBaseline.author");
     signature(p, baseline.committer, "verifierBaseline.committer");

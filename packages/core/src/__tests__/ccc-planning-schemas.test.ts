@@ -39,6 +39,10 @@ Card K1 proof for the planning content schemas (CONTRACT-v2 section 2.17). The t
 
 const ref = (artifactKey: string, digest = "a".repeat(64)) => ({ artifactKey, digest });
 
+/** U+1E9E (capital sharp s) and U+00DF (sharp s), as escapes so an editor cannot change their composition (card K1b). */
+const CAPITAL_SHARP_S = "ẞ";
+const SHARP_S = "ß";
+
 function diamondPlan(): CccPlanningTaskPlanV1 {
   const task = (id: string, owned: string, deps: string[]) => ({
     id, title: `task ${id}`, description: `implements ${id}`, requirementIds: [`REQ-${id}`],
@@ -195,6 +199,50 @@ describe("task plan validation (G4 prerequisites)", () => {
     }))).toEqual([]);
   });
 
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-14:58:
+  Card K1b (errata E4-K item 2, E2-40a): the capital sharp s opens the same APFS file as the sharp s and as `ss`, so two writers owning any two of the three would share one physical file. Each pair is checked across tasks, and the pair that matters most for a plan, a name that contains the capital sharp s against its `ss` spelling, is also checked inside one task and for verifier files below.
+  */
+  it("refuses owned paths across tasks that differ only by capital sharp s against sharp s or ss (card K1b)", () => {
+    for (const [left, right] of [
+      [`src/${CAPITAL_SHARP_S}.mjs`, "src/ss.mjs"],
+      [`src/${CAPITAL_SHARP_S}.mjs`, `src/${SHARP_S}.mjs`],
+      [`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strasse.mjs"],
+    ] as const) {
+      expect(problemsOf(mutate((plan) => {
+        plan.tasks[0]!.ownedPaths = [left]; plan.tasks[0]!.allowedWriteRoots = [left];
+        plan.tasks[1]!.ownedPaths = [right]; plan.tasks[1]!.allowedWriteRoots = [right];
+      })), `${left} | ${right}`).toMatch(/tasks T1 and T2 own overlapping paths/);
+    }
+    // Controls: the sharp s against ss stays refused, the I against dotless i over-refusal stays as pinned, and names that differ by more stay admitted.
+    for (const [left, right] of [[`src/${SHARP_S}.mjs`, "src/ss.mjs"], ["src/I.mjs", "src/ı.mjs"]] as const) {
+      expect(problemsOf(mutate((plan) => {
+        plan.tasks[0]!.ownedPaths = [left]; plan.tasks[0]!.allowedWriteRoots = [left];
+        plan.tasks[1]!.ownedPaths = [right]; plan.tasks[1]!.allowedWriteRoots = [right];
+      })), `${left} | ${right}`).toMatch(/tasks T1 and T2 own overlapping paths/);
+    }
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = [`src/stra${CAPITAL_SHARP_S}e.mjs`]; plan.tasks[0]!.allowedWriteRoots = [`src/stra${CAPITAL_SHARP_S}e.mjs`];
+      plan.tasks[1]!.ownedPaths = ["src/strase.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["src/strase.mjs"];
+    }))).toEqual([]);
+  });
+
+  it("refuses a duplicate owned path within one task that only capital sharp s reveals (card K1b)", () => {
+    for (const [first, second] of [
+      [`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strasse.mjs"],
+      [`src/stra${CAPITAL_SHARP_S}e.mjs`, `src/stra${SHARP_S}e.mjs`],
+      [`src/${CAPITAL_SHARP_S}.mjs`, "src/ss.mjs"],
+    ] as const) {
+      expect(problemsOf(mutate((plan) => {
+        plan.tasks[0]!.ownedPaths = [first, second]; plan.tasks[0]!.allowedWriteRoots = [first];
+      })), `${first} | ${second}`).toMatch(/task T1 owns the same path twice: /);
+    }
+    // Control: two files that differ by more than the fold are admissible in one task.
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = [`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strase.mjs"]; plan.tasks[0]!.allowedWriteRoots = ["src/strase.mjs"];
+    }))).toEqual([]);
+  });
+
   it("refuses an owned path inside .git or naming an .env file, and the same for a write root", () => {
     for (const bad of [".git", ".git/hooks/pre-commit", "src/.git/config", ".GIT/config"]) {
       expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; plan.tasks[0]!.allowedWriteRoots = [bad]; })), bad)
@@ -338,6 +386,38 @@ describe("path comparison key", () => {
       expect(cccPlanningPathComparisonKey(left), `${left} | ${right}`).not.toBe(cccPlanningPathComparisonKey(right));
       expect(cccPlanningPathsOverlap(left, right), `${left} | ${right}`).toBe(false);
     }
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-14:58:
+  Card K1b (errata E4-K item 2, E2-40a). The E2-40 formula upper-cased first, and U+1E9E (capital sharp s) is already upper case, so it lower-cased to the sharp s while the sharp s and `ss` both keyed to `ss`. All three open one file on APFS. Lower-casing first sends the capital sharp s to the sharp s, and the rest of the chain then lands all three on `ss`. The characters are written as escapes so no editor can change their composition.
+  */
+  it("merges capital sharp s with sharp s and ss, is idempotent over a fixed sample, and keeps the pinned I and dotless i over-refusal (card K1b)", () => {
+    const key = cccPlanningPathComparisonKey;
+    expect(key(`src/${CAPITAL_SHARP_S}.mjs`)).toBe(key("src/ss.mjs"));
+    expect(key(`src/${CAPITAL_SHARP_S}.mjs`)).toBe(key(`src/${SHARP_S}.mjs`));
+    expect(key(`src/${SHARP_S}.mjs`)).toBe(key("src/ss.mjs"));
+    expect(key(`stra${CAPITAL_SHARP_S}e`)).toBe(key("STRASSE"));
+    expect(key(`stra${CAPITAL_SHARP_S}e`)).toBe(key("strasse"));
+    expect(key(CAPITAL_SHARP_S)).toBe("ss");
+    for (const [left, right] of [[`src/${CAPITAL_SHARP_S}.mjs`, "src/ss.mjs"], [`src/${CAPITAL_SHARP_S}.mjs`, `src/${SHARP_S}.mjs`],
+      [`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strasse.mjs"]] as const) {
+      expect(cccPlanningPathsOverlap(left, right), `${left} | ${right}`).toBe(true);
+    }
+
+    const sample = ["src/Tokenizer.mjs", CAPITAL_SHARP_S, SHARP_S, "ss", `stra${CAPITAL_SHARP_S}e`, "STRASSE", "ς", "σ", "Σ",
+      "ﬁle", "K", "İ", "ı", "I", "café", "café", `./SRC/${CAPITAL_SHARP_S}/`, `a/../b/${CAPITAL_SHARP_S}.mjs`,
+      "ǅ", "ŉ", "ΐ", "ẞẞ"];
+    for (const value of sample) {
+      expect(key(key(value)), JSON.stringify(value)).toBe(key(value));
+    }
+
+    // Controls: the sharp s and ss stay merged, the I against dotless i over-refusal stays as pinned, and a different name stays apart.
+    expect(key(`src/${SHARP_S}.mjs`)).toBe(key("src/ss.mjs"));
+    expect(key("src/I.mjs")).toBe(key("src/ı.mjs"));
+    expect(key(`src/${CAPITAL_SHARP_S}.mjs`)).not.toBe(key("src/s.mjs"));
+    expect(key(`src/${CAPITAL_SHARP_S}.mjs`)).not.toBe(key("src/sss.mjs"));
+    expect(cccPlanningPathsOverlap(`src/${CAPITAL_SHARP_S}.mjs`, "src/s.mjs")).toBe(false);
   });
 });
 
@@ -625,6 +705,113 @@ describe("content schema validators", () => {
     for (const exitCode of [0, 1, 137, null]) {
       expect(withResults(passed, { ...failed, exitCode }), String(exitCode)).toEqual([]);
     }
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-14:58:
+  Card K1b (errata E4-K item 2, E2-40a): the verifier bundle's own files are de-duplicated on the comparison key, so the capital sharp s and `ss` spellings of one file cannot both be bundled, where the Taskfile or a harness on disk could differ from the blob the custody check reads.
+  */
+  it("refuses verifier bundle files that differ only by capital sharp s, sharp s or ss (card K1b)", () => {
+    type BundleFile = Readonly<{ path: string; mode: "100644" | "100755"; content: string }>;
+    const file = (path: string): BundleFile => ({ path, mode: "100644", content: "export {};\n" });
+    const withFiles = (...extra: BundleFile[]) => validateCccPlanningVerifierBundleV1(withField(VERIFIER, "files", [...VERIFIER.files, ...extra]));
+    expect(withFiles(file(`test/stra${CAPITAL_SHARP_S}e.mjs`), file("test/strasse.mjs")))
+      .toContain(`verifier file test/strasse.mjs is the same path as test/stra${CAPITAL_SHARP_S}e.mjs`);
+    expect(withFiles(file(`test/stra${CAPITAL_SHARP_S}e.mjs`), file(`test/stra${SHARP_S}e.mjs`)))
+      .toContain(`verifier file test/stra${SHARP_S}e.mjs is the same path as test/stra${CAPITAL_SHARP_S}e.mjs`);
+    // Controls: the sharp s against ss stays refused, and names that differ by more are admitted.
+    expect(withFiles(file(`test/stra${SHARP_S}e.mjs`), file("test/strasse.mjs")))
+      .toContain(`verifier file test/strasse.mjs is the same path as test/stra${SHARP_S}e.mjs`);
+    expect(withFiles(file(`test/stra${CAPITAL_SHARP_S}e.mjs`), file("test/strase.mjs"))).toEqual([]);
+
+    const control = VERIFIER.controls[0]!;
+    const withControlFiles = (...paths: string[]) => validateCccPlanningVerifierBundleV1(withField(VERIFIER, "controls",
+      [{ ...control, files: paths.map((path) => ({ path, content: "export {};\n" })) }]));
+    expect(withControlFiles(`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strasse.mjs"))
+      .toContain(`control CTRL-1 file src/strasse.mjs is the same path as src/stra${CAPITAL_SHARP_S}e.mjs`);
+    expect(withControlFiles(`src/stra${CAPITAL_SHARP_S}e.mjs`, "src/strase.mjs")).toEqual([]);
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-14:58:
+  Card K1b (errata E4-K item 4). A control is a defective implementation written over the baseline to prove the verifier fails it, so it may replace an implementation file and nothing else. A control file that is the same path as a verifier bundle file, on the comparison key, would replace the verifier itself (the Taskfile or a harness) with a body that always passes; one that lies inside a bundle file's path is refused too, because the key treats `Taskfile.yml/x` as below `taskfile.yml`. Both are refused with the bundle file named. A control that replaces an implementation file outside the bundle is the positive control.
+  */
+  it("refuses a control file that equals or lies inside a verifier bundle file, and admits one outside the bundle (card K1b)", () => {
+    const extra = { path: `test/stra${CAPITAL_SHARP_S}e.mjs`, mode: "100644" as const, content: "export {};\n" };
+    const control = VERIFIER.controls[0]!;
+    const withControlFiles = (...paths: string[]) => validateCccPlanningVerifierBundleV1({
+      ...VERIFIER,
+      files: [...VERIFIER.files, extra],
+      controls: [{ ...control, files: paths.map((path) => ({ path, content: "export {};\n" })) }],
+    });
+    // Equal on the comparison key: exact, case-folded and capital-sharp-s spellings, for the Taskfile and for a harness file.
+    expect(withControlFiles("Taskfile.yml")).toContain("control CTRL-1 file Taskfile.yml replaces verifier file Taskfile.yml");
+    expect(withControlFiles("taskfile.yml")).toContain("control CTRL-1 file taskfile.yml replaces verifier file Taskfile.yml");
+    expect(withControlFiles("TEST/Tokenizer.Test.mjs"))
+      .toContain("control CTRL-1 file TEST/Tokenizer.Test.mjs replaces verifier file test/tokenizer.test.mjs");
+    expect(withControlFiles("src/ok.mjs", "test/strasse.mjs"))
+      .toContain(`control CTRL-1 file test/strasse.mjs replaces verifier file test/stra${CAPITAL_SHARP_S}e.mjs`);
+    // Inside a bundle file's path.
+    expect(withControlFiles("Taskfile.yml/inner.mjs")).toContain("control CTRL-1 file Taskfile.yml/inner.mjs lies inside verifier file Taskfile.yml");
+    expect(withControlFiles("TASKFILE.YML/a/b.mjs")).toContain("control CTRL-1 file TASKFILE.YML/a/b.mjs lies inside verifier file Taskfile.yml");
+    expect(withControlFiles("test/strasse.mjs/x")).toContain(`control CTRL-1 file test/strasse.mjs/x lies inside verifier file test/stra${CAPITAL_SHARP_S}e.mjs`);
+    // A second control is checked too.
+    expect(validateCccPlanningVerifierBundleV1(withField(VERIFIER, "controls", [control, { ...control, id: "CTRL-2", files: [{ path: "taskfile.yml", content: "x" }] }])))
+      .toContain("control CTRL-2 file taskfile.yml replaces verifier file Taskfile.yml");
+
+    // Controls: an implementation file outside the bundle is admitted, so are look-alikes that are neither equal nor inside, and two controls may replace the same one.
+    expect(withControlFiles("src/tokenizer.mjs")).toEqual([]);
+    expect(withControlFiles("src/tokenizer.mjs", "src/other.mjs")).toEqual([]);
+    expect(withControlFiles("Taskfile.yml.bak", "test/tokenizer.test.mjs2", "test2/tokenizer.test.mjs", "tests/Taskfile.yml")).toEqual([]);
+    expect(validateCccPlanningVerifierBundleV1(withField(VERIFIER, "controls", [control, { ...control, id: "CTRL-2" }]))).toEqual([]);
+    expect(validateCccPlanningVerifierBundleV1(VERIFIER)).toEqual([]);
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-14:58:
+  Card K1b (errata E4-K item 5), defence in depth. The spec-ready closure's `verifierBaseline.files` are the files of the baseline commit, so they get the verifier-file refusals (E2-41) even though the bundle was validated earlier: a `.git` segment, an `.env` file or a denied name is refused, and two spellings of one path on the comparison key are one file. A requirement's proof ids are Taskfile names like every other proof id (E1-12, E2-43).
+  */
+  it("runs spec-ready baseline files through the verifier file helper: key duplicates, .git, .env and denied names (card K1b)", () => {
+    const baseline = SPEC_READY.verifierBaseline;
+    const entry = (path: string) => ({ path, mode: "100644" as const, blobOid: "8".repeat(40), sha256: "9".repeat(64) });
+    const withBaselineFiles = (...paths: string[]) => validateCccPlanningSpecReadyV1(
+      withField(SPEC_READY, "verifierBaseline", { ...baseline, files: paths.map(entry) }));
+    expect(withBaselineFiles("Taskfile.yml", "taskfile.yml")).toContain("verifier baseline file taskfile.yml is the same path as Taskfile.yml");
+    expect(withBaselineFiles(`test/stra${CAPITAL_SHARP_S}e.mjs`, "test/strasse.mjs"))
+      .toContain(`verifier baseline file test/strasse.mjs is the same path as test/stra${CAPITAL_SHARP_S}e.mjs`);
+    expect(withBaselineFiles("test/a.mjs", "test/a.mjs")).toContain("verifier baseline file test/a.mjs is declared more than once");
+    const refusals: readonly [string, RegExp][] = [
+      [".git/hooks/post-checkout", /verifierBaseline\.files\[1\]\.path "\.git\/hooks\/post-checkout" has a \.git path segment/],
+      [".env", /verifierBaseline\.files\[1\]\.path "\.env" names an \.env file/],
+      ["config/.env.local", /verifierBaseline\.files\[1\]\.path "config\/\.env\.local" names an \.env file/],
+      ["config/.npmrc", /verifierBaseline\.files\[1\]\.path "config\/\.npmrc" has the denied name \.npmrc as a path segment/],
+      [".envrc", /verifierBaseline\.files\[1\]\.path "\.envrc" has the denied name \.envrc as a path segment/],
+      ["_secrets/key.json", /verifierBaseline\.files\[1\]\.path "_secrets\/key\.json" has the denied name _secrets as a path segment/],
+      [".AgentSecrets/token", /verifierBaseline\.files\[1\]\.path "\.AgentSecrets\/token" has the denied name \.agentsecrets as a path segment/],
+    ];
+    for (const [path, problem] of refusals) {
+      expect(withBaselineFiles("Taskfile.yml", path), path).toContainEqual(expect.stringMatching(problem));
+    }
+    // Controls: ordinary harness paths are admitted, a name that merely mentions env or secrets is admitted, and the fixture itself is clean.
+    expect(withBaselineFiles("Taskfile.yml", "test/harness/run.mjs", "test/fixtures/sample.txt", "test/env.mjs", "docs/secrets-guide.md")).toEqual([]);
+    expect(withBaselineFiles("test/strase.mjs", "test/strasse.mjs")).toEqual([]);
+    expect(validateCccPlanningSpecReadyV1(SPEC_READY)).toEqual([]);
+  });
+
+  it("requires requirement-map proof ids to be Taskfile-safe proof ids (card K1b)", () => {
+    const requirement = REQUIREMENT_MAP.requirements[0]!;
+    const withProofIds = (proofIds: readonly string[]) => validateCccPlanningRequirementMapV1(
+      withField(REQUIREMENT_MAP, "requirements", [{ ...requirement, proofIds }]));
+    for (const id of ["Tokenizer", "PROOF-1", "-t1", "t1_a", "verify:t1", "has space", `a${"b".repeat(63)}`]) {
+      expect(withProofIds([id]), id).toContainEqual(expect.stringMatching(/requirements\[0\]\.proofIds\[0\] must be a proof id/));
+    }
+    expect(withProofIds(["tokenizer", "PROOF-2"])).toContainEqual(expect.stringMatching(/requirements\[0\]\.proofIds\[1\] must be a proof id/));
+    // Controls: lowercase, hyphenated and the longest legal ids are admitted, a repeat is still refused, and at least one is still required.
+    for (const ids of [["tokenizer"], ["word-frequency", "0tokenizer"], [`a${"b".repeat(62)}`]]) {
+      expect(withProofIds(ids), ids.join(",")).toEqual([]);
+    }
+    expect(withProofIds(["tokenizer", "tokenizer"])).toContain("requirements[0].proofIds lists tokenizer more than once");
+    expect(withProofIds([])).toContain("requirements[0].proofIds must have at least one entry");
   });
 
   it("registers one validator per content schema id", () => {

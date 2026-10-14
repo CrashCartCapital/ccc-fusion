@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import { CCC_PLANNING_BUDGET_POLICY_V1 } from "../ccc-planning/budget-fit.js";
 import {
@@ -378,6 +378,54 @@ describe("policy digest inputs", () => {
     expect(cccPlanningPolicyDigest()).toBe(digest);
     expect(cccPlanningSourcePolicySha256()).toBe(sourceDigest);
   });
+
+  /*
+  FNXC:CccPlanningPolicy 2026-10-14-14:58:
+  Card K1b (errata E4-K item 3). The test above calls the digest first, and `cccPlanningPolicyDigestMaterial` deep-freezes everything it returns in place, so a missing module-level `deepFreezeCccPlanningConstant` call is healed by the very call the test makes before it looks. This test imports the modules afresh and inspects every constant that feeds the digest before any digest function runs, so removing any one module-level freeze leaves an unfrozen object that is reported by its path. The digest material is read only afterwards, to prove that these constants are exactly its inputs (same objects), so the inspected list cannot drift away from what the digest hashes.
+  */
+  it("has every module-level digest input deep-frozen straight after a fresh import, before any digest call (card K1b)", async () => {
+    const unfrozenPaths = (value: unknown, path: string, seen = new Set<unknown>()): string[] => {
+      if (value === null || typeof value !== "object" || seen.has(value)) return [];
+      seen.add(value);
+      const found = Object.isFrozen(value) ? [] : [path];
+      for (const [key, entry] of Object.entries(value)) found.push(...unfrozenPaths(entry, `${path}.${key}`, seen));
+      return found;
+    };
+
+    // Positive control: the walker reports an unfrozen copy and a shallow-frozen copy, so an empty report below means something.
+    expect(unfrozenPaths(structuredClone(CCC_PLANNING_SOURCE_POLICY_I2), "copy")).toContain("copy.allow.0");
+    expect(unfrozenPaths(Object.freeze(structuredClone(CCC_PLANNING_PREFLIGHT_LINEAGES)), "copy")).toContain("copy.0.probes");
+
+    vi.resetModules();
+    const policy = await import("../ccc-planning/policy.js");
+    const budget = await import("../ccc-planning/budget-fit.js");
+    expect(policy.CCC_PLANNING_DENIED_NAMES, "the fresh import is a different module instance").not.toBe(CCC_PLANNING_DENIED_NAMES);
+
+    const inputs: readonly (readonly [string, unknown])[] = [
+      ["role policy", policy.CCC_PLANNING_ROLE_POLICY_FULL_V2],
+      ["toolsets", policy.CCC_PLANNING_TOOLSETS],
+      ["linked writer toolset", policy.CCC_PLANNING_LINKED_WRITER_TOOLSET],
+      ["preflight lineages", policy.CCC_PLANNING_PREFLIGHT_LINEAGES],
+      ["denied names", policy.CCC_PLANNING_DENIED_NAMES],
+      ["budget policy", budget.CCC_PLANNING_BUDGET_POLICY_V1],
+      ["source policy", policy.CCC_PLANNING_SOURCE_POLICY_I2],
+    ];
+    const unfrozen = inputs.flatMap(([label, value]) => unfrozenPaths(value, label));
+    expect(unfrozen).toEqual([]);
+
+    // Only now read the digest material: its inputs are exactly the objects inspected above, and it names nothing else.
+    const material = policy.cccPlanningPolicyDigestMaterial() as Record<string, unknown>;
+    expect(Object.keys(material).sort()).toEqual(["budgetPolicy", "counters", "deniedNames", "linkedWriterToolset", "preflightLineages",
+      "probeTool", "roles", "sourcePolicy", "toolsets"]);
+    expect(material.roles).toBe(policy.CCC_PLANNING_ROLE_POLICY_FULL_V2.roles);
+    expect(material.toolsets).toBe(policy.CCC_PLANNING_TOOLSETS);
+    expect(material.linkedWriterToolset).toBe(policy.CCC_PLANNING_LINKED_WRITER_TOOLSET);
+    expect(material.preflightLineages).toBe(policy.CCC_PLANNING_PREFLIGHT_LINEAGES);
+    expect(material.deniedNames).toBe(policy.CCC_PLANNING_DENIED_NAMES);
+    expect(material.budgetPolicy).toBe(budget.CCC_PLANNING_BUDGET_POLICY_V1);
+    expect(material.sourcePolicy).toBe(policy.CCC_PLANNING_SOURCE_POLICY_I2);
+    expect(material.probeTool).toBe(policy.CCC_PLANNING_PROBE_TOOL);
+  });
 });
 
 /*
@@ -518,5 +566,65 @@ describe("database refusal mapping", () => {
     expect(error.code).toBe("CCC_PLANNING_TASK_CUSTODY");
     expect(error.message).toBe("CCC_PLANNING_TASK_CUSTODY: task FN-9 is held by a request-to-code run; moveTask refused");
     expect(error.field).toBe("moveTask");
+  });
+});
+
+/*
+FNXC:CccPlanningErrors 2026-10-14-14:58:
+Card K1b (errata E3-4, E4-K item 1): `CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED` is the one new terminal code since the K1 final repair. It is appended after the last code, so no earlier code moves: callers and the database mapping key on the code string, but a pinned order keeps a reviewer's diff of this closed list honest. The 97 earlier codes below are an independent copy of the list as K1 froze it.
+*/
+const PRE_K1B_REFUSAL_CODES = [
+    "CCC_PLANNING_AUTHORITY_RECEIPT_REQUIRED", "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID",
+    "CCC_PLANNING_AUTHORITY_RECEIPT_UNCONFIRMED", "CCC_PLANNING_AUTHORITY_RECEIPT_EXPIRED",
+    "CCC_PLANNING_AUTHORITY_RECEIPT_CONSUMED", "CCC_PLANNING_AUTHORITY_CONFIRMATION_REQUIRED",
+    "CCC_PLANNING_REJECTED_MODEL_IDENTITY", "CCC_PLANNING_ENDPOINT_NOT_LOOPBACK", "CCC_PLANNING_BUDGET_POLICY_MISMATCH",
+    "CCC_PLANNING_RUNTIME_NOT_PERMITTED", "CCC_PLANNING_TARGET_NOT_DISPOSABLE", "CCC_PLANNING_QUALIFICATION_REQUIRED",
+    "CCC_PLANNING_REQUEST_INVALID", "CCC_PLANNING_REQUEST_DIGEST_MISMATCH", "CCC_PLANNING_REQUEST_CONTAINS_PRD_GRAMMAR",
+    "CCC_PLANNING_PROFILE_NOT_SUPPORTED", "CCC_PLANNING_LARGE_NOT_AUTHORIZED", "CCC_PLANNING_PLANNING_FIT_INSUFFICIENT",
+    "CCC_PLANNING_SOURCE_POLICY_MISMATCH", "CCC_PLANNING_CONFINEMENT_UNQUALIFIED", "CCC_PLANNING_POSTGRES_REQUIRED",
+    "CCC_PLANNING_WORKFLOW_IR_DRIFT", "CCC_PLANNING_PHASE_ALLOCATION_EXHAUSTED", "CCC_PLANNING_ITERATION_CAP",
+    "CCC_PLANNING_DISPATCH_CAP", "CCC_PLANNING_UNRECONCILED_DISPATCH", "CCC_PLANNING_DEADLINE",
+    "CCC_PLANNING_REPAIR_EXHAUSTED", "CCC_PLANNING_REPAIR_EPOCH_CLOSED", "CCC_PLANNING_REVIEW_STAGNATED",
+    "CCC_PLANNING_BUILD_FIT_INSUFFICIENT", "CCC_PLANNING_RESEARCH_GRANT_EXHAUSTED", "CCC_PLANNING_FENCE_STALE",
+    "CCC_PLANNING_CONTROL_PENDING", "CCC_PLANNING_REVISION_STALE", "CCC_PLANNING_DECISION_NOT_AWAITED",
+    "CCC_PLANNING_STATE_TRANSITION_REFUSED", "CCC_PLANNING_RUN_TERMINAL", "CCC_PLANNING_RUN_NOT_FOUND",
+    "CCC_PLANNING_RUN_AMBIGUOUS", "CCC_PLANNING_RUN_PROJECT_MISMATCH", "CCC_PLANNING_RUN_ENDED",
+    "CCC_PLANNING_TASK_CUSTODY", "CCC_PLANNING_DESCENDANTS_UNSETTLED", "CCC_PLANNING_CONTROL_REQUIRES_CAMPAIGN_BRIDGE",
+    "CCC_PLANNING_ANCHOR_INSERT_INVALID", "CCC_PLANNING_ANCHOR_IMMUTABLE", "CCC_PLANNING_COUNTER_DECREASE",
+    "CCC_PLANNING_SPEND_REFUSED", "CCC_PLANNING_REVIEW_EPOCH_INVALID", "CCC_PLANNING_GRANT_CHANGE_REFUSED",
+    "CCC_PLANNING_IMPORT_LINK_WRITE_ONCE", "CCC_PLANNING_ARTIFACT_IMMUTABLE", "CCC_PLANNING_ARTIFACT_PUBLISHER_REQUIRED",
+    "CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID", "CCC_PLANNING_ARTIFACT_TOO_LARGE", "CCC_PLANNING_ARTIFACT_NOT_UTF8",
+    "CCC_PLANNING_ARTIFACT_DIGEST_MISMATCH", "CCC_PLANNING_ARTIFACT_RUN_MISMATCH", "CCC_PLANNING_ARTIFACT_FENCE_REFUSED",
+    "CCC_PLANNING_ARTIFACT_INPUT_UNPUBLISHED", "CCC_PLANNING_DESIGN_SEAL_BROKEN", "CCC_PLANNING_ARTIFACT_SLOT_CONFLICT",
+    "CCC_PLANNING_REQUEST_ANCHOR_MISMATCH", "CCC_PLANNING_REQUEST_QUOTE_UNRESOLVED",
+    "CCC_PLANNING_REQUEST_QUOTE_AMBIGUOUS", "CCC_PLANNING_REQUEST_UNIT_UNDISPOSITIONED",
+    "CCC_PLANNING_REQUEST_DERIVATION_MISSING", "CCC_PLANNING_ANNEX_ATTRIBUTED_TO_REQUEST",
+    "CCC_PLANNING_ACCEPTANCE_CASE_UNMAPPED", "CCC_PLANNING_EXCLUSION_UNMAPPED", "CCC_PLANNING_ANNEX_DECISION_UNKNOWN",
+    "CCC_PLANNING_OBJECTION_UNRESOLVED", "CCC_PLANNING_GRAPH_INADMISSIBLE", "CCC_PLANNING_ORACLE_CONTROL_FAILED",
+    "CCC_PLANNING_ORACLE_SETUP_FAILURE", "CCC_PLANNING_ORACLE_CONTROL_UNTAGGED", "CCC_PLANNING_DESIGN_INFEASIBLE",
+    "CCC_PLANNING_REVIEW_REJECTED", "CCC_PLANNING_CODING_REPAIR_NOT_RUN", "CCC_PLANNING_SANDBOX_UNAVAILABLE",
+    "CCC_PLANNING_REVIEWED_BYTES_DRIFT", "CCC_PLANNING_IMPORT_STOPPED", "CCC_PLANNING_IMPORT_IDENTITY_DRIFT",
+    "CCC_PLANNING_IMPORT_REPLAY_REFUSED", "CCC_PLANNING_RECEIPT_ENVELOPE_MISMATCH", "CCC_PLANNING_ROUTE_NOT_ADMITTED",
+    "CCC_PLANNING_BUILD_BASELINE_MISMATCH", "CCC_PLANNING_FINAL_JUDGMENT_MISSING", "CCC_PLANNING_CAMPAIGN_FAILED",
+    "CCC_PLANNING_AWAITING_INTENT", "CCC_PLANNING_AWAITING_BUDGET", "CCC_PLANNING_AWAITING_EXECUTION_AUTHORITY",
+    "CCC_PLANNING_CANCELLED", "CCC_PLANNING_CLI_USAGE", "CCC_PLANNING_COMMAND_NOT_SUPPORTED",
+    "CCC_PLANNING_INTERNAL_ERROR",
+] as const;
+
+describe("refusal code list", () => {
+  it("pins the 97 earlier codes in order and appends CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED last (card K1b)", () => {
+    expect(PRE_K1B_REFUSAL_CODES).toHaveLength(97);
+    expect(CCC_PLANNING_REFUSAL_CODES).toEqual([...PRE_K1B_REFUSAL_CODES, "CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED"]);
+    expect(CCC_PLANNING_REFUSAL_CODES).toHaveLength(98);
+    // The new code behaves like every listed code: a database message that starts with it maps back to the typed refusal.
+    const refusal = cccPlanningRefusalFromDatabaseError(new Error("CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED: run x writer session closure unconfirmed"));
+    expect(refusal).toBeInstanceOf(CccPlanningRefusal);
+    expect(refusal?.code).toBe("CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED");
+    expect(refusal?.detail).toBe("run x writer session closure unconfirmed");
+  });
+
+  it("keeps every earlier code at its position and lists no code twice (card K1b control)", () => {
+    PRE_K1B_REFUSAL_CODES.forEach((code, index) => expect(CCC_PLANNING_REFUSAL_CODES[index], `position ${index}`).toBe(code));
+    expect(new Set(CCC_PLANNING_REFUSAL_CODES).size).toBe(CCC_PLANNING_REFUSAL_CODES.length);
   });
 });

@@ -15,6 +15,11 @@ FNXC:CccPlanningProofInventory 2026-10-14-13:26:
 The E2 final repair adds 12 tests, for 115 in all: full case folding of the path key across tasks, within one task and as the shared key GG reuses (E2-40, E2-13); denied-name segments (E2-42); verifier bundle and control file refusals and key de-duplication (E2-41); proof ids in task plans and proof results, and committed-means-exit-0 (E2-43); closure-digest refusals (E2-44); deep-frozen policy digest inputs and the denied-name list (E2-45, E2-42); write-root containment on the key (E2-46); and the runtime ordinal guard (E2-47). The names stay ASCII so they compare byte for byte.
 
 Errata E2-48 adds a second K1 check that this inventory cannot express, because a closed suite command runs Vitest only: `pnpm --filter @fusion/core exec tsc -p tsconfig.ccc-planning-tests.json`, which type-checks the seven test files and their sources (core's own typecheck excludes *.test.ts). It must exit 0. The Vitest command still takes under 10 s, so the 60 s timeout stands.
+
+FNXC:CccPlanningProofInventory 2026-10-14-15:12:
+Card K1b (errata E3-4 and E4-K; this module's successor owner) adds ten tests, for 125 in all, listed next to the tests they extend: the pinned refusal-code list with `CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED` appended last and its position control (item 1); the capital sharp s in the path key, across tasks, within one task and in verifier bundle and control files (item 2, E2-40a); the fresh-import deep-freeze check that runs before any digest call (item 3); a control file that equals or lies inside a verifier bundle file (item 4); and the spec-ready baseline-file and requirement-map proof-id refusals (item 5). Item 6 (`.envrc.bak` is admitted) is an accepted residual with no test. The names stay ASCII; the capital sharp s itself appears in test bodies only as an escape.
+
+TARGETED stays file-closed and OFFLINE stays name-closed over the same seven files. Measured with the repository's own closed checks (`assertMachineResultJson` on the real vitest JSON report) and with the card's seven-file command: 125 passed, 0 failed, 0 skipped. Wall time of the Vitest command on the M5 Max with other agents running heavy suites: 4.3 s at a load average of 9.5, 4.5 s at 13.1, 5.3 s at 16.9; Vitest's own time is about 4 s, of which the compiler-based `ccc-provider-attempt-views.typecheck.test.ts` is 3.2 s and no K1b test takes over 15 ms. The 60 s command timeout is therefore over 11 times the worst measurement; it is a hang bound and is unchanged, and no test timeout is touched.
 */
 
 const FILES = Object.freeze([
@@ -74,6 +79,7 @@ export const OFFLINE = Object.freeze([
       "counters and the I2 source policy > digests the source policy canonically",
       "policy digest inputs > lists the denied names sorted, including .envrc (errata E2-42)",
       "policy digest inputs > deep-freezes every object that feeds the policy digest, so a mutation attempt throws in strict mode and the digest is unchanged",
+      "policy digest inputs > has every module-level digest input deep-frozen straight after a fresh import, before any digest call (card K1b)",
       "run states and transitions > allows exactly the 64 frozen pairs, the adjudication-38 pair and identity, across all 400 pairs",
       "run states and transitions > refuses running -> importing and allows importing -> budget_exhausted (adjudication item 38)",
       "run states and transitions > rests Build on accepted or verification_failed, and only Spec on spec_ready",
@@ -84,6 +90,8 @@ export const OFFLINE = Object.freeze([
       "database refusal mapping > maps every code the 0042 and 0043 triggers raise",
       "database refusal mapping > follows a driver error wrapped as a cause, and returns null for anything else",
       "database refusal mapping > names the custody error after the operation it refused",
+      "refusal code list > pins the 97 earlier codes in order and appends CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED last (card K1b)",
+      "refusal code list > keeps every earlier code at its position and lists no code twice (card K1b control)",
       "strict N counting > counts 14 planning nodes at L = 0 and 17 at L = 2",
       "strict N counting > counts build nodes as T writers and T + 1 + P review/proof nodes",
       "strict N counting > refuses negative or fractional counts",
@@ -128,6 +136,8 @@ export const OFFLINE = Object.freeze([
       "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task, including a case-only or ./ duplicate",
       "task plan validation (G4 prerequisites) > refuses owned paths across tasks that only full case folding merges (sharp s, final sigma, fi ligature) and over-refuses I against dotless i as accepted fail-closed",
       "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task that only full case folding reveals (sharp s, final sigma, fi ligature)",
+      "task plan validation (G4 prerequisites) > refuses owned paths across tasks that differ only by capital sharp s against sharp s or ss (card K1b)",
+      "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task that only capital sharp s reveals (card K1b)",
       "task plan validation (G4 prerequisites) > refuses an owned path inside .git or naming an .env file, and the same for a write root",
       "task plan validation (G4 prerequisites) > refuses an owned path or write root with a denied-name segment (.npmrc, _secrets, .agentsecrets, .envrc), folded",
       "task plan validation (G4 prerequisites) > refuses an owned path that is absolute, escapes the worktree or names the root",
@@ -139,6 +149,7 @@ export const OFFLINE = Object.freeze([
       "owned path normalization > returns null for paths that cannot be owned",
       "owned path normalization > rewrites a plan's owned paths and write roots into canonical form",
       "path comparison key > gives one key to every spelling APFS opens as the same file: case, NFC and NFD, ./ and .., a trailing slash, sharp s, final sigma, the fi ligature, the Kelvin sign and dotted capital I",
+      "path comparison key > merges capital sharp s with sharp s and ss, is idempotent over a fixed sample, and keeps the pinned I and dotless i over-refusal (card K1b)",
       "content schema validators > admits a well-formed acceptance cases and refuses each one-field defect",
       "content schema validators > admits a well-formed requirement map and refuses each one-field defect",
       "content schema validators > admits a well-formed routing plan and refuses each one-field defect",
@@ -152,6 +163,10 @@ export const OFFLINE = Object.freeze([
       "content schema validators > admits a well-formed proof results and refuses each one-field defect",
       "content schema validators > names each proof's own verify:<id> Taskfile target and has no root-level task",
       "content schema validators > refuses a bundle or control file inside .git, naming an .env file or a denied name, or colliding with another on the comparison key",
+      "content schema validators > refuses verifier bundle files that differ only by capital sharp s, sharp s or ss (card K1b)",
+      "content schema validators > refuses a control file that equals or lies inside a verifier bundle file, and admits one outside the bundle (card K1b)",
+      "content schema validators > runs spec-ready baseline files through the verifier file helper: key duplicates, .git, .env and denied names (card K1b)",
+      "content schema validators > requires requirement-map proof ids to be Taskfile-safe proof ids (card K1b)",
       "content schema validators > follows section 2.17: one settled attempt per proof id with its terminal evidence",
       "content schema validators > mirrors the proof-attempt store: a committed result has exit code 0, and every proof id matches the proof id pattern",
       "content schema validators > registers one validator per content schema id",
