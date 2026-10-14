@@ -24,6 +24,7 @@ import {
   projectCccPrdSemanticBundleForHash,
   parseWorkflowIr,
   type CccPrdDiagnostic,
+  type CccPrdImportIntent,
   type CccPrdProof,
   type CccPrdProofV2,
   type CccPrdRefusalBundle,
@@ -1380,6 +1381,147 @@ function productGraphAdmissionDiagnostics(
   return diagnostics;
 }
 
+/*
+FNXC:CCCGraphAdmission 2026-10-14-07:05:
+The product graph rules live behind exactly one exported function so request-to-code
+planning gate G4 and the compiler can never disagree about what a supported task
+graph is. It owns three things the compiler used to check in three places: the task
+dependency-cycle check, the one-intent-per-singleton-entity cardinality rule, and
+productGraphAdmissionDiagnostics (series-parallel shape, one entry and one terminal,
+disjoint ownership, unshared live-execution authority, edge/dependency agreement).
+Every collection is normalised through validateUniqueIds and the intent grouping uses
+the same well-formedness predicate as the sidecar validator, so a duplicated or
+malformed declaration is counted here exactly as the compiler counts it. The result is
+stable-sorted: a gate can compare it to the compiler's own sorted diagnostics.
+*/
+export type CccPrdProductGraphAdmissionInput = Readonly<{
+  tasks: readonly Readonly<{
+    id: string;
+    workflowId: string;
+    dependencyTaskIds: readonly string[];
+    ownedPaths: readonly string[];
+    allowedWriteRoots: readonly string[];
+    protectedActionIds: readonly string[];
+  }>[];
+  edges: readonly Readonly<{
+    id: string;
+    fromTaskId: string;
+    toTaskId: string;
+    kind: "depends_on";
+  }>[];
+  workflows: readonly Readonly<{
+    id: string;
+    taskIds: readonly string[];
+    entryTaskIds: readonly string[];
+    terminalTaskIds: readonly string[];
+  }>[];
+  protectedActions: readonly Readonly<{ id: string; kind: string }>[];
+  importIntents: readonly CccPrdImportIntent[];
+}>;
+
+/** Import entity types a sidecar must declare exactly once. */
+const SINGLETON_IMPORT_ENTITY_TYPES = [
+  "campaign",
+  "source",
+  "run_audit",
+  "workflow",
+  "work_item",
+] as const;
+
+/**
+ * An import intent complete enough to be counted. Incomplete ones are reported
+ * as CCC_PRD_IMPORT_INTENT_INVALID by the sidecar validator and take no part in
+ * cardinality or graph admission.
+ */
+function isWellFormedImportIntent(
+  intent: Record<string, unknown>,
+): intent is Record<string, unknown> & { entityType: string; entityId: string; target: string } {
+  return isNonEmptyString(intent.entityType)
+    && IMPORT_ENTITY_VALUES.has(intent.entityType)
+    && isNonEmptyString(intent.entityId)
+    && intent.operation === "create"
+    && isNonEmptyString(intent.target);
+}
+
+type CccPrdGraphAdmissionView = {
+  collections: {
+    tasks: CccPrdDeclarationMap;
+    edges: CccPrdDeclarationMap;
+    workflows: CccPrdDeclarationMap;
+    protectedActions: CccPrdDeclarationMap;
+  };
+  intentsByType: Map<string, Record<string, unknown>[]>;
+};
+
+function graphAdmissionView(input: CccPrdProductGraphAdmissionInput): CccPrdGraphAdmissionView {
+  // validateUniqueIds is the compiler's own id rule (first declaration wins,
+  // non-record and id-less rows are dropped); its duplicate diagnostics belong
+  // to the sidecar validator, not to graph admission, so they are discarded.
+  const unique = (label: string, values: readonly unknown[]) =>
+    validateUniqueIds(label, [...values], []);
+  const intentsByType = new Map<string, Record<string, unknown>[]>();
+  for (const intent of unique("importIntents", input.importIntents).values()) {
+    if (!isWellFormedImportIntent(intent)) continue;
+    const typed = intentsByType.get(intent.entityType) ?? [];
+    typed.push(intent);
+    intentsByType.set(intent.entityType, typed);
+  }
+  return {
+    collections: {
+      tasks: unique("tasks", input.tasks),
+      edges: unique("edges", input.edges),
+      workflows: unique("workflows", input.workflows),
+      protectedActions: unique("protectedActions", input.protectedActions),
+    },
+    intentsByType,
+  };
+}
+
+function importGraphBaselineDiagnostics(view: CccPrdGraphAdmissionView): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  const taskCycle = detectDependencyCycle(view.collections.tasks, "dependencyTaskIds");
+  if (taskCycle) {
+    diagnostics.push(diagnostic("CCC_PRD_DEPENDENCY_CYCLE", `task dependency cycle includes ${taskCycle}`));
+  }
+  for (const entityType of SINGLETON_IMPORT_ENTITY_TYPES) {
+    const received = view.intentsByType.get(entityType)?.length ?? 0;
+    if (received !== 1) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_IMPORT_INTENT_CARDINALITY",
+        `sidecar requires exactly one ${entityType} import intent; received ${received}`,
+      ));
+    }
+  }
+  return diagnostics;
+}
+
+/**
+ * The compiler's rules for a dependency graph that can run as a supported
+ * product campaign: no task dependency cycle, exactly one import intent for each
+ * of campaign, source, run_audit, workflow and work_item, and (once there is one
+ * workflow intent and one work-item intent to anchor it) every rule in
+ * productGraphAdmissionDiagnostics. Pure, deterministic, and free of source
+ * bytes, so it runs on a planner's task plan before any packet exists.
+ */
+export function diagnoseCccPrdProductGraphAdmission(
+  input: CccPrdProductGraphAdmissionInput,
+): CccPrdDiagnostic[] {
+  const view = graphAdmissionView(input);
+  const diagnostics = importGraphBaselineDiagnostics(view);
+  const workflowIntents = view.intentsByType.get("workflow") ?? [];
+  const workItemIntents = view.intentsByType.get("work_item") ?? [];
+  if (workflowIntents.length === 1 && workItemIntents.length === 1) {
+    diagnostics.push(...productGraphAdmissionDiagnostics(
+      view.collections,
+      view.intentsByType.get("task") ?? [],
+      view.intentsByType.get("dependency_edge") ?? [],
+      workflowIntents[0]!,
+      workItemIntents[0]!,
+    ));
+  }
+  return stableDiagnostics(diagnostics);
+}
+
 function validateSidecar(
   sidecar: CccPrdSidecar,
   custody: ReturnType<typeof readCccPrdPacketCustody>,
@@ -1766,10 +1908,6 @@ function validateSidecar(
       diagnostics.push(diagnostic("CCC_PRD_REFERENCE_FOREIGN", `task ${String(task.id)} workflow is unknown`));
     }
   }
-  const taskCycle = detectDependencyCycle(collections.tasks, "dependencyTaskIds");
-  if (taskCycle) {
-    diagnostics.push(diagnostic("CCC_PRD_DEPENDENCY_CYCLE", `task dependency cycle includes ${taskCycle}`));
-  }
   const requirementTaskIds = new Set<string>();
   for (const task of collections.tasks.values()) {
     if (!Array.isArray(task.requirementIds)) continue;
@@ -1890,13 +2028,7 @@ function validateSidecar(
       ["id", "entityType", "entityId", "operation", "target"],
       diagnostics,
     );
-    if (
-      !isNonEmptyString(intent.entityType)
-      || !IMPORT_ENTITY_VALUES.has(intent.entityType)
-      || !isNonEmptyString(intent.entityId)
-      || intent.operation !== "create"
-      || !isNonEmptyString(intent.target)
-    ) {
+    if (!isWellFormedImportIntent(intent)) {
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} is incomplete`));
       continue;
     }
@@ -1912,18 +2044,6 @@ function validateSidecar(
     }
     if (intent.entityType === "work_item" && !collections.workflows.has(intent.entityId)) {
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} references unknown workflow`));
-    }
-  }
-  for (const entityType of [
-    "campaign",
-    "source",
-    "run_audit",
-    "workflow",
-    "work_item",
-  ]) {
-    const intents = intentsByType.get(entityType) ?? [];
-    if (intents.length !== 1) {
-      diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_CARDINALITY", `sidecar requires exactly one ${entityType} import intent; received ${intents.length}`));
     }
   }
   const campaign = intentsByType.get("campaign")?.[0];
@@ -1945,19 +2065,21 @@ function validateSidecar(
     ));
   }
 
-  if (
-    input.requireMaterialCoverage
-    && workflowIntents.length === 1
-    && workItemIntents.length === 1
-  ) {
-    diagnostics.push(...productGraphAdmissionDiagnostics(
-      collections,
-      intentsByType.get("task") ?? [],
-      intentsByType.get("dependency_edge") ?? [],
-      workflowIntents[0]!,
-      workItemIntents[0]!,
-    ));
-  }
+  // Task cycle, import-intent cardinality, and (for supported product intake)
+  // every product graph rule come from the one exported admission function, so
+  // planning gate G4 and this compiler cannot drift. Only supported product
+  // intake (requireMaterialCoverage) has ever been held to the product graph
+  // rules; every other packet keeps just the cycle and cardinality checks.
+  const graphAdmissionInput = {
+    tasks: [...collections.tasks.values()],
+    edges: [...collections.edges.values()],
+    workflows: [...collections.workflows.values()],
+    protectedActions: [...collections.protectedActions.values()],
+    importIntents: [...collections.importIntents.values()],
+  } as unknown as CccPrdProductGraphAdmissionInput;
+  diagnostics.push(...(input.requireMaterialCoverage
+    ? diagnoseCccPrdProductGraphAdmission(graphAdmissionInput)
+    : importGraphBaselineDiagnostics(graphAdmissionView(graphAdmissionInput))));
 
   if (input.requireMaterialCoverage || sidecar.materialCoverage !== undefined) {
     const analysis = analyzeCccPrdMaterialCoverage({
