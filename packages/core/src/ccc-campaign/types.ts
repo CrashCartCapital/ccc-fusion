@@ -402,6 +402,38 @@ export type CccProviderAttemptSettlementInput = CccProviderAttemptReconciliation
   "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding"
 >;
 
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-08:20:
+Request-to-code planning sessions reuse the Pi provider-attempt seam with their own scope type (CONTRACT-v2 section 2.12, decision 0.24). These views are generic over the scope so `pi.ts`, the core ledger (L1) and the engine binding (P1) share one definition. They are type-only and additive: `CccProviderAttemptScope` and `CccProviderAttemptSettlementInput` above stay byte-identical, so the campaign seam and every persisted shape are unchanged. A scope is a view when its binding names the route (task, provider, model, transport); the campaign authority binding and the planning route binding both qualify.
+*/
+export type CccProviderAttemptRouteBindingView = Readonly<{
+  taskId: string;
+  providerId: string;
+  modelId: string;
+  transport: CccCampaignTransport;
+}>;
+
+export type CccProviderAttemptScopeView = Readonly<Omit<CccProviderAttemptScope, "binding"> & {
+  binding: CccProviderAttemptRouteBindingView;
+}>;
+
+/** Why a planning or planning-linked terminal settled as a known-effect refusal (D10). */
+export type CccProviderAttemptRefusalReason =
+  | "receipt-missing"
+  | "receipt-mismatch"
+  | "effective-route-drift"
+  | "provider-error-event";
+
+/**
+ * `refusalReason` is supplied only in planning and planning-linked scope;
+ * provider-attempt.ts never persists it (persisted evidence is exact-key
+ * checked), and L1 and BF consume it.
+ */
+export type CccProviderAttemptSettlementInputOf<S extends CccProviderAttemptScopeView> =
+  CccProviderAttemptReconciliation
+  & Pick<S, "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding">
+  & Readonly<{ refusalReason?: CccProviderAttemptRefusalReason }>;
+
 export type CccProviderAttemptDispatchDecision =
   | Readonly<{ kind: "dispatch-permit"; scope: CccProviderAttemptScope }>
   | Readonly<{ kind: "dispatched-unknown" | "terminal"; scope: CccProviderAttemptScope }>;
@@ -415,11 +447,27 @@ export class CccProviderAttemptIdentityError extends Error {
   }
 }
 
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-08:20:
+The limit reasons widen for planning and planning-linked scopes (CONTRACT-v2 section 2.12). Only the type widens: campaign code raises the first three exactly as before, and the engine's catch still maps only "max-requests", so campaign behaviour is unchanged.
+*/
+export type CccProviderAttemptLimitReason =
+  | "deadline"
+  | "max-requests"
+  | "max-concurrency"
+  | "iteration-cap"
+  | "dispatch-cap"
+  | "unreconciled-dispatch"
+  | "control-pending"
+  | "phase-allocation"
+  | "run-not-building"
+  | "runtime-not-permitted";
+
 export class CccProviderAttemptLimitError extends Error {
   public readonly code = "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED";
 
   public constructor(
-    public readonly reason: "deadline" | "max-requests" | "max-concurrency",
+    public readonly reason: CccProviderAttemptLimitReason,
     message: string,
   ) {
     super(message);

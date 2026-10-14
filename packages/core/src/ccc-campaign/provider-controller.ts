@@ -16,9 +16,24 @@ import type {
   CccCampaignWorkItemFence,
   CccProviderAttemptDispatchDecision,
   CccProviderAttemptScope,
+  CccProviderAttemptScopeView,
+  CccProviderAttemptSettlementInputOf,
 } from "./types.js";
 
 export type CccCampaignProviderControllerHoldReason = "dispatched-unknown" | "terminal";
+
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-09:30:
+Structural controller views (CONTRACT-v2 section 2.12, decision 0.24). Core's planning ledger (L1) builds a controller of this shape and the engine (P1) aliases `CccProviderAttemptController` to it, so core never imports engine. Type-only: nothing below changes campaign dispatch.
+*/
+export type CccProviderControllerDecisionView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> =
+  | Readonly<{ kind: "dispatch-permit"; scope: S }>
+  | Readonly<{ kind: "hold"; reason: CccCampaignProviderControllerHoldReason; scope: S }>;
+
+export type CccProviderAttemptControllerView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> = Readonly<{
+  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccProviderControllerDecisionView<S>>;
+  reconcile(input: CccProviderAttemptSettlementInputOf<S>): Promise<S>;
+}>;
 
 export type CccCampaignProviderControllerDecision =
   | Readonly<{ kind: "dispatch-permit"; scope: CccProviderAttemptScope }>
