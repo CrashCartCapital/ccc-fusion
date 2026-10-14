@@ -1523,10 +1523,20 @@ export async function cleanupArchivedTasksImpl(store: TaskStore): Promise<string
         .select()
         .from(schema.project.tasks)
         .where(and(eq(schema.project.tasks.projectId, projectId), eq(schema.project.tasks.column, "archived")));
+      /*
+      FNXC:CccPlanningArtifacts 2026-10-14-13:46:
+      A planning task that owns an anchor row is never hard-removed by this sweep. Its documents are immutable `cccplan-` artifacts: trigger 0043 refuses the ON DELETE CASCADE, and the anchor's foreign key refuses the delete itself, so the sweep would throw on the first such row and strand every ordinary task after it. Skip it before the cold-storage snapshot too, so a held planning task leaves no half-removed trace (CONTRACT-v3 section 2.5, decision D22).
+      */
+      const anchoredPlanningRows = await layer.db
+        .select({ taskId: schema.cccPlanningRuns.planningTaskId })
+        .from(schema.cccPlanningRuns)
+        .where(eq(schema.cccPlanningRuns.projectId, projectId));
+      const anchoredPlanningTaskIds = new Set(anchoredPlanningRows.map((anchored) => anchored.taskId));
       const cleanedUpIds: string[] = [];
       const { rm } = await import("node:fs/promises");
 
       for (const row of archivedRows) {
+        if (anchoredPlanningTaskIds.has(row.id)) continue;
         const task = store.rowToTask(store.pgRowToTaskRow(row));
         const dir = store.taskDir(task.id);
         // Guarantee a cold-storage snapshot before the destructive delete.
