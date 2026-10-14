@@ -1178,6 +1178,203 @@ function cleanupCreatedParents(paths: string[]): void {
   }
 }
 
+export type CccPrdPacketSourceInput = Readonly<{
+  projectRelativePath: string;
+  bytes: Buffer;
+  role: string;
+  authoritative: boolean;
+}>;
+
+type CccPrdPacketDigest = Readonly<{
+  sources: readonly CccPrdPacketSourceInput[];
+  manifestBytes: Buffer;
+  manifestSha256: string;
+  packetHash: string;
+}>;
+
+/*
+FNXC:CccPacketWriter 2026-10-14-09:30:
+One function owns how a packet's manifest bytes, manifestSha256 and packetHash
+are derived from its sources, so freeze and request-to-code planning cannot
+drift apart. Sources are sorted by UTF-16 code units here (freeze already
+handed them over sorted, so its bytes are unchanged), which makes the hashes
+independent of caller order. Only authoritative sources enter packetHash,
+exactly as custody recomputes it on read.
+*/
+function digestCccPrdPacket(
+  sourceVersion: string,
+  inputSources: readonly CccPrdPacketSourceInput[],
+): CccPrdPacketDigest {
+  const sources = [...inputSources].sort((left, right) =>
+    compareCccPrdCodeUnits(left.projectRelativePath, right.projectRelativePath));
+  const manifest = {
+    schema: CCC_PRD_PACKET_SCHEMA_VERSION,
+    source_version: sourceVersion,
+    entries: sources.map((source) => ({
+      relative_path: `sources/${source.projectRelativePath}`,
+      role: source.role,
+      sha256: sha256(source.bytes),
+      authoritative: source.authoritative,
+    })),
+  };
+  const manifestBytes = Buffer.from(`${canonicalCccPrdJson(manifest)}\n`, "utf8");
+  const manifestSha256 = sha256(manifestBytes);
+  const packetHash = sha256(canonicalCccPrdJson({
+    manifestSha256,
+    sources: sources
+      .filter((source) => source.authoritative)
+      .map((source) => ({
+        path: `sources/${source.projectRelativePath}`,
+        role: source.role,
+        authoritative: true as const,
+        sha256: sha256(source.bytes),
+        byteLength: source.bytes.byteLength,
+      })),
+  }));
+  return { sources, manifestBytes, manifestSha256, packetHash };
+}
+
+function assertCccPrdPacketWriterInput(input: {
+  sourceVersion: string;
+  sources: readonly CccPrdPacketSourceInput[];
+  extraFiles: readonly Readonly<{ name: string; bytes: Buffer }>[];
+}): void {
+  if (typeof input.sourceVersion !== "string" || input.sourceVersion.length === 0) {
+    return refuse("CCC_PRD_INTAKE_SOURCE_INVALID", "packet source version must be a non-empty string");
+  }
+  if (!input.sources.some((source) => source.authoritative)) {
+    return refuse("CCC_PRD_INTAKE_SOURCE_INVALID", "packet needs at least one authoritative source");
+  }
+  const seenPaths = new Set<string>();
+  for (const source of input.sources) {
+    const path = source.projectRelativePath;
+    if (
+      typeof path !== "string"
+      || path.length === 0
+      || path.includes("\0")
+      || path.startsWith("/")
+      || path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+    ) {
+      return refuse(
+        "CCC_PRD_INTAKE_PATH_ESCAPE",
+        `packet source path must be a normalized relative path: ${JSON.stringify(path)}`,
+      );
+    }
+    if (seenPaths.has(path)) {
+      return refuse("CCC_PRD_INTAKE_SOURCE_INVALID", `packet source path is duplicated: ${path}`);
+    }
+    seenPaths.add(path);
+    if (typeof source.role !== "string" || source.role.length === 0) {
+      return refuse("CCC_PRD_INTAKE_SOURCE_INVALID", `packet source has no role: ${path}`);
+    }
+    if (!Buffer.isBuffer(source.bytes)) {
+      return refuse("CCC_PRD_INTAKE_SOURCE_INVALID", `packet source bytes must be a Buffer: ${path}`);
+    }
+  }
+  const seenNames = new Set<string>();
+  for (const file of input.extraFiles) {
+    const name = file.name;
+    if (
+      typeof name !== "string"
+      || name.length === 0
+      || name === "."
+      || name === ".."
+      || name === "manifest.json"
+      || name === "sources"
+      || /[\\/\0]/.test(name)
+      || seenNames.has(name)
+      || !Buffer.isBuffer(file.bytes)
+    ) {
+      return refuse(
+        "CCC_PRD_INTAKE_SOURCE_INVALID",
+        `packet extra file needs a unique plain file name and Buffer bytes: ${JSON.stringify(name)}`,
+      );
+    }
+    seenNames.add(name);
+  }
+}
+
+/*
+FNXC:CccPacketWriter 2026-10-14-09:30:
+Extracted with unchanged behaviour from the tail of `freezeCccPrdPacket` so the
+planning import bridge reuses the exact staged-rename publication: write every
+file into a sibling `.stage-` directory with `wx`, refuse if the output appeared
+meanwhile, rename once, and on any failure remove the stage directory and only
+the parents this call created. Input is checked before any filesystem effect,
+because planning (unlike freeze) does not get its paths from a vetted source
+traversal. The caller owns where `outputDir` may live: freeze keeps its
+active-projects-root check, planning writes under owned scratch.
+*/
+export function writeCccPrdPacketFiles(input: Readonly<{
+  outputDir: string;
+  sourceVersion: string;
+  sources: readonly CccPrdPacketSourceInput[];
+  extraFiles?: readonly Readonly<{ name: string; bytes: Buffer }>[];
+}>): Readonly<{
+  rootDir: string;
+  manifestPath: string;
+  manifestSha256: string;
+  packetHash: string;
+}> {
+  const extraFiles = input.extraFiles ?? [];
+  assertCccPrdPacketWriterInput({
+    sourceVersion: input.sourceVersion,
+    sources: input.sources,
+    extraFiles,
+  });
+  const outputDir = resolve(input.outputDir);
+  if (lstatOrNull(outputDir)) {
+    return refuse("CCC_PRD_INTAKE_OUTPUT_EXISTS", `packet output already exists: ${outputDir}`);
+  }
+  const { sources, manifestBytes, manifestSha256, packetHash } = digestCccPrdPacket(
+    input.sourceVersion,
+    input.sources,
+  );
+
+  let stageDir: string | null = null;
+  let createdParents: string[] = [];
+  try {
+    createdParents = createOutputParent(outputDir);
+    const outputParent = dirname(outputDir);
+    stageDir = mkdtempSync(join(outputParent, `.${basename(outputDir)}.stage-`));
+    for (const source of sources) {
+      const destination = join(
+        stageDir,
+        "sources",
+        ...source.projectRelativePath.split("/"),
+      );
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, source.bytes, { flag: "wx" });
+    }
+    writeFileSync(join(stageDir, "manifest.json"), manifestBytes, { flag: "wx" });
+    for (const file of extraFiles) {
+      writeFileSync(join(stageDir, file.name), file.bytes, { flag: "wx" });
+    }
+    if (lstatOrNull(outputDir)) {
+      return refuse(
+        "CCC_PRD_INTAKE_OUTPUT_EXISTS",
+        `packet output appeared before publication: ${outputDir}`,
+      );
+    }
+    renameSync(stageDir, outputDir);
+    stageDir = null;
+    return {
+      rootDir: outputDir,
+      manifestPath: join(outputDir, "manifest.json"),
+      manifestSha256,
+      packetHash,
+    };
+  } catch (error) {
+    if (stageDir) rmSync(stageDir, { recursive: true, force: true });
+    cleanupCreatedParents(createdParents);
+    return asIntakeError(
+      error,
+      "CCC_PRD_INTAKE_WRITE_FAILED",
+      "CCC PRD packet staging failed",
+    );
+  }
+}
+
 export function freezeCccPrdPacket(input: {
   activeProjectsRoot: string;
   selectedPrdPath: string;
@@ -1285,32 +1482,10 @@ export function freezeCccPrdPacket(input: {
     }
   }
 
-  const manifestEntries = sources.map((source) => ({
-    relative_path: `sources/${source.projectRelativePath}`,
-    role: source.role,
-    sha256: sha256(source.bytes),
-    authoritative: source.authoritative,
-  }));
-  const manifest = {
-    schema: CCC_PRD_PACKET_SCHEMA_VERSION,
-    source_version: collected.sourceVersion,
-    entries: manifestEntries,
-  };
-  const manifestBytes = Buffer.from(`${canonicalCccPrdJson(manifest)}\n`, "utf8");
-  const manifestSha256 = sha256(manifestBytes);
-  const authoritativeSources = sources
-    .filter((source) => source.authoritative)
-    .map((source) => ({
-      path: `sources/${source.projectRelativePath}`,
-      role: source.role,
-      authoritative: true as const,
-      sha256: sha256(source.bytes),
-      byteLength: source.bytes.byteLength,
-    }));
-  const packetHash = sha256(canonicalCccPrdJson({
-    manifestSha256,
-    sources: authoritativeSources,
-  }));
+  const { manifestSha256, packetHash } = digestCccPrdPacket(
+    collected.sourceVersion,
+    sources,
+  );
 
   const manifestPath = join(outputDir, "manifest.json");
   const receiptPath = join(outputDir, "freeze-receipt.json");
@@ -1360,39 +1535,11 @@ export function freezeCccPrdPacket(input: {
     unresolvedReferences: collected.unresolvedReferences,
   };
 
-  let stageDir: string | null = null;
-  let createdParents: string[] = [];
-  try {
-    createdParents = createOutputParent(outputDir);
-    const outputParent = dirname(outputDir);
-    stageDir = mkdtempSync(join(outputParent, `.${basename(outputDir)}.stage-`));
-    for (const source of sources) {
-      const destination = join(
-        stageDir,
-        "sources",
-        ...source.projectRelativePath.split("/"),
-      );
-      mkdirSync(dirname(destination), { recursive: true });
-      writeFileSync(destination, source.bytes, { flag: "wx" });
-    }
-    writeFileSync(join(stageDir, "manifest.json"), manifestBytes, { flag: "wx" });
-    writeFileSync(join(stageDir, "freeze-receipt.json"), receiptBytes, { flag: "wx" });
-    if (lstatOrNull(outputDir)) {
-      return refuse(
-        "CCC_PRD_INTAKE_OUTPUT_EXISTS",
-        `freeze output appeared before publication: ${outputDir}`,
-      );
-    }
-    renameSync(stageDir, outputDir);
-    stageDir = null;
-    return result;
-  } catch (error) {
-    if (stageDir) rmSync(stageDir, { recursive: true, force: true });
-    cleanupCreatedParents(createdParents);
-    return asIntakeError(
-      error,
-      "CCC_PRD_INTAKE_WRITE_FAILED",
-      "CCC PRD packet staging failed",
-    );
-  }
+  writeCccPrdPacketFiles({
+    outputDir,
+    sourceVersion: collected.sourceVersion,
+    sources,
+    extraFiles: [{ name: "freeze-receipt.json", bytes: receiptBytes }],
+  });
+  return result;
 }
