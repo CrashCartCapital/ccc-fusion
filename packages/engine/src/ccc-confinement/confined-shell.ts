@@ -103,9 +103,9 @@ Errata E2 (final repair of X1).
   (`process.cpuUsage()`, `process.getuid()`, `fs.fstatSync`) is never stopped by
   it (still running at 15-20 s). A loop that makes one every 1,000 passes is
   stopped, about 1 s late. The binding CPU bound is therefore the wall ceiling
-  (`wallMsCeiling`, enforced by the controller), not `cpuSeconds`.
-  Risk row: "macOS RLIMIT_CPU misses syscall-heavy loops" -> mitigated by the
-  wall ceiling and the controller sweep, proven by the syscall-loop test.
+  (`wallMsCeiling`, enforced by the controller), not `cpuSeconds`. The risk row
+  lives in the contract (section 6, risk 44, per errata E4 X1c item 11): a
+  per-pass syscall loop is bounded by the wall timer, not by RLIMIT_CPU.
 
 FNXC:CccConfinedShell 2026-10-14-14:07:
 The command's wall timer starts when the reaper reports the command spawned
@@ -116,6 +116,40 @@ outside it), which made a 1 s model timeout fire before a 10 ms command ran.
 The runner's own timeout, counted from spawn, still bounds the whole exec.
 Under a load average of 16 to 33 each lsof scan costs 0.5 to 0.9 s, not the
 0.3 s quoted above for a quiet host.
+
+FNXC:CccConfinedShell 2026-10-14-15:20:
+Errata E4, card X1c (X1 residuals). Signatures change only where E4 allows:
+`dispose()` returns `CccConfinedDisposeResult`, the factory's `testOnly` is
+narrowed to `{ lsofPath? }`, and `CccSealedToolchain` gains `libraries`, which
+`sealCccToolchain` computes.
+- Item 4, seal coverage: the clone copies every sealed executable and every
+  library an executable loads from inside its own install root (Homebrew
+  node's `lib/libnode.*.dylib`). `sealCccToolchain` now finds those libraries,
+  hashes them and records each with its place in the clone (`clonePath`), and
+  the toolchain digest covers them. Creation re-hashes them, the clone copies
+  exactly the sealed list and hashes every copied file, and every exec
+  re-checks every source and clone file (size, mtime, ctime and inode, with a
+  full re-hash when any of them moved). A drifted library is
+  `toolchain-digest-drift`.
+- Item 5: `createCccConfinedBashOperations` accepts only `{ lsofPath? }` as its
+  test seam; any other key, `sealedEnvironment` included, is a TypeError. The
+  environment seam stays on `qualifyCccConfinedShell` (E2-11).
+- Item 6: `dispose()` returns `{ closure: "unconfirmed" }` when its final sweep
+  does not converge or any earlier exec ended CLOSURE_UNCONFIRMED, otherwise
+  `{ closure: "confirmed" }`, and returns the same result on every call.
+- Item 7: the template material also binds `SYSTEM_RUNTIME_READ_ROOTS`,
+  `DEVICE_READ_FILES` and a rendering of the whole writer-profile assembly for
+  sentinel inputs, so widening any input of the assembly changes the digest.
+- Item 8: when closure cannot be confirmed, the controller SIGKILLs every pid
+  the reaper reported stopping before it refuses, so no stopped orphan is left.
+  The foreign-pid filter (E2-26c): a pid a controller scan saw running from the
+  clone is an instance process; any other reported pid is killed only when
+  `ps` shows it is ours (same uid) and stopped (`T`), so the foreign zombie
+  (`Z`, P7) the reaper can signal, or a pid since recycled by a running
+  process, is never signalled. A failed sweep also kills the pids it stopped.
+- Item 9 (E4-7): the exit status of an lsof scan never decides; a scan is
+  trusted only when its output parses and lists the controller's own pid. This
+  was already the E2-22 behaviour; X1c pins it with tests.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -142,12 +176,21 @@ import {
 
 /** `name` (E2-25, `^[A-Za-z0-9._+-]{1,64}$`) is the PATH name of a utility's clone; it defaults to the file's basename. */
 export type CccSealedExecutable = Readonly<{ path: string; sha256: string; name?: string }>;
+/**
+ * E4 X1c item 4: a library the per-instance clone copies (an executable loads
+ * it from inside its own install root, such as Homebrew node's
+ * `lib/libnode.*.dylib`). `clonePath` is where the copy sits relative to the
+ * instance directory (`lib/libnode.137.dylib`). Only `sealCccToolchain` builds it.
+ */
+export type CccSealedLibrary = Readonly<{ path: string; sha256: string; clonePath: string }>;
 export type CccSealedToolchain = Readonly<{
   bash: CccSealedExecutable;
   sh: CccSealedExecutable;
   node: CccSealedExecutable;
   git: CccSealedExecutable & Readonly<{ execPath: string }>;
   utilities: readonly CccSealedExecutable[];
+  /** E4 X1c item 4: every library the clone copies, computed and hashed by `sealCccToolchain` and covered by the digest. */
+  libraries: readonly CccSealedLibrary[];
   toolchainSha256: string;
 }>;
 export type CccConfinementLimits = Readonly<{
@@ -185,17 +228,30 @@ export type CccConfinementRefusalReason =
   | "instance-disposed";
 
 /**
- * Test-only seams (E2-11, E2-21, E2-22). Production never passes them.
- * `sealedEnvironment` rewrites the sealed environment just before each exec;
- * `lsofPath` replaces the absolute `/usr/sbin/lsof` the controller sweep runs.
+ * Test-only seams of `qualifyCccConfinedShell` (E2-11, E2-21, E2-22).
+ * Production never passes them. `sealedEnvironment` rewrites the sealed
+ * environment just before each exec; `lsofPath` replaces the absolute
+ * `/usr/sbin/lsof` the controller sweep runs.
  */
 export type CccConfinedShellTestOnly = Readonly<{
   sealedEnvironment?: (sealed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>;
   lsofPath?: string;
 }>;
 
+/**
+ * E4 X1c item 5: the operations factory's only test seam. Any other key,
+ * `sealedEnvironment` included, is a TypeError at creation.
+ */
+export type CccConfinedBashOperationsTestOnly = Readonly<{ lsofPath?: string }>;
+
+/**
+ * E4-9: what `dispose()` learned about closure. "unconfirmed" when its final
+ * sweep did not converge or any earlier exec ended CLOSURE_UNCONFIRMED.
+ */
+export type CccConfinedDisposeResult = Readonly<{ closure: "confirmed" | "unconfirmed" }>;
+
 /** E2-24: the operations own their toolchain clone; `dispose` removes it and later execs refuse. */
-export type CccConfinedBashOperations = BashOperations & Readonly<{ dispose(): Promise<void> }>;
+export type CccConfinedBashOperations = BashOperations & Readonly<{ dispose(): Promise<CccConfinedDisposeResult> }>;
 
 export class CccConfinementRefusedError extends Error {
   readonly code = "CCC_CONFINEMENT_REFUSED" as const;
@@ -588,9 +644,11 @@ function isSealedName(name: unknown): name is string {
 }
 
 type ToolchainBody = Omit<CccSealedToolchain, "toolchainSha256">;
+/** The executables of a toolchain, before or after its libraries are sealed. */
+type ToolchainExecutables = Pick<CccSealedToolchain, "bash" | "sh" | "node" | "git" | "utilities">;
 
 function toolchainDigest(body: ToolchainBody): string {
-  // A nameless entry hashes exactly as before E2-25, so earlier digests stay valid.
+  // A nameless entry hashes exactly as before E2-25.
   const entry = (value: CccSealedExecutable) => ({
     path: value.path,
     sha256: value.sha256,
@@ -603,7 +661,61 @@ function toolchainDigest(body: ToolchainBody): string {
     node: entry(body.node),
     git: { ...entry(body.git), execPath: body.git.execPath },
     utilities: body.utilities.map(entry),
+    // E4 X1c item 4: every file the clone copies is in the digest, libraries included.
+    libraries: body.libraries.map((library) => ({ path: library.path, sha256: library.sha256, clonePath: library.clonePath })),
   })).digest("hex");
+}
+
+/** A library's place in the clone: a relative path inside the instance directory with no empty, `.` or `..` segment. */
+function isCloneRelativePath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096 || value.includes("\u0000") || isAbsolute(value)) {
+    return false;
+  }
+  return value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * E4 X1c item 4: the libraries the per-instance clone copies, found with the
+ * same rule the clone used before X1c: a linked runtime file an executable
+ * loads from inside its own install root (the directory above its `bin/`),
+ * placed at the same position relative to the clone's `bin/` (Homebrew node's
+ * `@rpath/libnode` becomes `lib/libnode.*.dylib`). Each is hashed here, so the
+ * digest, the post-clone check and the per-exec check all cover it. A library
+ * that would land outside the instance directory, on a sealed PATH name, or on
+ * the same place as another library is `toolchain-digest-drift`.
+ */
+async function sealedLibraries(executables: ToolchainExecutables): Promise<CccSealedLibrary[]> {
+  const pathNames = toolchainPathNames(executables);
+  const reserved = new Set([...pathNames.keys()].map((name) => `bin/${name}`));
+  const linked = await linkedRuntimeFilesForExecutables(toolchainExecutables(executables));
+  const byClonePath = new Map<string, CccSealedLibrary>();
+  for (const executable of new Set([...pathNames.values()].map((entry) => entry.path))) {
+    const installRoot = dirname(dirname(executable));
+    for (const file of linked) {
+      if (file === executable || isApplePlatformPath(file) || !cccIsSameOrWithin(file, installRoot) || !isRegularFile(file)) continue;
+      const clonePath = join("bin", relative(dirname(executable), file));
+      if (!isCloneRelativePath(clonePath)) {
+        refuse("toolchain-digest-drift", `${file} would be cloned outside the instance directory (${clonePath})`);
+      }
+      if (reserved.has(clonePath)) refuse("toolchain-digest-drift", `${file} would be cloned onto the sealed PATH name ${clonePath}`);
+      const existing = byClonePath.get(clonePath);
+      if (existing !== undefined && existing.path !== file) {
+        refuse("toolchain-digest-drift", `${existing.path} and ${file} would both be cloned to ${clonePath}`);
+      }
+      byClonePath.set(clonePath, { path: file, sha256: existing?.sha256 ?? fileSha256(file), clonePath });
+    }
+  }
+  return [...byClonePath.values()].sort((left, right) => (
+    compareCodeUnits(left.clonePath, right.clonePath) || compareCodeUnits(left.path, right.path)
+  ));
 }
 
 /** A utility to seal: its path, or its path and the PATH name its clone takes (E2-25). */
@@ -645,7 +757,7 @@ export async function sealCccToolchain(i: Readonly<{
     // The same file under the same name twice is one entry; anything else that shares a name refuses below.
     utilities.set(`${entry.path}\u0000${entry.name ?? ""}`, entry);
   }
-  const body: ToolchainBody = {
+  const executables: ToolchainExecutables = {
     bash: sealedExecutable(i.bash, "bash"),
     sh: sealedExecutable(i.sh, "sh"),
     node: sealedExecutable(i.node, "node"),
@@ -654,12 +766,13 @@ export async function sealCccToolchain(i: Readonly<{
       compareCodeUnits(left.path, right.path) || compareCodeUnits(left.name ?? "", right.name ?? "")
     )),
   };
-  const toolchain = { ...body, toolchainSha256: toolchainDigest(body) };
-  toolchainPathNames(toolchain);
-  return toolchain;
+  // Names are checked before the (slower) library discovery, which needs them.
+  toolchainPathNames(executables);
+  const body: ToolchainBody = { ...executables, libraries: await sealedLibraries(executables) };
+  return { ...body, toolchainSha256: toolchainDigest(body) };
 }
 
-function toolchainExecutables(toolchain: CccSealedToolchain): CccSealedExecutable[] {
+function toolchainExecutables(toolchain: ToolchainExecutables): CccSealedExecutable[] {
   return [toolchain.bash, toolchain.sh, toolchain.node, toolchain.git, ...toolchain.utilities];
 }
 
@@ -669,7 +782,7 @@ function toolchainExecutables(toolchain: CccSealedToolchain): CccSealedExecutabl
  * (E2-25). A duplicate effective name, a role carrying another name, or a
  * malformed name is `toolchain-digest-drift`.
  */
-function toolchainPathNames(toolchain: CccSealedToolchain): Map<string, CccSealedExecutable> {
+function toolchainPathNames(toolchain: ToolchainExecutables): Map<string, CccSealedExecutable> {
   const names = new Map<string, CccSealedExecutable>();
   const add = (name: string, executable: CccSealedExecutable) => {
     const existing = names.get(name);
@@ -709,9 +822,33 @@ function fileIdentity(path: string, sha256: string): FileIdentity {
   return { path, sha256, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs };
 }
 
-/** Every sealed path must still be its own non-platform real path with the sealed bytes. */
+/**
+ * Every sealed path must still be its own non-platform real path with the
+ * sealed bytes, and every sealed library (E4 X1c item 4) must still hold its
+ * sealed bytes at a well-formed place in the clone.
+ */
 function verifyToolchain(toolchain: CccSealedToolchain): FileIdentity[] {
   const identities: FileIdentity[] = [];
+  if (!Array.isArray(toolchain.libraries)) {
+    refuse("toolchain-digest-drift", "the sealed toolchain record has no library list; seal it with sealCccToolchain");
+  }
+  const clonePaths = new Set<string>();
+  for (const library of toolchain.libraries) {
+    if (
+      library === null || typeof library !== "object" || typeof library.path !== "string" || !isAbsolute(library.path)
+      || typeof library.sha256 !== "string" || !SHA256_HEX.test(library.sha256) || !isCloneRelativePath(library.clonePath)
+      || clonePaths.has(library.clonePath)
+    ) {
+      refuse("toolchain-digest-drift", `sealed library record is malformed: ${String((library as { path?: unknown } | null)?.path)}`);
+    }
+    clonePaths.add(library.clonePath);
+    if (isApplePlatformPath(library.path)) {
+      refuse("platform-binary-in-toolchain", `sealed library ${library.path} is an Apple platform file, which cannot join the per-instance clone`);
+    }
+    if (!isRegularFile(library.path)) refuse("toolchain-digest-drift", `sealed library is missing or not a regular file: ${library.path}`);
+    if (fileSha256(library.path) !== library.sha256) refuse("toolchain-digest-drift", `sealed library bytes changed: ${library.path}`);
+    identities.push(fileIdentity(library.path, library.sha256));
+  }
   for (const executable of toolchainExecutables(toolchain)) {
     if (
       typeof executable.path !== "string" || !isAbsolute(executable.path) || typeof executable.sha256 !== "string"
@@ -749,20 +886,26 @@ function verifyToolchain(toolchain: CccSealedToolchain): FileIdentity[] {
   }
   const { toolchainSha256, ...body } = toolchain;
   if (!SHA256_HEX.test(toolchainSha256) || toolchainDigest(body) !== toolchainSha256) {
-    refuse("toolchain-digest-drift", "toolchainSha256 does not match the sealed executables");
+    refuse("toolchain-digest-drift", "toolchainSha256 does not match the sealed executables and libraries");
   }
-  toolchainPathNames(toolchain);
+  for (const name of toolchainPathNames(toolchain).keys()) {
+    if (clonePaths.has(`bin/${name}`)) refuse("toolchain-digest-drift", `a sealed library would be cloned onto the sealed PATH name ${name}`);
+  }
   return identities;
 }
 
-/** Cheap per-command re-check: re-hash only a file whose identity changed since it was verified. */
+/**
+ * Cheap per-command re-check of every sealed file, executables and libraries
+ * alike (E4 X1c item 4): re-hash only a file whose size, mtime, ctime, device or
+ * inode changed since it was hashed in full.
+ */
 function recheckToolchain(identities: readonly FileIdentity[]): void {
   for (const identity of identities) {
     let stat;
     try {
       stat = statSync(identity.path);
     } catch {
-      refuse("toolchain-digest-drift", `sealed executable disappeared: ${identity.path}`);
+      refuse("toolchain-digest-drift", `sealed file disappeared: ${identity.path}`);
     }
     if (
       stat.dev === identity.dev && stat.ino === identity.ino && stat.size === identity.size
@@ -771,7 +914,7 @@ function recheckToolchain(identities: readonly FileIdentity[]): void {
       continue;
     }
     if (fileSha256(identity.path) !== identity.sha256) {
-      refuse("toolchain-digest-drift", `sealed executable bytes changed: ${identity.path}`);
+      refuse("toolchain-digest-drift", `sealed file bytes changed: ${identity.path}`);
     }
   }
 }
@@ -946,7 +1089,11 @@ function canonicalShellInput(input: CccConfinedShellInput): CanonicalShellInput 
   // E1-20 and E2-23: the defaults always apply; a caller can add names, never remove `.env`.
   const deniedNames = [...cccConfinedEffectiveDeniedNames(input.deniedNames)];
   const overlaps = (left: string, right: string) => cccIsSameOrWithin(left, right) || cccIsSameOrWithin(right, left);
-  const toolchainPaths = [...toolchainExecutables(input.toolchain).map((entry) => entry.path), input.toolchain.git.execPath];
+  const toolchainPaths = [
+    ...toolchainExecutables(input.toolchain).map((entry) => entry.path),
+    input.toolchain.git.execPath,
+    ...(Array.isArray(input.toolchain.libraries) ? input.toolchain.libraries.map((library) => library.path) : []),
+  ];
   for (const writeRoot of writeRoots) {
     if (!cccIsSameOrWithin(writeRoot, worktreeRoot)) refuse("root-overlap", `write root is outside the worktree: ${writeRoot}`);
     if (gitDirs.some((gitDir) => overlaps(writeRoot, gitDir))) refuse("root-overlap", `write root overlaps a git dir: ${writeRoot}`);
@@ -985,22 +1132,26 @@ function renderWriterProfile(slots: Readonly<Record<"EXEC" | "LOOPBACK" | "METAD
 }
 
 /**
- * The dylib closure depends only on the sealed executables, so it is discovered
- * once per toolchain digest per process (about 1.5 s of otool calls). A stale
- * entry can only under-admit: dyld then fails to load inside the sandbox.
+ * The dylib closure depends only on the sealed executables (their paths, in
+ * toolchain order, and their bytes), so it is discovered once per such list per
+ * process (about 1.5 s of otool calls), shared by the seal and the profile. A
+ * stale entry can only under-admit: dyld then fails to load inside the sandbox.
  */
-const linkedRuntimeFilesByToolchain = new Map<string, Promise<string[]>>();
+const linkedRuntimeFilesByExecutables = new Map<string, Promise<string[]>>();
 
-function linkedRuntimeFilesFor(toolchain: CccSealedToolchain): Promise<string[]> {
-  const executables = toolchainExecutables(toolchain).map((entry) => entry.path);
-  const key = `${toolchain.toolchainSha256}\u0000${executables.join("\u0000")}`;
-  let files = linkedRuntimeFilesByToolchain.get(key);
+function linkedRuntimeFilesForExecutables(executables: readonly CccSealedExecutable[]): Promise<string[]> {
+  const key = executables.map((entry) => `${entry.path}\u0000${entry.sha256}`).join("\u0001");
+  let files = linkedRuntimeFilesByExecutables.get(key);
   if (!files) {
-    files = cccDarwinLinkedRuntimeFiles(executables);
-    files.catch(() => linkedRuntimeFilesByToolchain.delete(key));
-    linkedRuntimeFilesByToolchain.set(key, files);
+    files = cccDarwinLinkedRuntimeFiles(executables.map((entry) => entry.path));
+    files.catch(() => linkedRuntimeFilesByExecutables.delete(key));
+    linkedRuntimeFilesByExecutables.set(key, files);
   }
   return files;
+}
+
+function linkedRuntimeFilesFor(toolchain: CccSealedToolchain): Promise<string[]> {
+  return linkedRuntimeFilesForExecutables(toolchainExecutables(toolchain));
 }
 
 function toolchainsDir(scratchRoot: string): string {
@@ -1017,22 +1168,32 @@ function placeholderCloneDir(scratchRoot: string): string {
   return join(toolchainsDir(scratchRoot), "instance");
 }
 
-async function writerProfile(
-  input: CccConfinedShellInput,
-  canonical: CanonicalShellInput,
-  cloneDir: string,
-): Promise<Readonly<{ profile: string; profileSha256: string }>> {
-  const toolchain = input.toolchain;
-  const linkedRuntimeFiles = await linkedRuntimeFilesFor(toolchain);
+type WriterProfileAssembly = Readonly<{
+  linkedRuntimeFiles: readonly string[];
+  gitExecPath: string;
+  canonical: CanonicalShellInput;
+  cloneDir: string;
+  /** The host-existence filter for read roots and files; the template material passes one that admits every path. */
+  exists: (path: string) => boolean;
+}>;
+
+/**
+ * The writer profile from its inputs, with no I/O beyond `exists`. Every
+ * operations instance renders through this, and the template material renders
+ * it for sentinel inputs (E4 X1c item 7), so any change to an input list or a
+ * rule here changes the template digest.
+ */
+function assembleWriterProfile(i: WriterProfileAssembly): string {
+  const canonical = i.canonical;
   const readRoots = cccUniqueSortedPaths([
-    ...SYSTEM_RUNTIME_READ_ROOTS.filter((path) => existsSync(path)),
-    ...linkedRuntimeFiles.map((path) => dirname(path)),
-    toolchain.git.execPath,
+    ...SYSTEM_RUNTIME_READ_ROOTS.filter((path) => i.exists(path)),
+    ...i.linkedRuntimeFiles.map((path) => dirname(path)),
+    i.gitExecPath,
     canonical.worktreeRoot,
     ...canonical.gitDirs,
     canonical.scratchRoot,
   ]);
-  const readFiles = cccUniqueSortedPaths([...DEVICE_READ_FILES, ...linkedRuntimeFiles].filter((path) => existsSync(path)));
+  const readFiles = cccUniqueSortedPaths([...DEVICE_READ_FILES, ...i.linkedRuntimeFiles].filter((path) => i.exists(path)));
   const metadata = cccUniqueSortedPaths([...readRoots, ...readFiles].flatMap(cccPathAncestors));
   const writeRoots = cccUniqueSortedPaths([...canonical.writeRoots, canonical.scratchRoot]);
   const deny: string[] = [];
@@ -1045,8 +1206,8 @@ async function writerProfile(
   deny.push(GIT_SEGMENT_WRITE_DENY);
   // Every clone lies inside the writable scratch root; this later deny makes them all read-only (P9 order).
   deny.push(toolchainsWriteDeny(canonical.scratchRoot));
-  const profile = renderWriterProfile({
-    EXEC: cccSbplSubpath(cloneDir),
+  return renderWriterProfile({
+    EXEC: cccSbplSubpath(i.cloneDir),
     LOOPBACK: canonical.loopbackPort !== undefined ? cccSbplLoopbackPortRules(canonical.loopbackPort).join("\n") : "",
     METADATA: metadata.map(cccSbplLiteral).join(" "),
     READ: [
@@ -1055,6 +1216,20 @@ async function writerProfile(
     ].join("\n"),
     WRITE: `(allow file-write* ${[...writeRoots.map(cccSbplSubpath), cccSbplLiteral("/dev/null")].join(" ")})`,
     DENY: deny.join("\n"),
+  });
+}
+
+async function writerProfile(
+  input: CccConfinedShellInput,
+  canonical: CanonicalShellInput,
+  cloneDir: string,
+): Promise<Readonly<{ profile: string; profileSha256: string }>> {
+  const profile = assembleWriterProfile({
+    linkedRuntimeFiles: await linkedRuntimeFilesFor(input.toolchain),
+    gitExecPath: input.toolchain.git.execPath,
+    canonical,
+    cloneDir,
+    exists: existsSync,
   });
   return { profile, profileSha256: createHash("sha256").update(profile).digest("hex") };
 }
@@ -1106,12 +1281,37 @@ function sealedEnvironment(i: SealedEnvironmentInput): Record<string, string> {
 const TEMPLATE_SENTINEL_PORT = 47_999;
 
 /**
+ * E4 X1c item 7: the whole writer-profile assembly rendered for sentinel
+ * inputs, one of each kind (a linked library, a git exec path, a git dir, a
+ * write root, a denied root, a caller denied name and the loopback port), with
+ * every system read root and device file admitted, so the rendering does not
+ * depend on the host.
+ */
+const TEMPLATE_SENTINEL_PROFILE = assembleWriterProfile({
+  linkedRuntimeFiles: ["/ccc-sentinel/runtime/lib/libsentinel.dylib"],
+  gitExecPath: "/ccc-sentinel/git/libexec/git-core",
+  canonical: {
+    worktreeRoot: "/ccc-sentinel/worktree",
+    gitDirs: ["/ccc-sentinel/gitdir"],
+    writeRoots: ["/ccc-sentinel/worktree/src"],
+    deniedRoots: ["/ccc-sentinel/denied"],
+    deniedNames: [...cccConfinedEffectiveDeniedNames(["sample*.name"])],
+    scratchRoot: "/ccc-sentinel/scratch",
+    loopbackPort: TEMPLATE_SENTINEL_PORT,
+  },
+  cloneDir: "/ccc-sentinel/scratch/toolchains/sentinel",
+  exists: () => true,
+});
+
+/**
  * Everything that decides what the sandbox admits apart from the per-run paths:
  * the profile template, the bash wrapper, the reaper, the denied-name pattern,
  * the `.git` segment rule, the toolchains write deny, the sealed environment,
- * the loopback rule and the controller sweep. The functions are rendered for
- * sentinel inputs, so a change to any of their outputs changes the digest a
- * qualification receipt binds and every earlier qualification becomes stale
+ * the loopback rule, the controller sweep, and (E4 X1c item 7) the system
+ * runtime read roots, the device read files and the whole profile assembly
+ * rendered for sentinel inputs. The functions are rendered for sentinel inputs,
+ * so a change to any of their outputs changes the digest a qualification
+ * receipt binds and every earlier qualification becomes stale
  * (`qualification-missing`, E1-20).
  */
 export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL: readonly string[] = Object.freeze([
@@ -1130,6 +1330,9 @@ export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL: readonly string[] = Obj
   }))} shell-added ${SHELL_ADDED_ENV_KEYS.join(",")}`,
   `loopback ${cccSbplLoopbackPortRules(TEMPLATE_SENTINEL_PORT).join("\n")}`,
   `controller-sweep ${LSOF_EXECUTABLE} txt by clone inode; stop, rescan, kill, two empty scans; at most ${CONTROLLER_SWEEP_MAX_SCANS} scans; killed lists only pids a scan saw`,
+  `system-runtime-read-roots ${JSON.stringify(SYSTEM_RUNTIME_READ_ROOTS)}`,
+  `device-read-files ${JSON.stringify(DEVICE_READ_FILES)}`,
+  `writer-profile-sentinel ${TEMPLATE_SENTINEL_PROFILE}`,
 ]);
 export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256 = createHash("sha256")
   .update(CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL.join("\u0000"))
@@ -1149,10 +1352,11 @@ type ToolchainClone = Readonly<{
 /**
  * E2-24 and E2-25: clones each sealed executable to
  * `<scratch>/toolchains/<instanceId>/bin/<PATH name>` (APFS clonefile, a full
- * copy across volumes), and each dylib an executable loads from inside its own
- * install root to the same place relative to `bin/` (Homebrew node's
- * `@loader_path/../lib/libnode` becomes `<instance>/lib/libnode`). Every clone
- * of a sealed executable must hash to its sealed sha256 before the first exec.
+ * copy across volumes), and (E4 X1c item 4) exactly the sealed libraries, each
+ * to the `clonePath` the seal recorded (Homebrew node's
+ * `@loader_path/../lib/libnode` becomes `<instance>/lib/libnode`). Every copied
+ * file, executable or library, must hash to its sealed sha256 before the first
+ * exec, and every one is re-checked before each later exec.
  */
 async function cloneToolchain(toolchain: CccSealedToolchain, instanceDir: string): Promise<ToolchainClone> {
   const toolchains = dirname(instanceDir);
@@ -1165,7 +1369,8 @@ async function cloneToolchain(toolchain: CccSealedToolchain, instanceDir: string
   const binDir = join(instanceDir, "bin");
   await mkdir(binDir);
   const sources = new Map<string, string>();
-  const place = async (source: string, target: string): Promise<void> => {
+  const copied: { target: string; source: string; sha256: string }[] = [];
+  const place = async (source: string, target: string, sha256: string): Promise<void> => {
     if (target === instanceDir || !cccIsSameOrWithin(target, instanceDir)) {
       refuse("toolchain-digest-drift", `${source} would be cloned outside the instance directory (${target})`);
     }
@@ -1173,28 +1378,19 @@ async function cloneToolchain(toolchain: CccSealedToolchain, instanceDir: string
     if (existing === source) return;
     if (existing !== undefined) refuse("toolchain-digest-drift", `${existing} and ${source} would both be cloned to ${target}`);
     sources.set(target, source);
+    copied.push({ target, source, sha256 });
     await mkdir(dirname(target), { recursive: true });
     await copyFile(source, target, fsConstants.COPYFILE_FICLONE);
     await chmod(target, 0o555);
   };
-  const pathNames = toolchainPathNames(toolchain);
-  for (const [name, executable] of pathNames) await place(executable.path, join(binDir, name));
-  const linkedRuntimeFiles = await linkedRuntimeFilesFor(toolchain);
-  for (const executable of new Set([...pathNames.values()].map((entry) => entry.path))) {
-    const installRoot = dirname(dirname(executable));
-    for (const file of linkedRuntimeFiles) {
-      if (file === executable || isApplePlatformPath(file) || !cccIsSameOrWithin(file, installRoot)) continue;
-      if (!statSync(file).isFile()) continue;
-      await place(file, resolve(binDir, relative(dirname(executable), file)));
-    }
-  }
+  for (const [name, executable] of toolchainPathNames(toolchain)) await place(executable.path, join(binDir, name), executable.sha256);
+  for (const library of toolchain.libraries) await place(library.path, join(instanceDir, library.clonePath), library.sha256);
   const identities: FileIdentity[] = [];
-  for (const [name, executable] of pathNames) {
-    const target = join(binDir, name);
-    if (fileSha256(target) !== executable.sha256) {
-      refuse("toolchain-digest-drift", `the per-instance clone ${target} of ${executable.path} does not carry the sealed bytes`);
+  for (const { target, source, sha256 } of copied) {
+    if (fileSha256(target) !== sha256) {
+      refuse("toolchain-digest-drift", `the per-instance clone ${target} of ${source} does not carry the sealed bytes`);
     }
-    identities.push(fileIdentity(target, executable.sha256));
+    identities.push(fileIdentity(target, sha256));
   }
   const inodes = new Set<string>();
   for (const target of sources.keys()) {
@@ -1405,10 +1601,62 @@ async function sweepCloneProcesses(clone: ToolchainClone, lsofPath: string): Pro
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, CONTROLLER_SWEEP_SETTLE_MS));
     }
+    killStoppedSeen(stopped, killed);
     return outcome(false, `still finding processes after ${CONTROLLER_SWEEP_MAX_SCANS} scans`);
   } catch (error) {
+    killStoppedSeen(stopped, killed);
     return outcome(false, error instanceof Error ? error.message : String(error));
   }
+}
+
+/**
+ * E4 X1c item 8: a sweep that gives up never leaves behind a process it
+ * stopped. Every pid in `stopped` was listed by a scan as running from the
+ * clone, so it is an instance process (E2-26c) and is killed.
+ */
+function killStoppedSeen(stopped: ReadonlySet<number>, killed: Set<number>): void {
+  for (const pid of stopped) {
+    if (killed.has(pid)) continue;
+    signalClonePid(pid, "SIGKILL");
+    killed.add(pid);
+  }
+}
+
+/**
+ * E4 X1c item 8: when the controller cannot confirm closure, nothing the
+ * in-sandbox reaper stopped may stay stopped forever. Every pid the reaper
+ * reported stopping is SIGKILLed after the foreign-pid filter (E2-26c): a pid a
+ * controller scan saw running from the clone is an instance process; any other
+ * is killed only when `ps` lists it with the controller's uid in a stopped
+ * state (`T`). The foreign zombie the reaper can signal (P7, state `Z`), a pid
+ * that has since gone, and a pid recycled by a running process are never
+ * signalled. Without a usable `ps` no unseen pid is signalled. Returns the pids
+ * it signalled.
+ */
+async function killReaperStoppedPids(reported: readonly number[], sweep: ControllerSweep): Promise<number[]> {
+  const alreadyKilled = new Set(sweep.killed);
+  const seen = new Set(sweep.seen);
+  const candidates = cccUniqueSortedNumbers(reported.filter((pid) => (
+    Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid && !alreadyKilled.has(pid)
+  )));
+  const confirmed = candidates.filter((pid) => seen.has(pid));
+  const unseen = candidates.filter((pid) => !seen.has(pid));
+  if (unseen.length > 0) {
+    const ps = await captureSupervised(PS_EXECUTABLE, ["-o", "pid=,uid=,stat=", "-p", unseen.join(",")], { label: "ccc-confined-shell-orphans" });
+    // ps exits 1 when a listed pid is gone; its lines for the others still count.
+    if (!ps.timedOut && !ps.overLimit && ps.spawnError === null && ps.signal === null) {
+      const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+      const wanted = new Set(unseen);
+      for (const line of ps.stdout.split("\n")) {
+        const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)\s*$/u.exec(line);
+        if (!match) continue;
+        const pid = Number(match[1]);
+        if (wanted.has(pid) && Number(match[2]) === uid && match[3]!.startsWith("T")) confirmed.push(pid);
+      }
+    }
+  }
+  for (const pid of confirmed) signalClonePid(pid, "SIGKILL");
+  return cccUniqueSortedNumbers(confirmed);
 }
 
 function exitCodeOf(exit: ClosureFrame["exit"]): number | null {
@@ -1495,7 +1743,9 @@ function confinedOperations(
   let profile: Promise<Readonly<{ profile: string; profileSha256: string }>> | undefined;
   let queue: Promise<unknown> = Promise.resolve();
   let disposed = false;
-  let disposal: Promise<void> | undefined;
+  let disposal: Promise<CccConfinedDisposeResult> | undefined;
+  /** E4-9: set once any exec on this instance ends CLOSURE_UNCONFIRMED; dispose then reports unconfirmed. */
+  let closureUnconfirmed = false;
 
   // E1-20: one exec at a time per instance, so the last-closure record and the
   // shared scratch home and tmp are never shared by two commands.
@@ -1631,12 +1881,15 @@ function confinedOperations(
     // E1-18: the controller sweep is the closure authority on every path that
     // may have started a process, whatever the reaper managed to report.
     const sweep = await sweepCloneProcesses(instanceClone, lsofPath);
-    const frame = outcome === null ? null : parseClosureFrame(Buffer.concat(closureChunks).toString("utf8"));
+    const reported = parseClosureFrame(Buffer.concat(closureChunks).toString("utf8"));
+    const frame = outcome === null ? null : reported;
     const record = mergedClosureRecord(frame, sweep);
     if (!sweep.converged) {
+      // E4 X1c item 8: no process the reaper stopped is left stopped behind an unconfirmed closure.
+      const orphansKilled = await killReaperStoppedPids(reported?.record.stopped ?? [], sweep);
       throw new CccConfinementClosureError(
         record,
-        `the controller sweep did not converge (${sweep.failure ?? "unknown"}; ${sweep.remaining.length} process(es) still running from the per-instance toolchain); ${QUARANTINE_NOTE}`,
+        `the controller sweep did not converge (${sweep.failure ?? "unknown"}; ${sweep.remaining.length} process(es) still running from the per-instance toolchain; SIGKILLed ${orphansKilled.length} process(es) the reaper had stopped); ${QUARANTINE_NOTE}`,
       );
     }
     if (runnerError !== null || outcome === null) throw runnerError ?? new Error("confined-shell runner produced no outcome");
@@ -1664,17 +1917,27 @@ function confinedOperations(
       if (disposed) {
         return Promise.reject(new CccConfinementRefusedError("instance-disposed", "these confined-shell operations were disposed and their toolchain clone removed"));
       }
-      return serialized(() => execOnce(command, cwd, execOptions));
+      return serialized(async () => {
+        try {
+          return await execOnce(command, cwd, execOptions);
+        } catch (error) {
+          if (error instanceof CccConfinementClosureError) closureUnconfirmed = true;
+          throw error;
+        }
+      });
     },
-    // E2-24: after the execs already queued, sweep once more (best effort: an exec
-    // whose sweep failed has already thrown CLOSURE_UNCONFIRMED), then remove
-    // exactly this instance's clone directory. Idempotent.
+    // E2-24 and E4-9: after the execs already queued, sweep once more, then
+    // remove exactly this instance's clone directory. The result is
+    // "unconfirmed" when that sweep does not converge or any earlier exec ended
+    // CLOSURE_UNCONFIRMED. Idempotent: every call returns the first result.
     dispose: () => {
       disposed = true;
-      disposal ??= serialized(async () => {
+      disposal ??= serialized(async (): Promise<CccConfinedDisposeResult> => {
         const made = clone ? await clone.catch(() => undefined) : undefined;
-        if (made) await sweepCloneProcesses(made, lsofPath);
+        // No clone means no exec ever started a process from this instance.
+        const finalSweepConverged = made ? (await sweepCloneProcesses(made, lsofPath)).converged : true;
         await rm(instanceDir, { recursive: true, force: true });
+        return Object.freeze({ closure: finalSweepConverged && !closureUnconfirmed ? "confirmed" : "unconfirmed" });
       });
       return disposal;
     },
@@ -1691,12 +1954,37 @@ function confinedOperations(
  * admit. The per-instance toolchain clone is made on first exec under
  * `<scratch>/toolchains/<instanceId>/`; call `dispose()` to remove it.
  * `testOnly` is the documented test seam of E2-22; production never passes it.
+ * E4 X1c item 5: it admits `lsofPath` only. Any other key, `sealedEnvironment`
+ * included, own or inherited, throws a TypeError before any check or process,
+ * so a leaky environment can reach only `qualifyCccConfinedShell`.
  */
 export function createCccConfinedBashOperations(
   input: CccConfinedShellInput,
-  testOnly?: CccConfinedShellTestOnly,
+  testOnly?: CccConfinedBashOperationsTestOnly,
 ): CccConfinedBashOperations {
-  return confinedOperations(input, { requireQualification: true, ...(testOnly ? { testOnly } : {}) });
+  const seam = operationsTestOnly(testOnly);
+  return confinedOperations(input, { requireQualification: true, ...(seam ? { testOnly: seam } : {}) });
+}
+
+/** E4 X1c item 5: copy the factory's test seam, refusing anything but an optional string `lsofPath`. */
+function operationsTestOnly(testOnly: unknown): CccConfinedBashOperationsTestOnly | undefined {
+  if (testOnly === undefined) return undefined;
+  if (typeof testOnly !== "object" || testOnly === null || Array.isArray(testOnly)) {
+    throw new TypeError("createCccConfinedBashOperations: testOnly must be a plain object with at most an lsofPath");
+  }
+  const keys = new Set<PropertyKey>(Reflect.ownKeys(testOnly));
+  for (const key in testOnly) keys.add(key);
+  if ("sealedEnvironment" in testOnly) keys.add("sealedEnvironment");
+  const extra = [...keys].filter((key) => key !== "lsofPath");
+  if (extra.length > 0) {
+    throw new TypeError(
+      `createCccConfinedBashOperations: testOnly admits only lsofPath; refused ${extra.map((key) => String(key)).join(", ")}`,
+    );
+  }
+  const lsofPath = (testOnly as { lsofPath?: unknown }).lsofPath;
+  if (lsofPath === undefined) return {};
+  if (typeof lsofPath !== "string") throw new TypeError("createCccConfinedBashOperations: testOnly.lsofPath must be a string");
+  return { lsofPath };
 }
 
 const QUALIFICATION_LIMITS: CccConfinementLimits = {

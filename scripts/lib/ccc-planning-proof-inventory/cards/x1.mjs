@@ -42,9 +42,40 @@ exec pays two to six lsof scans at 0.5 to 0.9 s each under that load. The
 180 s command timeout is unchanged; on a quiet host the file takes well under
 it, and on a host this loaded the margin is thin, which is a host-load fact,
 not a reason to widen it.
+
+FNXC:CccPlanningProofInventory 2026-10-14-16:35:
+Card X1c (errata E4, items 1-9; X1c is the successor owner of this card file)
+brings the file to fifty-one tests, listed below in file order. Item 3 sizes the
+command's `timeoutMs`, a runner hang bound for a deterministic suite, not a test
+timeout: tests that do not test isolation, lifecycle or qualification now share
+one operations instance and one qualification, and the bound is set from
+measurements.
+- Closed check (this command and x1c's, through `runCccPlanningProof` with an
+  inventory loader filtered to the two cards), M5 Max, two runs on the final
+  bytes: 105.4 s wall (this file 97.6 s), load average 11.63 before and 9.88
+  after; 116.4 s wall (this file 108.7 s), load 10.14 before and 9.75 after,
+  with another agent's Darwin sandbox suite running at the same time.
+- Direct vitest runs of the file: 99.6 s at load 9.92 to 10.72, and 102.3 s at
+  load 10.42 to 10.68.
+- Two runs during a host-wide lsof stall failed on assertions, not on the
+  bound: 401.5 s (load 14.13 before, 3.86 after) and 362.5 s (load 16.59 to
+  10.39). Minutes after the second, plain `/usr/sbin/lsof` scans run by hand,
+  with none of these tests running (another agent's Darwin sandbox suite was),
+  took 10.3 s and 11.1 s against the sweep's 11 s per-scan lifetime, so sweeps
+  failed and the shared instance's serialized queue made later tests time out.
+- No run reached a load average of 25 in this session. The worst recorded at
+  load 25 or more is errata E4's 261 s for the previous 45-test file, and this
+  file runs no slower at equal load (97 to 109 s here at load about 10, against
+  105 to 124 s for the previous file at load 10 to 16).
+The bound is therefore 620 s: at least 1.5 x 261 s (392 s) and 1.5 x the
+slowest run seen here, the stalled 401.5 s (602 s, rounded up), and far below
+P0's 3,600 s maximum.
 */
 
 const SUITE = "CCC confined writer shell (Darwin sandbox-exec)";
+
+/** Runner hang bound for the whole file (E4 X1c item 3), sized in the header above; not a test timeout. */
+const CONFINED_SHELL_TIMEOUT_MS = 620_000;
 
 const NAMES = Object.freeze([
   `${SUITE} > network > (a) refuses a connect to an unadmitted 127.0.0.1 listener with EPERM while the same connect outside succeeds`,
@@ -64,7 +95,9 @@ const NAMES = Object.freeze([
   `${SUITE} > refuses hard-linking a toolchain binary into a write root and cannot execute a copy, while a symlinked launch still runs the per-instance clone`,
   `${SUITE} > lays the per-instance clone out at <scratch>/toolchains/<instance>/bin and denies writes anywhere under toolchains from inside, while the scratch home writes`,
   `${SUITE} > dispose removes only its own instance clone, is idempotent, and makes a later exec refuse, while another instance on the same scratch keeps running`,
+  `${SUITE} > dispose reports unconfirmed when its final sweep cannot be trusted or an earlier exec ended unconfirmed, and returns that result again`,
   `${SUITE} > runs a utility sealed from gcat under the name cat, while without the name only gcat is on PATH`,
+  `${SUITE} > seals every library the clone copies, so a libnode that changes after sealing, in its source or in the per-instance clone, refuses as toolchain-digest-drift, while the unchanged fixture toolchain runs`,
   `${SUITE} > keeps a foreign zombie the in-sandbox reaper can signal out of the closure record, while a real escaper in the same command is listed`,
   `${SUITE} > caps output at maxOutputBytes with a truncation marker and still confirms closure`,
   `${SUITE} > reaps a command that outlives the model-requested timeout and reports the timeout`,
@@ -72,11 +105,14 @@ const NAMES = Object.freeze([
   `${SUITE} > stops a loop that makes a syscall on every pass, which RLIMIT_CPU does not stop on macOS, at the wall timeout with closure confirmed`,
   `${SUITE} > confirms a normal command's closure with zero survivors`,
   `${SUITE} > reports CLOSURE_UNCONFIRMED when the sweep's lsof exits 1 or prints unparseable output, while the real lsof confirms the same command`,
+  `${SUITE} > trusts a sweep only when its output parses and lists the controller: exit 1 with empty output and output without the controller are unconfirmed, while parsed real output is trusted even when the stub exits 1`,
+  `${SUITE} > SIGKILLs every process the reaper stopped when the controller cannot confirm closure, so no stopped orphan remains, while the same command under the real lsof is confirmed`,
   `${SUITE} > kills a setsid escaper, an argv[0]-spoofed escaper and a symlink-launched escaper from outside the sandbox after the command kills its reaper`,
   `${SUITE} > kills a setsid escaper from outside the sandbox after the command freezes its reaper past a 2 s timeout`,
   `${SUITE} > serializes concurrent execs on one instance so the later command starts after the earlier one ends`,
   `${SUITE} > emits every deny after the allows, admits loopback only for the owned port, and grants no mach, shm or system-socket`,
   `${SUITE} > binds the template digest to the denied-name pattern, the sealed environment and the loopback rule`,
+  `${SUITE} > binds the template digest to the system runtime read roots, the device read files and a sentinel rendering of every rule the writer-profile assembly emits`,
   `${SUITE} > shared write predicate > exports the default denied names as a frozen superset of the planning list plus .envrc`,
   `${SUITE} > shared write predicate > unions caller names with the defaults, folding case and de-duplicating, so a caller cannot drop .env`,
   `${SUITE} > shared write predicate > refuses a path outside the write roots, including through .., a symlink or a relative spelling, while a path inside a root is admitted`,
@@ -88,6 +124,7 @@ const NAMES = Object.freeze([
   `${SUITE} > refuses before any spawn > refuses a sealed record naming an Apple platform binary as platform-binary-in-toolchain, while the Homebrew toolchain is admitted`,
   `${SUITE} > refuses before any spawn > refuses a duplicate effective PATH name, a role collision and a malformed name as toolchain-digest-drift, while distinct names seal`,
   `${SUITE} > refuses before any spawn > refuses creation as closure-sweep-unavailable when the sweep's lsof is missing, relative or not executable, while the absolute /usr/sbin/lsof is admitted`,
+  `${SUITE} > refuses before any spawn > refuses an operations testOnly key other than lsofPath, sealedEnvironment included, with a TypeError, while lsofPath alone and no testOnly are admitted`,
   `${SUITE} > refuses before any spawn > refuses a write root that carries a denied-name or .git segment as root-overlap, while an ordinary write root is admitted`,
   `${SUITE} > refuses before any spawn > refuses a qualification for another OS build or profile template, while the live one is admitted`,
   `${SUITE} > refuses before any spawn > refuses a write root outside the worktree and a scratch root inside it, while the contained layout is admitted`,
@@ -105,7 +142,7 @@ function confinedShellCommand(id) {
     expectedNames: NAMES,
     platform: "darwin",
     needsPostgres: false,
-    timeoutMs: 180_000,
+    timeoutMs: CONFINED_SHELL_TIMEOUT_MS,
   });
 }
 

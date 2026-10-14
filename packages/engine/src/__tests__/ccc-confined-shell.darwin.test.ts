@@ -36,11 +36,31 @@ segments and denied names for both shells (E2-23). The clone lives at
 platform binaries refuse with their own reason (E2-25). The closure record lists
 only processes the controller saw running from the clone, so the foreign zombie
 the in-sandbox reaper can signal (P7) never appears in it (E2-26c).
+
+FNXC:CccConfinedShell 2026-10-14-15:05:
+Errata E4, card X1c (the X1 residuals).
+- Item 1: the layout test uses only bash builtins and node, and asserts whole
+  lines (`bin-write-rc=1`) and `toolchains-mkdir-err EPERM`. The old version
+  called `dirname` and `mkdir`, which are not on the sealed PATH (coreutils are
+  sealed with their `g` names), and matched the substring `rc=1`, which the
+  missing-utility status `rc=127` also contains, so it could never fail.
+- Item 2: the timeout test's quick positive control runs with a 30 s model
+  timeout; only the command that must time out keeps 1 s.
+- Item 3: tests that do not test isolation, lifecycle, qualification or a
+  non-default input share one operations instance (`sharedOps` on the `shared`
+  fixture), so the per-instance clone, its hash and the first launch of a fresh
+  clone (1 to 3 s on a loaded host) are paid once. They keep their files apart
+  by name. The CPU-limit tests share one `cpuSeconds: 1` instance.
+- Items 4 to 9: the sealed library coverage (a fixture toolchain copied from
+  Homebrew node, whose libnode is the library), the factory's narrowed test
+  seam, the dispose result, the template material, no stopped orphans, and the
+  sweep trust rule. A mode-file lsof stub lets one instance switch between the
+  real lsof and each untrusted answer.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { appendFile, chmod, copyFile, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -63,6 +83,7 @@ import {
   readCccConfinementOsBuild,
   sealCccToolchain,
   type CccClosureRecord,
+  type CccConfinedBashOperations,
   type CccConfinedShellInput,
   type CccConfinementLimits,
   type CccSealedToolchain,
@@ -313,6 +334,48 @@ async function holdForeignZombie(): Promise<{ holder: ChildProcess; zombie: numb
   return { holder, zombie };
 }
 
+/** True once `process.kill(pid, 0)` throws ESRCH (the pid is gone, not stopped and not a zombie), within the deadline. */
+async function esrchWithin(pid: number, deadlineMs: number): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw error;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+}
+
+type LsofMode = "real" | "real-exit-1" | "empty-exit-1" | "omit-self";
+
+/**
+ * A stand-in for the sweep's lsof, which the controller runs outside the
+ * sandbox. A mode file picks its answer per scan: "real" execs /usr/sbin/lsof,
+ * "real-exit-1" runs it and then exits 1, "empty-exit-1" prints nothing and
+ * exits 1, and "omit-self" prints well-formed fields for pid 1 only, so the
+ * controller's own pid is missing.
+ */
+async function modeLsof(dir: string): Promise<{ path: string; setMode: (mode: LsofMode) => Promise<void> }> {
+  const path = join(dir, `lsof-mode-${randomBytes(4).toString("hex")}`);
+  const modeFile = `${path}.mode`;
+  await writeFile(modeFile, "real\n");
+  await writeFile(path, [
+    "#!/bin/sh",
+    `read -r mode < '${modeFile}'`,
+    'case "$mode" in',
+    "  empty-exit-1) exit 1 ;;",
+    "  omit-self) printf 'p1\\nftxt\\nD0x1\\ni2\\n'; exit 0 ;;",
+    '  real-exit-1) /usr/sbin/lsof "$@"; exit 1 ;;',
+    '  *) exec /usr/sbin/lsof "$@" ;;',
+    "esac",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  return { path, setMode: (mode) => writeFile(modeFile, `${mode}\n`) };
+}
+
 type Fixture = {
   root: string;
   worktree: string;
@@ -330,13 +393,28 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   const escapees: number[] = [];
   let toolchain: CccSealedToolchain;
   let qualification: CccConfinedShellInput["qualification"];
+  /** E4-X item 3: one fixture and one operations instance for every test that needs neither isolation nor a non-default input. */
+  let shared: Fixture;
+  let sharedOps: CccConfinedBashOperations;
+  let admitted: Listener | undefined;
+  let unadmitted: Listener | undefined;
+  let cpuOneShared: { fx: Fixture; ops: CccConfinedBashOperations } | undefined;
 
   /** Records every escaper pid announced in output or written to a pid file, before any assertion runs. */
   function track(output: string, pidFile?: string): number[] {
     const fromFile = pidFile && existsSync(pidFile) ? readFileSync(pidFile, "utf8") : "";
-    const pids = [...`${output}\n${fromFile}`.matchAll(/(?:ESCAPER|SPOOFED|LINKED) (\d+)/gu)].map((match) => Number(match[1]));
+    const pids = [...`${output}\n${fromFile}`.matchAll(/(?:ESCAPER|SPOOFED|LINKED|ORPHAN) (\d+)/gu)].map((match) => Number(match[1]));
     escapees.push(...pids);
     return pids;
+  }
+
+  /** The one `cpuSeconds: 1` instance the two CPU-limit tests share. */
+  async function cpuOne(): Promise<{ fx: Fixture; ops: CccConfinedBashOperations }> {
+    if (!cpuOneShared) {
+      const fx = await fixture({ limits: { ...LIMITS, cpuSeconds: 1 } });
+      cpuOneShared = { fx, ops: createCccConfinedBashOperations(fx.input) };
+    }
+    return cpuOneShared;
   }
 
   beforeAll(async () => {
@@ -353,6 +431,12 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       profileTemplateSha256: CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256,
       osBuild: readCccConfinementOsBuild(),
     };
+    admitted = await listen(await acquireCccSemanticProofLoopbackPort());
+    unadmitted = await listen(0);
+    // The shared fixture admits the loopback port and adds one caller name, so
+    // the network and caller-name tests can use the shared instance too.
+    shared = await fixture({ loopbackPort: admitted.port, deniedNames: [...DENIED_NAMES, "custom.key"] });
+    sharedOps = createCccConfinedBashOperations(shared.input);
   });
 
   afterEach(async () => {
@@ -361,6 +445,10 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   afterAll(async () => {
+    await sharedOps?.dispose();
+    await cpuOneShared?.ops.dispose();
+    await closeListener(admitted);
+    await closeListener(unadmitted);
     await Promise.all(roots.splice(0).map(async (root) => {
       await chmod(root, 0o755).catch(() => undefined);
       await rm(root, { recursive: true, force: true });
@@ -388,12 +476,15 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       writeFile(join(worktree, ".env"), `SECRET=${envToken}\n`),
       writeFile(join(worktree, "README"), `${readmeToken}\n`),
       // Escaper programs live in the worktree (readable inside); each appends to a
-      // heartbeat file in the write root and carries this run's token.
+      // heartbeat file in the write root and carries this run's token. The pid
+      // file is the optional second argument, so tests sharing a worktree keep
+      // their pid lists apart.
       writeFile(join(worktree, "esc.js"), [
         'const { spawn } = require("node:child_process");',
         "const target = process.argv[2];",
+        'const pidFile = process.argv[3] || "src/pids";',
         `const child = spawn(process.execPath, ["-e", "setInterval(()=>require('node:fs').appendFileSync(" + JSON.stringify(target) + ",'x'),50)/*${RUN_TOKEN}*/"], { detached: true, stdio: "ignore" });`,
-        'require("node:fs").appendFileSync("src/pids", "ESCAPER " + child.pid + "\\n");',
+        'require("node:fs").appendFileSync(pidFile, "ESCAPER " + child.pid + "\\n");',
         'console.log("ESCAPER " + child.pid);',
         "child.unref();",
       ].join("\n")),
@@ -417,32 +508,16 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   }
 
   describe("network", () => {
-    let admitted: Listener | undefined;
-    let unadmitted: Listener | undefined;
-    let fx: Fixture;
-    let ops: BashOperations;
-
-    beforeAll(async () => {
-      admitted = await listen(await acquireCccSemanticProofLoopbackPort());
-      unadmitted = await listen(0);
-      fx = await fixture({ loopbackPort: admitted.port });
-      ops = createCccConfinedBashOperations(fx.input);
-    });
-
-    afterAll(async () => {
-      await closeListener(admitted);
-      await closeListener(unadmitted);
-    });
-
+    // The shared fixture admits `admitted.port` (acquireCccSemanticProofLoopbackPort) and nothing else.
     it("(a) refuses a connect to an unadmitted 127.0.0.1 listener with EPERM while the same connect outside succeeds", async () => {
       const port = unadmitted!.port;
       expect(port).not.toBe(admitted!.port);
-      const control = outside(connectCommand(port), fx.worktree);
+      const control = outside(connectCommand(port), shared.worktree);
       expect(control.output).toContain(`CONNECT-OK ${port}`);
       const seenByControl = await settledConnections(unadmitted!, 1);
       expect(seenByControl).toBeGreaterThanOrEqual(1);
 
-      const confined = await run(ops, connectCommand(port), fx.worktree);
+      const confined = await run(sharedOps, connectCommand(port), shared.worktree);
       expect(confined.output).toContain(`CONNECT-ERR ${port} EPERM`);
       expect(confined.output).not.toContain("CONNECT-OK");
       expect(unadmitted!.connections()).toBe(seenByControl);
@@ -451,9 +526,9 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     it("(h) connects to the one admitted loopback port from acquireCccSemanticProofLoopbackPort while an unadmitted port in the same command is refused", async () => {
       const before = admitted!.connections();
       const confined = await run(
-        ops,
+        sharedOps,
         `${connectCommand(admitted!.port)}; ${connectCommand(unadmitted!.port)}`,
-        fx.worktree,
+        shared.worktree,
       );
       expect(confined.output).toContain(`CONNECT-OK ${admitted!.port}`);
       expect(confined.output).toContain(`CONNECT-ERR ${unadmitted!.port} EPERM`);
@@ -462,21 +537,20 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("(b) denies reading a file outside the roots while the same read outside the sandbox prints it", async () => {
-    const fx = await fixture();
+    const fx = shared;
     const command = readCommand(fx.canaryPath, "cat");
     const control = outside(command, fx.worktree);
     expect(control.output).toContain(fx.canaryToken);
     expect(control.output).toContain("cat-rc=0");
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).not.toContain(fx.canaryToken);
     expect(confined.output).toContain("Operation not permitted");
     expect(confined.output).toContain("cat-rc=1");
   });
 
   it("(c) denies kill -0 of a same-user sibling spawned outside the sandbox while the same kill outside succeeds, and the sibling survives", async () => {
-    const fx = await fixture();
+    const fx = shared;
     const sleeper = spawn("/bin/sleep", ["60"], { stdio: "ignore" });
     sleepers.push(sleeper);
     const pid = sleeper.pid!;
@@ -484,8 +558,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     const control = outside(command, fx.worktree);
     expect(control.output).toContain("kill-rc=0");
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).toContain("Operation not permitted");
     expect(confined.output).toContain("kill-rc=1");
     expect(confined.closure?.killed ?? []).not.toContain(pid);
@@ -493,7 +566,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("(d) drops parent credentials from the environment and passes only the sealed and task keys", async () => {
-    const fx = await fixture();
+    const fx = shared;
     const omniroute = `canary-${randomBytes(6).toString("hex")}`;
     const fusion = `fusion-canary-${randomBytes(6).toString("hex")}`;
     const saved = { OMNIROUTE_API_KEY: process.env.OMNIROUTE_API_KEY, FUSION_CANARY_SECRET: process.env.FUSION_CANARY_SECRET };
@@ -506,8 +579,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       expect(control.get("OMNIROUTE_API_KEY") === omniroute).toBe(true);
       expect(control.get("FUSION_CANARY_SECRET") === fusion).toBe(true);
 
-      const ops = createCccConfinedBashOperations(fx.input);
-      const confined = await run(ops, ENV_DUMP, fx.worktree, { env: { ...process.env } });
+      const confined = await run(sharedOps, ENV_DUMP, fx.worktree, { env: { ...process.env } });
       const inside = parseEnv(confined.output);
       expect(confined.output.includes(omniroute)).toBe(false);
       expect(confined.output.includes(fusion)).toBe(false);
@@ -529,15 +601,14 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("(e) reaps a setsid escaper after the command returns and lists it in the closure record", async () => {
-    const fx = await fixture();
-    const command = "node esc.js src/hb-e";
+    const fx = shared;
+    const command = "node esc.js src/hb-e src/pids-e";
     const control = outside(command, fx.worktree);
     const [controlPid] = track(control.output);
     expect(controlPid).toBeGreaterThan(1);
     expect(processState(controlPid!)).toBe("alive");
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await settle(ops, command, fx.worktree);
+    const confined = await settle(sharedOps, command, fx.worktree);
     const [escaperPid] = track(confined.output);
     expect(confined.error).toBeNull();
     expect(escaperPid).toBeGreaterThan(1);
@@ -547,14 +618,13 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("(f) denies .env inside the worktree while README in the same directory reads", async () => {
-    const fx = await fixture();
+    const fx = shared;
     const command = `${readCommand(".env", "env")}; ${readCommand("README", "readme")}`;
     const control = outside(command, fx.worktree);
     expect(control.output).toContain(fx.envToken);
     expect(control.output).toContain("env-rc=0");
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).not.toContain(fx.envToken);
     expect(confined.output).toContain("env-rc=1");
     expect(confined.output).toContain(fx.readmeToken);
@@ -584,10 +654,20 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     const root = realpathSync(await mkdtemp(join(tmpdir(), "ccc-confined-shell-qual-leak-")));
     roots.push(root);
     // E2-21: the builder runs at exec time, after the probe planted its canary in process.env.
+    // FNXC:CccConfinedShell 2026-10-14-15:40: the leak keeps every parent key, the canary
+    // included, except NODE_OPTIONS. The planning proof runner sets NODE_OPTIONS to
+    // `--import <repo>/scripts/lib/ccc-planning-offline-network-guard.mjs`, a file the
+    // sandbox cannot read, so a leaked copy stops every sandboxed node from starting and
+    // fails all seven probes, not only env-scrubbed (reproduced under the runner, E4 X1c item 3).
     const receipt = await qualifyCccConfinedShell({
       toolchain,
       scratchRoot: root,
-      testOnly: { sealedEnvironment: (sealed) => ({ ...(process.env as Record<string, string>), ...sealed }) },
+      testOnly: {
+        sealedEnvironment: (sealed) => {
+          const { NODE_OPTIONS: _hostNodeOptions, ...parent } = process.env as Record<string, string>;
+          return { ...parent, ...sealed };
+        },
+      },
     });
     const passed = new Map(receipt.probes.map((entry) => [entry.probe, entry.passed]));
     expect(passed.get("env-scrubbed")).toBe(false);
@@ -599,7 +679,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("writes inside a write root and scratch, and is refused in the worktree outside the write roots", async () => {
-    const fx = await fixture();
+    const fx = shared;
     // The scratch write is guarded so an unconfined shell (the stub) cannot write into the host TMPDIR.
     const command = [
       `echo src > src/x.txt; echo "src-rc=$?"`,
@@ -607,8 +687,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       `case "$TMPDIR" in ${fx.input.scratchRoot}/*) echo tmp > "$TMPDIR/x.txt"; echo "tmp-rc=$?";; *) echo tmp-unsealed;; esac`,
       `echo up > ../x.txt; echo "up-rc=$?"`,
     ].join("; ");
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).toContain("src-rc=0");
     expect(confined.output).toContain("tmp-rc=0");
     expect(confined.output).toContain("docs-rc=1");
@@ -619,7 +698,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("denies writes to any .git path segment inside a write root while a sibling file in the same root writes", async () => {
-    const fx = await fixture();
+    const fx = shared;
     await mkdir(join(fx.worktree, "src", "pre", ".git"), { recursive: true });
     const command = [
       `node -e 'const fs=require("fs");for (const p of ["src/sub/.git","src/.git"]) {try{fs.mkdirSync(p,{recursive:true});console.log("mkdir-ok "+p)}catch(e){console.log("mkdir-err "+p+" "+e.code)}}'`,
@@ -629,8 +708,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     const control = outside(`echo "[core]" > src/pre/.git/probe; echo "control-rc=$?"`, fx.worktree);
     expect(control.output).toContain("control-rc=0");
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).toContain("mkdir-err src/sub/.git EPERM");
     expect(confined.output).toContain("mkdir-err src/.git EPERM");
     expect(confined.output).toContain("config-rc=1");
@@ -641,7 +719,8 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("denies .envrc, a default name, and a caller-added name inside the sandbox, while README reads", async () => {
-    const fx = await fixture({ deniedNames: ["custom.key"] });
+    // The shared fixture's caller names add custom.key to the defaults.
+    const fx = shared;
     const envrcToken = `envrc-${randomBytes(6).toString("hex")}`;
     const customToken = `custom-${randomBytes(6).toString("hex")}`;
     await writeFile(join(fx.worktree, ".envrc"), `export X=${envrcToken}\n`);
@@ -651,8 +730,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(control.output).toContain(envrcToken);
     expect(control.output).toContain(customToken);
 
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).not.toContain(envrcToken);
     expect(confined.output).toContain("envrc-rc=1");
     expect(confined.output).not.toContain(customToken);
@@ -693,25 +771,24 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("refuses hard-linking a toolchain binary into a write root and cannot execute a copy, while a symlinked launch still runs the per-instance clone", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
+    const fx = shared;
     const command = [
-      `node -e 'try{require("fs").linkSync(process.execPath,"src/hn");console.log("hardlink-ok")}catch(e){console.log("hardlink-err "+e.code)}'`,
-      `node -e 'const fs=require("fs");fs.copyFileSync(process.execPath,"src/cn");fs.chmodSync("src/cn",0o755);console.log("copy-ok")'`,
-      `./src/cn -e 'console.log("copy-ran")'; echo "copy-exec-rc=$?"`,
+      `node -e 'try{require("fs").linkSync(process.execPath,"src/hl-hn");console.log("hardlink-ok")}catch(e){console.log("hardlink-err "+e.code)}'`,
+      `node -e 'const fs=require("fs");fs.copyFileSync(process.execPath,"src/hl-cn");fs.chmodSync("src/hl-cn",0o755);console.log("copy-ok")'`,
+      `./src/hl-cn -e 'console.log("copy-ran")'; echo "copy-exec-rc=$?"`,
       // Positive control for the hard-link refusal: a file the command owns in the write root links.
-      `node -e 'try{require("fs").linkSync("src/cn","src/cn-link");console.log("rootlink-ok")}catch(e){console.log("rootlink-err "+e.code)}'`,
-      `node -e 'require("fs").symlinkSync(process.execPath,"src/sn")'`,
-      `./src/sn -e 'console.log("SYMLINK-EXEC "+process.execPath)'; echo "symlink-exec-rc=$?"`,
+      `node -e 'try{require("fs").linkSync("src/hl-cn","src/hl-cn-link");console.log("rootlink-ok")}catch(e){console.log("rootlink-err "+e.code)}'`,
+      `node -e 'require("fs").symlinkSync(process.execPath,"src/hl-sn")'`,
+      `./src/hl-sn -e 'console.log("SYMLINK-EXEC "+process.execPath)'; echo "symlink-exec-rc=$?"`,
     ].join("; ");
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     expect(confined.output).toContain("hardlink-err EPERM");
-    expect(existsSync(join(fx.worktree, "src", "hn"))).toBe(false);
+    expect(existsSync(join(fx.worktree, "src", "hl-hn"))).toBe(false);
     expect(confined.output).toContain("copy-ok");
     expect(confined.output).not.toContain("copy-ran");
     expect(confined.output).toContain("copy-exec-rc=126");
     expect(confined.output).toContain("rootlink-ok");
-    expect(existsSync(join(fx.worktree, "src", "cn-link"))).toBe(true);
+    expect(existsSync(join(fx.worktree, "src", "hl-cn-link"))).toBe(true);
     expect(confined.output).toContain("symlink-exec-rc=0");
     const launched = /SYMLINK-EXEC (\S+)/u.exec(confined.output)?.[1] ?? "";
     // The symlink resolves to this instance's clone, never the shared host binary.
@@ -720,24 +797,30 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("lays the per-instance clone out at <scratch>/toolchains/<instance>/bin and denies writes anywhere under toolchains from inside, while the scratch home writes", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
+    // E4-X item 1: bash builtins and node only (no utility the sealed PATH lacks), and whole-line assertions.
+    const fx = shared;
     const command = [
       PRINT_EXEC,
-      `echo planted > "$(dirname "$(command -v node)")/planted"; echo "bin-write-rc=$?"`,
-      `mkdir "$HOME/../toolchains/other"; echo "toolchains-mkdir-rc=$?"`,
+      `n="$(command -v node)"; echo planted > "\${n%/*}/planted"; echo "bin-write-rc=$?"`,
+      `node -e 'try{require("fs").mkdirSync(process.env.HOME+"/../toolchains/other");console.log("toolchains-mkdir-ok")}catch(e){console.log("toolchains-mkdir-err "+e.code)}'`,
+      `node -e 'const p=require("path").dirname(process.execPath)+"/node";try{require("fs").writeFileSync(p,"x");console.log("node-overwrite-ok")}catch(e){console.log("node-overwrite-err "+e.code)}'`,
       `echo home > "$HOME/ok.txt"; echo "home-rc=$?"`,
     ].join("; ");
-    const confined = await run(ops, command, fx.worktree);
+    const confined = await run(sharedOps, command, fx.worktree);
     const execPath = printedExec(confined.output);
     const toolchains = join(fx.input.scratchRoot, "toolchains");
     expect(execPath).toMatch(new RegExp(`^${toolchains.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}/[0-9a-f]{16}/bin/node$`, "u"));
-    expect(confined.output).toContain("bin-write-rc=1");
-    expect(confined.output).toContain("toolchains-mkdir-rc=1");
-    expect(confined.output).toContain("home-rc=0");
+    expect(confined.output).toMatch(/^bin-write-rc=1$/mu);
+    expect(confined.output).toContain("toolchains-mkdir-err EPERM");
+    expect(confined.output).not.toContain("toolchains-mkdir-ok");
+    expect(confined.output).toMatch(/^node-overwrite-err E(?:PERM|ACCES)$/mu);
+    // Positive control: the same shell writes the scratch home, beside the toolchains directory.
+    expect(confined.output).toMatch(/^home-rc=0$/mu);
     expect(existsSync(join(dirname(execPath), "planted"))).toBe(false);
     expect(existsSync(join(toolchains, "other"))).toBe(false);
     expect(readFileSync(join(fx.input.scratchRoot, "home", "ok.txt"), "utf8")).toBe("home\n");
+    // The node clone still runs, so the overwrite attempt changed nothing.
+    expect((await run(sharedOps, PRINT_EXEC, fx.worktree)).output).toBe(`EXEC ${execPath}\n`);
   });
 
   it("dispose removes only its own instance clone, is idempotent, and makes a later exec refuse, while another instance on the same scratch keeps running", async () => {
@@ -749,8 +832,9 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(instanceDir).not.toBe(siblingDir);
     expect(existsSync(instanceDir)).toBe(true);
 
-    await ops.dispose();
-    await ops.dispose();
+    // E4-9: with the real /usr/sbin/lsof the final sweep confirms closure, and a second dispose returns the same result.
+    expect(await ops.dispose()).toEqual({ closure: "confirmed" });
+    expect(await ops.dispose()).toEqual({ closure: "confirmed" });
     expect(existsSync(instanceDir)).toBe(false);
     expect(existsSync(siblingDir)).toBe(true);
     const after = await settle(ops, "echo after-dispose", fx.worktree);
@@ -758,8 +842,33 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect((after.error as CccConfinementRefusedError).reason).toBe("instance-disposed");
     expect(after.output).toBe("");
     expect((await run(sibling, "echo sibling-runs", fx.worktree)).output).toBe("sibling-runs\n");
-    await sibling.dispose();
+    expect(await sibling.dispose()).toEqual({ closure: "confirmed" });
     expect(existsSync(siblingDir)).toBe(false);
+  });
+
+  it("dispose reports unconfirmed when its final sweep cannot be trusted or an earlier exec ended unconfirmed, and returns that result again", async () => {
+    // Final sweep: every exec confirmed, then the sweep dispose runs gets an untrusted answer.
+    const finalSweep = await modeLsof(shared.root);
+    const finalFails = createCccConfinedBashOperations(shared.input, { lsofPath: finalSweep.path });
+    const confirmedExec = await settle(finalFails, "echo before-dispose", shared.worktree);
+    expect(confirmedExec.error).toBeNull();
+    expect(confirmedExec.closure).not.toBeNull();
+    await finalSweep.setMode("empty-exit-1");
+    expect(await finalFails.dispose()).toEqual({ closure: "unconfirmed" });
+    await finalSweep.setMode("real");
+    expect(await finalFails.dispose()).toEqual({ closure: "unconfirmed" });
+
+    // Earlier exec: one exec ended CLOSURE_UNCONFIRMED; a later exec and the final sweep both work.
+    const latch = await modeLsof(shared.root);
+    const earlier = createCccConfinedBashOperations(shared.input, { lsofPath: latch.path });
+    await latch.setMode("empty-exit-1");
+    expect((await settle(earlier, "echo unconfirmed-exec", shared.worktree)).error).toBeInstanceOf(CccConfinementClosureError);
+    await latch.setMode("real");
+    const laterExec = await settle(earlier, "echo confirmed-exec", shared.worktree);
+    expect(laterExec.error).toBeNull();
+    expect(laterExec.closure).not.toBeNull();
+    expect(await earlier.dispose()).toEqual({ closure: "unconfirmed" });
+    expect(await earlier.dispose()).toEqual({ closure: "unconfirmed" });
   });
 
   it("runs a utility sealed from gcat under the name cat, while without the name only gcat is on PATH", async () => {
@@ -781,23 +890,74 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(confined.output).toContain("cat-rc=0");
     expect(confined.output).toContain("gcat-lookup-rc=1");
 
-    // Control: the unnamed seal of the same binary appears only as gcat.
-    const plain = await fixture();
-    const unnamed = await run(createCccConfinedBashOperations(plain.input), command, plain.worktree);
-    expect(unnamed.output).not.toContain(plain.readmeToken);
+    // Control: the unnamed seal of the same binary (the shared toolchain) appears only as gcat.
+    const unnamed = await run(sharedOps, command, shared.worktree);
+    expect(unnamed.output).not.toContain(shared.readmeToken);
     expect(unnamed.output).toContain("cat-rc=127");
     expect(unnamed.output).toContain("gcat-lookup-rc=0");
   });
 
-  it("keeps a foreign zombie the in-sandbox reaper can signal out of the closure record, while a real escaper in the same command is listed", async () => {
+  it("seals every library the clone copies, so a libnode that changes after sealing, in its source or in the per-instance clone, refuses as toolchain-digest-drift, while the unchanged fixture toolchain runs", async () => {
+    // Fixture toolchain: a copy of Homebrew node's install root, whose node loads @rpath/libnode from ../lib.
     const fx = await fixture();
+    const hostNode = realpathSync(process.execPath);
+    const hostLibDir = join(dirname(dirname(hostNode)), "lib");
+    const libName = (await readdir(hostLibDir)).find((name) => /^libnode\.[0-9]+\.dylib$/u.test(name));
+    expect(libName).toBeDefined();
+    const nodeRoot = join(fx.root, "tools", "node-root");
+    await Promise.all([mkdir(join(nodeRoot, "bin"), { recursive: true }), mkdir(join(nodeRoot, "lib"), { recursive: true })]);
+    const fixtureNode = join(nodeRoot, "bin", "node");
+    const fixtureLib = join(nodeRoot, "lib", libName!);
+    await copyFile(hostNode, fixtureNode, fsConstants.COPYFILE_FICLONE);
+    await copyFile(join(hostLibDir, libName!), fixtureLib, fsConstants.COPYFILE_FICLONE);
+    await chmod(fixtureLib, 0o644);
+    const libSha256 = createHash("sha256").update(readFileSync(fixtureLib)).digest("hex");
+    const sealed = await sealCccToolchain({
+      bash: toolchain.bash.path,
+      sh: toolchain.sh.path,
+      node: fixtureNode,
+      git: toolchain.git.path,
+      utilities: [],
+    });
+    const input: CccConfinedShellInput = { ...fx.input, toolchain: sealed };
+
+    // Control: the unchanged fixture toolchain runs, from a clone that carries its libnode.
+    const ops = createCccConfinedBashOperations(input);
+    const control = await run(ops, PRINT_EXEC, fx.worktree);
+    const instanceDir = dirname(dirname(printedExec(control.output)));
+    const clonedLib = join(instanceDir, "lib", libName!);
+    expect(existsSync(clonedLib)).toBe(true);
+    expect((await run(ops, "echo unchanged-runs", fx.worktree)).output).toBe("unchanged-runs\n");
+
+    // RED: the per-instance clone of the library changes after the clone was hashed.
+    await chmod(clonedLib, 0o644);
+    await appendFile(clonedLib, "drift");
+    const cloneDrift = await settle(ops, "echo after-clone-drift", fx.worktree);
+    expect(cloneDrift.output).toBe("");
+    expect(cloneDrift.error).toBeInstanceOf(CccConfinementRefusedError);
+    expect((cloneDrift.error as CccConfinementRefusedError).reason).toBe("toolchain-digest-drift");
+
+    // RED: the sealed source library changes after sealing.
+    expect(refusalReason(() => createCccConfinedBashOperations(input))).toBeNull();
+    await appendFile(fixtureLib, "drift");
+    expect(refusalReason(() => createCccConfinedBashOperations(input))).toBe("toolchain-digest-drift");
+
+    // The seal names the library with its pre-drift bytes and its place in the clone, and the digest covers it:
+    // a record rewritten to the drifted bytes passes the byte check but not the toolchain digest.
+    expect(sealed.libraries).toEqual([{ path: fixtureLib, sha256: libSha256, clonePath: `lib/${libName}` }]);
+    const drifted = createHash("sha256").update(readFileSync(fixtureLib)).digest("hex");
+    const forged: CccSealedToolchain = { ...sealed, libraries: [{ ...sealed.libraries[0]!, sha256: drifted }] };
+    expect(refusalReason(() => createCccConfinedBashOperations({ ...input, toolchain: forged }))).toBe("toolchain-digest-drift");
+  });
+
+  it("keeps a foreign zombie the in-sandbox reaper can signal out of the closure record, while a real escaper in the same command is listed", async () => {
+    const fx = shared;
     const { holder, zombie } = await holdForeignZombie();
     sleepers.push(holder);
     expect(processState(zombie)).toBe("zombie");
-    const ops = createCccConfinedBashOperations(fx.input);
     // Positive control for P7: from inside, the foreign zombie answers signal 0, so the reaper's sweep sees it,
     // while its live parent outside the sandbox does not.
-    const confined = await settle(ops, `kill -0 ${zombie}; echo "zombie-rc=$?"; kill -0 ${holder.pid}; echo "holder-rc=$?"; node esc.js src/hb-z`, fx.worktree);
+    const confined = await settle(sharedOps, `kill -0 ${zombie}; echo "zombie-rc=$?"; kill -0 ${holder.pid}; echo "holder-rc=$?"; node esc.js src/hb-z src/pids-z`, fx.worktree);
     const [escaperPid] = track(confined.output);
     expect(confined.error).toBeNull();
     expect(confined.output).toContain("zombie-rc=0");
@@ -827,9 +987,11 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("reaps a command that outlives the model-requested timeout and reports the timeout", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
-    const quick = await run(ops, `node -e 'setTimeout(()=>console.log("quick-done"),10)'`, fx.worktree, { timeout: 1 });
+    const fx = shared;
+    const ops = sharedOps;
+    // E4-X item 2: the quick positive control gets a 30 s model timeout, so host load cannot fail it;
+    // only the command that must time out keeps 1 s.
+    const quick = await run(ops, `node -e 'setTimeout(()=>console.log("quick-done"),10)'`, fx.worktree, { timeout: 30 });
     expect(quick.output).toContain("quick-done");
 
     const started = Date.now();
@@ -842,8 +1004,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("kills a CPU loop at the cpuSeconds rlimit while the same loop under the default limit is not killed early", async () => {
-    const fx = await fixture({ limits: { ...LIMITS, cpuSeconds: 1 } });
-    const ops = createCccConfinedBashOperations(fx.input);
+    const { fx, ops } = await cpuOne();
     // The loops count consumed CPU time, not wall time, so a starved host cannot end them early (E1-20).
     const busy = await run(ops, `node -e '${cpuLoop(4e6)}'; echo "loop-rc=$?"`, fx.worktree);
     // bash's job report echoes the command text, so match the program's own output line only.
@@ -854,15 +1015,14 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     const pure = await run(ops, `node -e 'for(;;){}'; echo "pure-rc=$?"`, fx.worktree, { timeout: 20 });
     expect(pure.output).toContain("pure-rc=152");
 
-    const control = createCccConfinedBashOperations({ ...fx.input, limits: LIMITS });
-    const short = await run(control, `node -e '${cpuLoop(1.5e6)}'; echo "loop-rc=$?"`, fx.worktree);
+    // Control: the shared instance runs under the default limits.
+    const short = await run(sharedOps, `node -e '${cpuLoop(1.5e6)}'; echo "loop-rc=$?"`, shared.worktree);
     expect(short.output).toMatch(/^loop-finished$/mu);
     expect(short.output).toContain("loop-rc=0");
   });
 
   it("stops a loop that makes a syscall on every pass, which RLIMIT_CPU does not stop on macOS, at the wall timeout with closure confirmed", async () => {
-    const fx = await fixture({ limits: { ...LIMITS, cpuSeconds: 1 } });
-    const ops = createCccConfinedBashOperations(fx.input);
+    const { fx, ops } = await cpuOne();
     const started = Date.now();
     const result = await settle(ops, `node -e 'console.log("BURNER "+process.pid);for(;;){process.getuid()}'`, fx.worktree, { timeout: 3 });
     expect(result.error).toBeInstanceOf(Error);
@@ -876,9 +1036,7 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("confirms a normal command's closure with zero survivors", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
-    const confined = await run(ops, "echo reaper-intact", fx.worktree);
+    const confined = await run(sharedOps, "echo reaper-intact", shared.worktree);
     expect(confined.output).toBe("reaper-intact\n");
     expect(confined.closure).not.toBeNull();
     expect(confined.closure!.passes).toBeGreaterThanOrEqual(2);
@@ -888,13 +1046,13 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("reports CLOSURE_UNCONFIRMED when the sweep's lsof exits 1 or prints unparseable output, while the real lsof confirms the same command", async () => {
-    const fx = await fixture();
+    const fx = shared;
     const exitOne = join(fx.root, "lsof-exit-1");
     const garbled = join(fx.root, "lsof-garbled");
     await writeFile(exitOne, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     await writeFile(garbled, `#!/bin/sh\necho "p$PPID"\necho "not an lsof field"\nexit 1\n`, { mode: 0o755 });
 
-    const control = await settle(createCccConfinedBashOperations(fx.input), "echo sweep-real", fx.worktree);
+    const control = await settle(sharedOps, "echo sweep-real", fx.worktree);
     expect(control.error).toBeNull();
     expect(control.output).toBe("sweep-real\n");
     expect(control.closure).not.toBeNull();
@@ -909,22 +1067,64 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     }
   });
 
+  it("trusts a sweep only when its output parses and lists the controller: exit 1 with empty output and output without the controller are unconfirmed, while parsed real output is trusted even when the stub exits 1", async () => {
+    const lsof = await modeLsof(shared.root);
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+    // Positive controls (E4-7): the exit status never decides, so real output followed by exit 1 still confirms.
+    for (const mode of ["real", "real-exit-1"] as const) {
+      await lsof.setMode(mode);
+      const trusted = await settle(ops, `echo trusted-${mode}`, shared.worktree);
+      expect(trusted.error).toBeNull();
+      expect(trusted.output).toBe(`trusted-${mode}\n`);
+      expect(trusted.closure).not.toBeNull();
+    }
+    for (const mode of ["empty-exit-1", "omit-self"] as const) {
+      await lsof.setMode(mode);
+      const untrusted = await settle(ops, `echo untrusted-${mode}`, shared.worktree);
+      expect(untrusted.output).toBe(`untrusted-${mode}\n`);
+      expect(untrusted.error).toBeInstanceOf(CccConfinementClosureError);
+      expect(String((untrusted.error as Error).message)).toMatch(/did not list the controller/u);
+      expect(untrusted.closure).toBeNull();
+    }
+  });
+
+  it("SIGKILLs every process the reaper stopped when the controller cannot confirm closure, so no stopped orphan remains, while the same command under the real lsof is confirmed", async () => {
+    const command = `node -e 'setInterval(()=>{},1000)/*${RUN_TOKEN}*/' & echo "ORPHAN $!"`;
+    // Control: the real lsof sees the background child running from the clone, kills it and lists it.
+    const control = await settle(sharedOps, command, shared.worktree);
+    const [controlPid] = track(control.output);
+    expect(control.error).toBeNull();
+    expect(controlPid).toBeGreaterThan(1);
+    expect(control.closure!.killed).toContain(controlPid);
+    expect(await esrchWithin(controlPid!, 2_000)).toBe(true);
+
+    // The sweep's lsof answers nothing: the reaper still stopped the child, and the controller must not leave it stopped.
+    const lsof = await modeLsof(shared.root);
+    await lsof.setMode("empty-exit-1");
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+    const refused = await settle(ops, command, shared.worktree);
+    const [orphan] = track(refused.output);
+    expect(orphan).toBeGreaterThan(1);
+    expect(refused.error).toBeInstanceOf(CccConfinementClosureError);
+    expect(await esrchWithin(orphan!, 2_000)).toBe(true);
+  });
+
   it("kills a setsid escaper, an argv[0]-spoofed escaper and a symlink-launched escaper from outside the sandbox after the command kills its reaper", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
-    const heartbeats = ["hb1", "hb2", "hb3"].map((name) => join(fx.worktree, "src", name));
+    const fx = shared;
+    const ops = sharedOps;
+    const heartbeats = ["hb-s1", "hb-s2", "hb-s3"].map((name) => join(fx.worktree, "src", name));
     const command = [
-      "node esc.js src/hb1",
-      `(exec -a ccc-spoofed-${RUN_TOKEN} node hb.js src/hb2 & echo "SPOOFED $!" >> src/pids)`,
-      `node -e 'require("fs").symlinkSync(process.execPath,"src/sn")'`,
-      `(./src/sn hb.js src/hb3 & echo "LINKED $!" >> src/pids)`,
+      "node esc.js src/hb-s1 src/pids-s",
+      `(exec -a ccc-spoofed-${RUN_TOKEN} node hb.js src/hb-s2 & echo "SPOOFED $!" >> src/pids-s)`,
+      `node -e 'require("fs").symlinkSync(process.execPath,"src/sp-sn")'`,
+      `(./src/sp-sn hb.js src/hb-s3 & echo "LINKED $!" >> src/pids-s)`,
       // Every escaper is writing before the reaper dies.
-      "while [ ! -s src/hb1 ] || [ ! -s src/hb2 ] || [ ! -s src/hb3 ]; do :; done",
+      "while [ ! -s src/hb-s1 ] || [ ! -s src/hb-s2 ] || [ ! -s src/hb-s3 ]; do :; done",
       "kill -9 $PPID",
       "echo after-kill",
     ].join("; ");
     const confined = await settle(ops, command, fx.worktree);
-    const pids = [...new Set(track(confined.output, join(fx.worktree, "src", "pids")))];
+    const pids = [...new Set(track(confined.output, join(fx.worktree, "src", "pids-s")))];
     expect(pids).toHaveLength(3);
     for (const heartbeat of heartbeats) expect(fileSize(heartbeat)).toBeGreaterThan(0);
 
@@ -960,8 +1160,8 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
   });
 
   it("serializes concurrent execs on one instance so the later command starts after the earlier one ends", async () => {
-    const fx = await fixture();
-    const ops = createCccConfinedBashOperations(fx.input);
+    const fx = shared;
+    const ops = sharedOps;
     const first = settle(ops, `node -e 'setTimeout(()=>console.log("A-DONE "+Date.now()),700)'`, fx.worktree);
     const second = settle(ops, `node -e 'console.log("B-START "+Date.now())'`, fx.worktree);
     const [a, b] = await Promise.all([first, second]);
@@ -1005,6 +1205,27 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(material.some((part) => part.includes('"GIT_CONFIG_GLOBAL":"/dev/null"'))).toBe(true);
     expect(material.some((part) => part.includes("(allow network-outbound (remote tcp \"localhost:"))).toBe(true);
     expect(material.some((part) => part.includes('(deny file-write* (subpath "/ccc-sentinel/scratch/toolchains"))'))).toBe(true);
+  });
+
+  it("binds the template digest to the system runtime read roots, the device read files and a sentinel rendering of every rule the writer-profile assembly emits", async () => {
+    const material = CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL;
+    const part = (prefix: string): string => material.find((entry) => entry.startsWith(prefix)) ?? "";
+    for (const root of ["/System/Library", "/usr/lib", "/private/var/db/dyld", "/usr/share/zoneinfo", "/private/var/db/timezone"]) {
+      expect(part("system-runtime-read-roots ")).toContain(JSON.stringify(root));
+    }
+    for (const file of ["/dev/null", "/dev/urandom"]) expect(part("device-read-files ")).toContain(JSON.stringify(file));
+    const sentinel = part("writer-profile-sentinel ");
+    expect(sentinel).toContain('(allow file-read* (subpath "/usr/share/zoneinfo"))');
+    expect(sentinel).toContain('(literal "/dev/urandom")');
+    // Every rule family a real profile emits (the text before its first quoted path) is in the sentinel rendering,
+    // so widening any input of the assembly changes the digest a qualification binds.
+    const heads = (profile: string): Set<string> => new Set(profile.split("\n").filter((line) => line.length > 0).map((line) => line.split('"')[0]!));
+    const real = await buildCccWriterShellDarwinProfile({ ...shared.input, gitDirs: [], deniedRoots: [shared.outsideDir] });
+    const sentinelHeads = heads(sentinel.slice("writer-profile-sentinel ".length));
+    const realHeads = [...heads(real.profile)];
+    expect(realHeads.length).toBeGreaterThan(10);
+    expect(realHeads.filter((head) => !sentinelHeads.has(head))).toEqual([]);
+    expect(CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256).toBe(createHash("sha256").update(material.join("\u0000")).digest("hex"));
   });
 
   describe("shared write predicate", () => {
@@ -1156,6 +1377,18 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
       roots.push(qualificationRoot);
       await expect(qualifyCccConfinedShell({ toolchain, scratchRoot: qualificationRoot, testOnly: { lsofPath: join(fx.root, "lsof-missing") } }))
         .rejects.toMatchObject({ reason: "closure-sweep-unavailable" });
+    });
+
+    it("refuses an operations testOnly key other than lsofPath, sealedEnvironment included, with a TypeError, while lsofPath alone and no testOnly are admitted", async () => {
+      const fx = await fixture();
+      expect(refusalReason(() => createCccConfinedBashOperations(fx.input))).toBeNull();
+      expect(refusalReason(() => createCccConfinedBashOperations(fx.input, {}))).toBeNull();
+      expect(refusalReason(() => createCccConfinedBashOperations(fx.input, { lsofPath: "/usr/sbin/lsof" }))).toBeNull();
+      // E4-X item 5: the environment seam lives on qualifyCccConfinedShell only (E2-11).
+      const leaky = { sealedEnvironment: (sealed: Readonly<Record<string, string>>) => ({ ...(process.env as Record<string, string>), ...sealed }) };
+      for (const testOnly of [leaky, { lsofPath: "/usr/sbin/lsof", ...leaky }, { lsofPath: "/usr/sbin/lsof", extra: true }]) {
+        expect(() => createCccConfinedBashOperations(fx.input, testOnly as never)).toThrow(TypeError);
+      }
     });
 
     it("refuses a write root that carries a denied-name or .git segment as root-overlap, while an ordinary write root is admitted", async () => {
