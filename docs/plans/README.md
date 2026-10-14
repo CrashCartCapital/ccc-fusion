@@ -4,6 +4,7 @@ This folder contains current direction plus older design and execution records. 
 
 ## Current target
 
+- [2026-10-13 Request-to-code implementation PRD v3](./2026-10-13-ccc-fusion-request-to-code-prd-v3.md) - current implementation target for turning a plain-language request into a reviewed PRD, dependency plan, and checked code. It carries Ryan's explicit model amendment: the routine pool is GLM 5.3 (`glm/glm-5.3`), GLM 5.3 Flash (`glm/glm-5.3-flash`), and MiniMax M3 (`minimax/MiniMax-M3`), assigned by role. GLM 5.2 is excluded from new worker and fallback routes. Where the defaults below still say GLM 5.2, PRD v3 wins. Preserved byte-for-byte; sha256 `5aa8bc8dad8d2ad975983ad0af94209e3f09989b079f799ef65f0d5fe1c03927`.
 - [2026-08-11 CCC-Fusion product direction](./2026-08-11-ccc-fusion-product-direction.md) - current repo-local direction for worker compute, campaign parallelism, capacity learning, and delivery boundaries.
 
 ## How to read older plans
@@ -32,6 +33,7 @@ Keep these labels separate when using this folder:
 
 ## Locked defaults for next planning
 
+- Superseded on 2026-10-13 by PRD v3 for model identity (GLM 5.3, GLM 5.3 Flash, MiniMax M3 by role); the rest of this list still applies.
 - Routine CCC-Fusion workers should use OmniRoute endpoints, mainly MiniMax M3 and GLM 5.2, unless measured evidence says a task class needs escalation.
 - Orchestrator workers can also use MiniMax M3 and GLM 5.2 when the chunk size and role fit.
 - Escalation should be explicit and recorded: first resize the task for MiniMax M3 or GLM 5.2; then OpenCode Go through OmniRoute for Kimi K3 or Qwen 3.8; then Gemini Pro or limited AGY-delivered Opus 4.6 when available; then Codex Terra high/xhigh, Terra max, and finally Sol max.
