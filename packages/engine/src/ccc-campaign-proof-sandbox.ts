@@ -5,7 +5,7 @@ import { mkdir } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createServer as createTcpServer } from "node:net";
 import { promisify } from "node:util";
-import { superviseSpawn } from "@fusion/core";
+import { superviseSpawn, type SupervisedChild } from "@fusion/core";
 
 const DARWIN_SANDBOX_EXECUTABLE = "/usr/bin/sandbox-exec";
 const DARWIN_SHELL_EXECUTABLE = "/bin/sh";
@@ -85,6 +85,15 @@ export function isCccSemanticProofSandboxReady(
  * before any per-proof work (mkdtemp, materialization) starts.
  */
 export async function inspectCccSemanticProofSandboxReadiness(): Promise<CccSemanticProofSandboxReadiness> {
+  return readCccSemanticProofSandboxReadiness();
+}
+
+/**
+ * Synchronous form of `inspectCccSemanticProofSandboxReadiness`, for callers
+ * that must refuse before returning (the confined writer shell builds Pi
+ * `BashOperations` synchronously). Same checks, same envelope.
+ */
+export function readCccSemanticProofSandboxReadiness(): CccSemanticProofSandboxReadiness {
   if (process.platform !== "darwin") {
     return {
       ready: false,
@@ -161,6 +170,16 @@ function sbplLiteral(path: string): string {
 
 function sbplSubpath(path: string): string {
   return `(subpath ${sbplString(path)})`;
+}
+
+// sandbox-exec requires the hostname form here; the sandboxed process still binds and
+// connects to the literal IPv4 loopback address, and the port remains controller-selected.
+function sbplLoopbackPortRules(port: number): string[] {
+  return [
+    `(allow network-bind (local tcp "localhost:${port}"))`,
+    `(allow network-inbound (local tcp "localhost:${port}"))`,
+    `(allow network-outbound (remote tcp "localhost:${port}"))`,
+  ];
 }
 
 function canonicalExistingPath(path: string, label: string): string {
@@ -495,13 +514,7 @@ export async function buildCccSemanticProofDarwinProfile(
     "(allow ipc-posix-shm*)",
     "(allow system-socket)",
     "(deny network*)",
-    // sandbox-exec requires the hostname form here; the proof still binds and connects
-    // to the literal IPv4 loopback address, and the port remains controller-selected.
-    ...(canonical.loopbackPort !== undefined ? [
-      `(allow network-bind (local tcp "localhost:${canonical.loopbackPort}"))`,
-      `(allow network-inbound (local tcp "localhost:${canonical.loopbackPort}"))`,
-      `(allow network-outbound (remote tcp "localhost:${canonical.loopbackPort}"))`,
-    ] : []),
+    ...(canonical.loopbackPort !== undefined ? sbplLoopbackPortRules(canonical.loopbackPort) : []),
   ];
   for (const deniedRoot of canonical.deniedReadRoots) {
     lines.push(`(deny file-read* ${sbplSubpath(deniedRoot)})`);
@@ -538,10 +551,159 @@ function boundedOutputAppend(
   chunk: Buffer,
   currentBytes: number,
   maximumBytes: number,
+  onAccepted?: (accepted: Buffer) => void,
 ): number {
   const remaining = Math.max(0, maximumBytes - currentBytes);
-  if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+  if (remaining > 0) {
+    const accepted = chunk.subarray(0, remaining);
+    chunks.push(accepted);
+    onAccepted?.(accepted);
+  }
   return currentBytes + chunk.byteLength;
+}
+
+export type CccDarwinSandboxedStopReason = "timeout" | "output" | "abort";
+
+/**
+ * One `sandbox-exec -p <profile> <executable> ...args` run under the process
+ * supervisor, with a wall timeout and a combined stdout+stderr byte cap. This is
+ * the runner behind `runCccSemanticProofSandboxedProcess`; the confined writer
+ * shell (ccc-confinement/confined-shell.ts) reuses it with a controller-owned
+ * stdin and a closure pipe, streaming output and a reaper-aware stop.
+ */
+export type RunCccDarwinSandboxedProcessInput = Readonly<{
+  profile: string;
+  executable: string;
+  args: readonly string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  maxOutputBytes: number;
+  diagnosticLabel: string;
+  /** Time past `timeoutMs` before the supervisor tears the group down. Default two termination graces. */
+  lifetimeGraceMs?: number;
+  /** "pipe" gives the caller a writable stdin through `onSpawn`. Default "ignore". */
+  stdin?: "ignore" | "pipe";
+  /** Extra controller-owned pipes after stderr (fd 3 onward), read through `onSpawn`. */
+  extraPipes?: number;
+  signal?: AbortSignal;
+  onSpawn?: (supervised: SupervisedChild) => void;
+  /** Streams each accepted (in-cap) slice of stdout or stderr. */
+  onOutput?: (accepted: Buffer) => void;
+  /** Replaces the default SIGTERM-then-SIGKILL stop. Called at most once. */
+  requestStop?: (supervised: SupervisedChild, reason: CccDarwinSandboxedStopReason) => void;
+}>;
+
+export type CccDarwinSandboxedProcessOutcome = Readonly<{
+  result: CccSemanticProofSandboxedProcessResult;
+  stopReason: CccDarwinSandboxedStopReason | null;
+}>;
+
+export async function runCccDarwinSandboxedProcess(
+  input: RunCccDarwinSandboxedProcessInput,
+): Promise<CccDarwinSandboxedProcessOutcome> {
+  const { maxOutputBytes } = input;
+  const supervised = superviseSpawn(
+    DARWIN_SANDBOX_EXECUTABLE,
+    ["-p", input.profile, input.executable, ...input.args],
+    {
+      cwd: input.cwd,
+      env: input.env,
+      stdio: [
+        input.stdin ?? "ignore",
+        "pipe",
+        "pipe",
+        ...Array.from({ length: input.extraPipes ?? 0 }, () => "pipe" as const),
+      ],
+      maxLifetimeMs: input.timeoutMs + (input.lifetimeGraceMs ?? TERMINATION_GRACE_MS * 2),
+      diagnosticLabel: input.diagnosticLabel,
+    },
+  );
+  input.onSpawn?.(supervised);
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  const stdoutHash = createHash("sha256");
+  const stderrHash = createHash("sha256");
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let outputOverLimit = false;
+  let timedOut = false;
+  let killed = false;
+  let stopReason: CccDarwinSandboxedStopReason | null = null;
+  let spawnError: string | undefined;
+  let forceKillTimer: NodeJS.Timeout | undefined;
+
+  const stop = (reason: CccDarwinSandboxedStopReason): void => {
+    if (killed) return;
+    killed = true;
+    stopReason = reason;
+    if (input.requestStop) {
+      input.requestStop(supervised, reason);
+      return;
+    }
+    supervised.kill("SIGTERM");
+    forceKillTimer = setTimeout(() => supervised.kill("SIGKILL"), TERMINATION_GRACE_MS);
+    forceKillTimer.unref?.();
+  };
+  const onOutput = (kind: "stdout" | "stderr", chunkValue: string | Buffer): void => {
+    const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
+    if (kind === "stdout") {
+      stdoutHash.update(chunk);
+      stdoutBytes = boundedOutputAppend(
+        stdoutChunks,
+        chunk,
+        stdoutBytes,
+        Math.max(0, maxOutputBytes - Math.min(stderrBytes, maxOutputBytes)),
+        input.onOutput,
+      );
+    } else {
+      stderrHash.update(chunk);
+      stderrBytes = boundedOutputAppend(
+        stderrChunks,
+        chunk,
+        stderrBytes,
+        Math.max(0, maxOutputBytes - Math.min(stdoutBytes, maxOutputBytes)),
+        input.onOutput,
+      );
+    }
+    if (stdoutBytes + stderrBytes > maxOutputBytes) {
+      outputOverLimit = true;
+      stop("output");
+    }
+  };
+  supervised.child.stdout?.on("data", (chunk) => onOutput("stdout", chunk));
+  supervised.child.stderr?.on("data", (chunk) => onOutput("stderr", chunk));
+  supervised.child.once("error", (error) => {
+    spawnError = error.message;
+  });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    stop("timeout");
+  }, input.timeoutMs);
+  timeout.unref?.();
+  const onAbort = (): void => stop("abort");
+  if (input.signal?.aborted) onAbort();
+  else input.signal?.addEventListener("abort", onAbort, { once: true });
+
+  const exit = await supervised.waitExit();
+  clearTimeout(timeout);
+  input.signal?.removeEventListener("abort", onAbort);
+  if (forceKillTimer) clearTimeout(forceKillTimer);
+  return {
+    result: {
+      exitCode: exit.code,
+      signal: exit.signal,
+      stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+      stderr: Buffer.concat(stderrChunks).toString("utf8"),
+      stdoutSha256: stdoutHash.digest("hex"),
+      stderrSha256: stderrHash.digest("hex"),
+      timedOut,
+      killed,
+      outputOverLimit,
+      ...(spawnError ? { spawnError } : {}),
+    },
+    stopReason,
+  };
 }
 
 export async function runCccSemanticProofSandboxedProcess(
@@ -607,84 +769,38 @@ export async function runCccSemanticProofSandboxedProcess(
   // This repeats the preflight at the last possible point before dispatch so a
   // replaced PATH entry cannot silently select a different Node executable.
   assertSealedNodeResolution(canonical);
-  const supervised = superviseSpawn(
-    DARWIN_SANDBOX_EXECUTABLE,
-    ["-p", profile, executable, ...input.args],
-    {
-      cwd: canonical.proofRoot,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-      maxLifetimeMs: timeoutMs + TERMINATION_GRACE_MS * 2,
-      diagnosticLabel: "ccc-semantic-proof-v2",
-    },
-  );
-  const stdoutChunks: Buffer[] = [];
-  const stderrChunks: Buffer[] = [];
-  const stdoutHash = createHash("sha256");
-  const stderrHash = createHash("sha256");
-  let stdoutBytes = 0;
-  let stderrBytes = 0;
-  let outputOverLimit = false;
-  let timedOut = false;
-  let killed = false;
-  let spawnError: string | undefined;
-  let forceKillTimer: NodeJS.Timeout | undefined;
-
-  const stop = (): void => {
-    if (killed) return;
-    killed = true;
-    supervised.kill("SIGTERM");
-    forceKillTimer = setTimeout(() => supervised.kill("SIGKILL"), TERMINATION_GRACE_MS);
-    forceKillTimer.unref?.();
-  };
-  const onOutput = (kind: "stdout" | "stderr", chunkValue: string | Buffer): void => {
-    const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
-    if (kind === "stdout") {
-      stdoutHash.update(chunk);
-      stdoutBytes = boundedOutputAppend(
-        stdoutChunks,
-        chunk,
-        stdoutBytes,
-        Math.max(0, maxOutputBytes - Math.min(stderrBytes, maxOutputBytes)),
-      );
-    } else {
-      stderrHash.update(chunk);
-      stderrBytes = boundedOutputAppend(
-        stderrChunks,
-        chunk,
-        stderrBytes,
-        Math.max(0, maxOutputBytes - Math.min(stdoutBytes, maxOutputBytes)),
-      );
-    }
-    if (stdoutBytes + stderrBytes > maxOutputBytes) {
-      outputOverLimit = true;
-      stop();
-    }
-  };
-  supervised.child.stdout?.on("data", (chunk) => onOutput("stdout", chunk));
-  supervised.child.stderr?.on("data", (chunk) => onOutput("stderr", chunk));
-  supervised.child.once("error", (error) => {
-    spawnError = error.message;
+  const { result } = await runCccDarwinSandboxedProcess({
+    profile,
+    executable,
+    args: input.args,
+    cwd: canonical.proofRoot,
+    env,
+    timeoutMs,
+    maxOutputBytes,
+    diagnosticLabel: "ccc-semantic-proof-v2",
   });
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    stop();
-  }, timeoutMs);
-  timeout.unref?.();
-
-  const exit = await supervised.waitExit();
-  clearTimeout(timeout);
-  if (forceKillTimer) clearTimeout(forceKillTimer);
-  return {
-    exitCode: exit.code,
-    signal: exit.signal,
-    stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-    stderr: Buffer.concat(stderrChunks).toString("utf8"),
-    stdoutSha256: stdoutHash.digest("hex"),
-    stderrSha256: stderrHash.digest("hex"),
-    timedOut,
-    killed,
-    outputOverLimit,
-    ...(spawnError ? { spawnError } : {}),
-  };
+  return result;
 }
+
+/*
+FNXC:CccConfinedShell 2026-10-14-08:30:
+Card X1 (PRD v3 §8, D12): the confined writer shell builds its own
+`ccc-writer-shell.v1` profile but reuses this file's path canonicalisation,
+SBPL escaping, ancestor-metadata pattern, dylib closure discovery and loopback
+rule form instead of a second implementation. These are re-exports of the
+existing internal helpers; the semantic-proof profile and runner keep their
+exact behaviour.
+*/
+export {
+  DARWIN_SANDBOX_EXECUTABLE as CCC_DARWIN_SANDBOX_EXECUTABLE,
+  DARWIN_SHELL_SELECTION_PATH as CCC_DARWIN_SHELL_SELECTION_PATH,
+  canonicalExistingPath as cccCanonicalExistingPath,
+  darwinLinkedRuntimeFiles as cccDarwinLinkedRuntimeFiles,
+  isSameOrWithin as cccIsSameOrWithin,
+  pathAncestors as cccPathAncestors,
+  sbplLiteral as cccSbplLiteral,
+  sbplLoopbackPortRules as cccSbplLoopbackPortRules,
+  sbplString as cccSbplString,
+  sbplSubpath as cccSbplSubpath,
+  uniqueSorted as cccUniqueSortedPaths,
+};
