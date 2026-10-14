@@ -741,7 +741,185 @@ function exactObjectKeys(value: Record<string, unknown>, expected: string[], lab
   }
 }
 
-function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBinding | undefined {
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-14:05:
+The provider-attempt seam carries campaign scopes and request-to-code planning scopes (CONTRACT-v3 section 2.12, D9). Its asserts read only the route fields of a scope's binding, so they take the view scope; the campaign types stay instances of the views, which the three aliases below check at compile time.
+*/
+type CccProviderAttemptViewScope = import("./agent-runtime.js").CccProviderAttemptScopeView;
+type CccProviderAttemptViewBinding = CccProviderAttemptBinding<CccProviderAttemptViewScope>;
+type CccProviderAttemptViewHold = Extract<import("./agent-runtime.js").CccProviderControllerDecisionView, { kind: "hold" }>;
+type CccProviderAttemptRouteRefusalReason = import("./agent-runtime.js").CccProviderAttemptRefusalReason;
+type _CccCampaignScopeIsView = CccAssertType<CccProviderAttemptScope extends CccProviderAttemptViewScope ? true : false>;
+type _CccCampaignDecisionIsView = CccAssertType<
+  CccCampaignProviderControllerDecision extends import("./agent-runtime.js").CccProviderControllerDecisionView ? true : false
+>;
+type _CccCampaignSettlementIsView = CccAssertType<
+  import("./agent-runtime.js").CccProviderAttemptSettlementInputOf<CccProviderAttemptScope> extends CccProviderAttemptSettlementInput
+    ? true
+    : false
+>;
+type CccAssertType<T extends true> = T;
+
+/**
+ * A planning or planning-linked route refusal (D10): a missing or mismatched
+ * terminal route receipt, effective-route drift, or a provider error event.
+ * Thrown out of the stream's slot loop after the attempt settled exactly once
+ * as `proved_failed`, so nothing retries the refused slot.
+ */
+export class CccProviderRouteReceiptError extends Error {
+  readonly code = "CCC_PROVIDER_ROUTE_RECEIPT_REFUSED" as const;
+
+  constructor(
+    readonly reason: CccProviderAttemptRouteRefusalReason,
+    readonly requested: Readonly<{ provider: string; model: string }>,
+    readonly observed: Readonly<{ provider: string; model: string }> | null,
+  ) {
+    super(
+      `ccc-fusion provider route refused (${reason}): requested ${requested.provider}/${requested.model}, `
+      + `observed ${observed ? `${observed.provider}/${observed.model}` : "none"}`,
+    );
+    this.name = "CccProviderRouteReceiptError";
+  }
+}
+
+/**
+ * Symbol key under which a binding factory records the route it bound on the
+ * frozen controller. A symbol key keeps the controller's own string keys
+ * exactly `preDispatch` and `reconcile`.
+ */
+export const CCC_PROVIDER_ATTEMPT_ROUTE_MARKER: unique symbol = Symbol.for("ccc-fusion.provider-attempt-route.v1");
+
+const CCC_PROVIDER_ATTEMPT_SCOPE_KINDS: ReadonlySet<unknown> = new Set(["campaign", "planning", "planning-linked-writer"]);
+const CCC_SESSION_TOOL_POLICY_ID = /^(?:ccc-(?:author|researcher|critic|writer)-(?:probe-)?tools\.v1|ccc-linked-writer-tools\.v1)$/;
+const CCC_LINKED_WRITER_TOOL_POLICY_ID = "ccc-linked-writer-tools.v1";
+
+/** Planning and planning-linked-writer scopes settle route refusals themselves (D10); campaign scope never does. */
+function cccProviderAttemptIsPlanningScope(binding: CccProviderAttemptViewBinding): boolean {
+  return binding.scopeKind === "planning" || binding.scopeKind === "planning-linked-writer";
+}
+
+function requireCccFrozenStringList(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value) || !Object.isFrozen(value)) {
+    throw new Error(`${label} must be a frozen array`);
+  }
+  if (value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new Error(`${label} must contain only non-empty strings`);
+  }
+  return value as readonly string[];
+}
+
+function validateCccSessionToolPolicy(value: unknown, scopeKind: unknown): void {
+  const label = "cccProviderAttemptBinding.toolPolicy";
+  if (!value || typeof value !== "object" || Array.isArray(value) || !Object.isFrozen(value)) {
+    throw new Error(`${label} must be a frozen object`);
+  }
+  const policy = value as Record<string, unknown>;
+  exactObjectKeys(policy, ["allowedTools", "deniedNames", "policyId", "readRoots", "toolsetDigest", "writeRoots"], label);
+  if (typeof policy.policyId !== "string" || !CCC_SESSION_TOOL_POLICY_ID.test(policy.policyId)) {
+    throw new Error(`${label}.policyId is not an admitted session tool policy`);
+  }
+  const linkedWriterPolicy = policy.policyId === CCC_LINKED_WRITER_TOOL_POLICY_ID;
+  if (scopeKind === "planning-linked-writer" && !linkedWriterPolicy) {
+    throw new Error(`${label}.policyId must be ${CCC_LINKED_WRITER_TOOL_POLICY_ID} for a planning-linked-writer scope`);
+  }
+  if (scopeKind === "planning" && linkedWriterPolicy) {
+    throw new Error(`${label}.policyId ${CCC_LINKED_WRITER_TOOL_POLICY_ID} is only for a planning-linked-writer scope`);
+  }
+  const allowedTools = requireCccFrozenStringList(policy.allowedTools, `${label}.allowedTools`);
+  if (allowedTools.length === 0) {
+    throw new Error(`${label}.allowedTools must not be empty`);
+  }
+  for (let index = 1; index < allowedTools.length; index += 1) {
+    if (compareCccPrdCodeUnits(allowedTools[index - 1]!, allowedTools[index]!) >= 0) {
+      throw new Error(`${label}.allowedTools must be sorted and unique`);
+    }
+  }
+  if (typeof policy.toolsetDigest !== "string" || !/^[a-f0-9]{64}$/.test(policy.toolsetDigest)) {
+    throw new Error(`${label}.toolsetDigest must be a sha256 hex digest`);
+  }
+  requireCccFrozenStringList(policy.readRoots, `${label}.readRoots`);
+  requireCccFrozenStringList(policy.deniedNames, `${label}.deniedNames`);
+  const writeRoots = requireCccFrozenStringList(policy.writeRoots, `${label}.writeRoots`);
+  const writerPolicy = linkedWriterPolicy || policy.policyId.startsWith("ccc-writer-");
+  if (!writerPolicy && writeRoots.length > 0) {
+    throw new Error(`${label}.writeRoots must be empty unless the role class is writer`);
+  }
+}
+
+/** The route a planning binding factory recorded on its frozen controller, if any. */
+function readCccProviderAttemptBoundRoute(binding: CccProviderAttemptViewBinding): Readonly<{ providerId: string; modelId: string; transport: string }> | undefined {
+  const route = (binding.controller as unknown as Record<PropertyKey, unknown>)[CCC_PROVIDER_ATTEMPT_ROUTE_MARKER];
+  if (route === undefined) return undefined;
+  if (!route || typeof route !== "object" || Array.isArray(route) || !Object.isFrozen(route)) {
+    throw new Error("cccProviderAttemptBinding.controller bound route must be a frozen object");
+  }
+  exactObjectKeys(route as Record<string, unknown>, ["modelId", "providerId", "transport"], "cccProviderAttemptBinding.controller bound route");
+  const { providerId, modelId, transport } = route as Record<string, unknown>;
+  if (typeof providerId !== "string" || typeof modelId !== "string" || typeof transport !== "string") {
+    throw new Error("cccProviderAttemptBinding.controller bound route must contain strings");
+  }
+  return { providerId, modelId, transport };
+}
+
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-14:55:
+Session creation for a planning or planning-linked-writer binding (CONTRACT-v3 section 2.12, D48). Pi selects the Fusion terminal route receipt adapter only for the session's default provider (registration below), and any other provider streams through unpatched pi-ai, so a bound route must be the default provider among the registered custom providers. A planning binding must come from createCccPlanningProviderAttemptBinding, whose controller records the bound route; a linked-writer binding is checked against that route when it carries one, and otherwise the mandatory terminal receipt refuses any other upstream at settlement. The stream guard, provider pin check and confinement are required here and the pin check runs before any provider is registered; using the guard and the confinement is left to the session cards.
+*/
+function assertCccPlanningSessionBinding(
+  options: AgentOptions,
+  binding: CccProviderAttemptViewBinding | undefined,
+  providers: ReturnType<typeof readCustomProviders>,
+): void {
+  if (!binding) return;
+  if (binding.toolPolicy !== undefined && !options.cccConfinement) {
+    throw new Error("cccProviderAttemptBinding.toolPolicy requires cccConfinement");
+  }
+  if (!cccProviderAttemptIsPlanningScope(binding)) return;
+  const label = `ccc-fusion ${binding.scopeKind} binding`;
+  if (binding.receiptAdapterId !== "terminal-route-sse-comments.v1") {
+    throw new Error(`${label} requires the terminal-route-sse-comments.v1 receipt adapter (D48)`);
+  }
+  if (binding.terminalRouteMembers !== undefined) {
+    throw new Error(`${label} must not carry terminalRouteMembers`);
+  }
+  if (binding.toolPolicy === undefined) {
+    throw new Error(`${label} requires a toolPolicy`);
+  }
+  const route = readCccProviderAttemptBoundRoute(binding);
+  if (route === undefined && binding.scopeKind === "planning") {
+    throw new Error(`${label} controller carries no bound route; build it with createCccPlanningProviderAttemptBinding`);
+  }
+  if (route !== undefined && route.providerId !== options.defaultProvider) {
+    throw new Error(
+      `ccc-fusion planning binding provider ${route.providerId} must be the session default provider `
+      + `${String(options.defaultProvider)} (D48)`,
+    );
+  }
+  const defaultProvider = providers.find(
+    (candidate) => customProviderRegistryKey(candidate, providers) === options.defaultProvider,
+  );
+  if (!defaultProvider) {
+    throw new Error(
+      `${label} default provider ${String(options.defaultProvider)} is not a registered custom provider, `
+      + "so the receipt adapter cannot be selected (D48)",
+    );
+  }
+  if (!options.cccStreamGuard) {
+    throw new Error(`${label} requires cccStreamGuard`);
+  }
+  if (typeof options.cccProviderPinCheck !== "function") {
+    throw new Error(`${label} requires cccProviderPinCheck`);
+  }
+  if (!options.cccConfinement) {
+    throw new Error(`${label} requires cccConfinement`);
+  }
+  if (binding.toolPolicy.allowedTools.includes("bash") && options.cccConfinement.bash === null) {
+    throw new Error(`${label} toolPolicy allows bash but cccConfinement.bash is null`);
+  }
+  options.cccProviderPinCheck(providers);
+}
+
+function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptViewBinding | undefined {
   if (input === undefined) return undefined;
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("cccProviderAttemptBinding must be a frozen object");
@@ -752,11 +930,15 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
   const bindingRecord = input as Record<string, unknown>;
   exactObjectKeys(
     bindingRecord,
-    bindingRecord.receiptAdapterId === undefined
-      ? ["controller", "turnKey"]
-      : bindingRecord.terminalRouteMembers === undefined
-        ? ["controller", "receiptAdapterId", "turnKey"]
-        : ["controller", "receiptAdapterId", "terminalRouteMembers", "turnKey"],
+    [
+      ...(bindingRecord.receiptAdapterId === undefined
+        ? ["controller", "turnKey"]
+        : bindingRecord.terminalRouteMembers === undefined
+          ? ["controller", "receiptAdapterId", "turnKey"]
+          : ["controller", "receiptAdapterId", "terminalRouteMembers", "turnKey"]),
+      ...(bindingRecord.scopeKind === undefined ? [] : ["scopeKind"]),
+      ...(bindingRecord.toolPolicy === undefined ? [] : ["toolPolicy"]),
+    ],
     "cccProviderAttemptBinding",
   );
   const binding = bindingRecord;
@@ -794,6 +976,12 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
       seen.add(key);
     });
   }
+  if (binding.scopeKind !== undefined && !CCC_PROVIDER_ATTEMPT_SCOPE_KINDS.has(binding.scopeKind)) {
+    throw new Error("cccProviderAttemptBinding.scopeKind must be campaign, planning or planning-linked-writer");
+  }
+  if (binding.toolPolicy !== undefined) {
+    validateCccSessionToolPolicy(binding.toolPolicy, binding.scopeKind);
+  }
   const controller = binding.controller;
   if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
     throw new Error("cccProviderAttemptBinding.controller must be a frozen object");
@@ -806,21 +994,24 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
   if (typeof controllerRecord.preDispatch !== "function" || typeof controllerRecord.reconcile !== "function") {
     throw new Error("cccProviderAttemptBinding.controller methods must be functions");
   }
-  return input as CccProviderAttemptBinding;
+  return input as CccProviderAttemptViewBinding;
 }
 
-type CccProviderAttemptSubmittedReconciliation = CccProviderAttemptSettlementInput;
+type CccProviderAttemptSubmittedReconciliation =
+  import("./agent-runtime.js").CccProviderAttemptSettlementInputOf<CccProviderAttemptViewScope>;
 
 type CccProviderAttemptSessionState = {
   nextSlot: number;
   tail?: Promise<void>;
+  /** Planning-scope route refusals this session settled, by dispatch key (D10, item 42). */
+  routeRefusals: Map<string, CccProviderRouteReceiptError>;
 };
 
 function createCccProviderAttemptSessionState(): CccProviderAttemptSessionState {
-  return { nextSlot: 1 };
+  return { nextSlot: 1, routeRefusals: new Map() };
 }
 
-function cccProviderAttemptHoldError(decision: Extract<CccCampaignProviderControllerDecision, { kind: "hold" }>, dispatchKey: string): Error {
+function cccProviderAttemptHoldError(decision: CccProviderAttemptViewHold, dispatchKey: string): Error {
   if (decision.reason === "terminal") {
     return new Error(`ccc-fusion provider attempt ${dispatchKey} is already ${decision.scope.state ?? "terminal"}`);
   }
@@ -867,7 +1058,7 @@ function persistedCccProviderAttemptEffectiveRoute(
 
 function assertCccProviderAttemptReconciledScope(
   requested: CccProviderAttemptSubmittedReconciliation,
-  observed: CccProviderAttemptScope,
+  observed: CccProviderAttemptViewScope,
 ): void {
   const requestedIdentity = {
     attemptKey: requested.attemptKey,
@@ -896,12 +1087,13 @@ function assertCccProviderAttemptReconciledScope(
   if (canonicalCccPrdJson(observedIdentity) !== canonicalCccPrdJson(requestedIdentity)) {
     throw new Error("ccc-fusion provider attempt reconciliation identity mismatch");
   }
-  if (observed.state !== "committed") {
-    throw new Error(`ccc-fusion provider attempt reconciliation did not return committed state: ${observed.state}`);
+  // A planning-scope refusal settles proved_failed through this same exact round-trip check (D10).
+  if (observed.state !== requested.outcome) {
+    throw new Error(`ccc-fusion provider attempt reconciliation did not return ${requested.outcome} state: ${observed.state}`);
   }
   const expectedTerminal = {
     kind: "reconciled",
-    state: "committed",
+    state: requested.outcome,
     evidenceDigest: requested.evidenceDigest,
     observerId: requested.observerId,
     ...(requested.effectiveRoute
@@ -915,7 +1107,7 @@ function assertCccProviderAttemptReconciledScope(
 
 function assertCccProviderAttemptScopeAssociation(
   request: CccCampaignProviderDispatchInput,
-  scope: CccProviderAttemptScope,
+  scope: CccProviderAttemptViewScope,
   label: string,
 ): void {
   if (scope.turnKey !== request.turnKey) {
@@ -940,7 +1132,7 @@ function assertCccProviderAttemptScopeAssociation(
 
 function assertCccProviderAttemptPermitScope(
   request: CccCampaignProviderDispatchInput,
-  scope: CccProviderAttemptScope,
+  scope: CccProviderAttemptViewScope,
 ): void {
   assertCccProviderAttemptScopeAssociation(request, scope, "dispatch-permit");
   if (scope.state !== "dispatched_unknown") {
@@ -951,7 +1143,7 @@ function assertCccProviderAttemptPermitScope(
   }
 }
 
-function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAttemptScope): void {
+function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAttemptViewScope): void {
   const terminal = scope.terminal;
   if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) {
     throw new Error("ccc-fusion terminal hold scope must include proved_failed terminal evidence");
@@ -985,7 +1177,7 @@ function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAtt
 }
 
 function createCccProviderAttemptControlledStream(input: {
-  binding: CccProviderAttemptBinding;
+  binding: CccProviderAttemptViewBinding;
   state: CccProviderAttemptSessionState;
   omniRouteRequested?: CccOmniRouteExpectation;
   dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
@@ -1009,8 +1201,13 @@ function createCccProviderAttemptControlledStream(input: {
       if (priorTail) {
         await priorTail.catch(() => undefined);
       }
+      const planningScope = cccProviderAttemptIsPlanningScope(input.binding);
+      const planningRequested = input.omniRouteRequested?.requested;
+      if (planningScope && !planningRequested) {
+        throw new Error("ccc-fusion planning provider attempt requires the terminal route receipt adapter");
+      }
       let source!: AsyncIterable<any> & { result: () => Promise<any> };
-      let scope!: CccProviderAttemptScope;
+      let scope!: CccProviderAttemptViewScope;
       while (true) {
         const dispatchKey = `pi-stream:${input.state.nextSlot}`;
         const request = {
@@ -1030,11 +1227,42 @@ function createCccProviderAttemptControlledStream(input: {
         assertCccProviderAttemptScopeAssociation(request, decision.scope, `${decision.reason} hold`);
         if (decision.reason === "terminal" && decision.scope.state === "proved_failed") {
           assertCccProviderAttemptProvedFailedTerminalScope(decision.scope);
+          // A slot this session refused on its route never advances (D10, item 42); a provider-error
+          // proved_failed slot still does (E2-1). Only planning scopes record refusals.
+          const refusal = input.state.routeRefusals.get(dispatchKey);
+          if (refusal) throw refusal;
           input.state.nextSlot += 1;
           continue;
         }
         throw cccProviderAttemptHoldError(decision, dispatchKey);
       }
+
+      /*
+      FNXC:CccPlanningProviderSeam 2026-10-14-15:05:
+      Planning-scope settlement (D10). A missing or mismatched terminal route receipt, or a provider error event, settles the attempt exactly once as proved_failed, with no effective route, the refusal reason and a digest over the refusal evidence. The settlement goes through the same exact round-trip check as a commit. Effective-route drift cannot reach here in planning scope: the permit check pins the scope's route to the request, and with the receipt adapter the effective fields are the requested Pi route.
+      */
+      const settlePlanningRefusal = async (
+        reason: CccProviderAttemptRouteRefusalReason,
+        observed: Readonly<{ provider: string; model: string }> | null,
+      ): Promise<CccProviderRouteReceiptError> => {
+        const requested = { provider: planningRequested!.provider, model: planningRequested!.model };
+        const reconciliation: CccProviderAttemptSubmittedReconciliation = {
+          ...scope,
+          outcome: "proved_failed" as const,
+          evidenceDigest: cccProviderAttemptEvidenceDigest({
+            schema: "ccc-provider-route-refusal.v1",
+            reason,
+            requested,
+            observed,
+            adapter: input.binding.receiptAdapterId ?? null,
+          }),
+          observerId: "pi",
+          refusalReason: reason,
+        };
+        const reconciledScope = await input.binding.controller.reconcile(reconciliation);
+        assertCccProviderAttemptReconciledScope(reconciliation, reconciledScope);
+        return new CccProviderRouteReceiptError(reason, requested, observed);
+      };
 
       let terminalDoneEvent: unknown;
       let finalResultPromise: Promise<any> | undefined;
@@ -1062,9 +1290,19 @@ function createCccProviderAttemptControlledStream(input: {
               // reported as a real receipt.
               const usage = result.usage;
               const hasUsage = usage != null && !(usage.input === 0 && usage.output === 0);
-              const omniRoute = input.omniRouteRequested
-                ? requireCccOmniRouteReceipt(input.omniRouteRequested, undefined, result)
-                : undefined;
+              let omniRoute: CccOmniRouteReceipt | undefined;
+              try {
+                omniRoute = input.omniRouteRequested
+                  ? requireCccOmniRouteReceipt(input.omniRouteRequested, undefined, result)
+                  : undefined;
+              } catch (receiptError) {
+                if (!planningScope) throw receiptError;
+                // Planning scope: settle the refusal once, discard the response and leave the slot loop.
+                const observed = readCccOmniRouteFinal(result) ?? null;
+                const refusal = await settlePlanningRefusal(observed ? "receipt-mismatch" : "receipt-missing", observed);
+                input.state.routeRefusals.set(scope.dispatchKey, refusal);
+                throw refusal;
+              }
               const reconciliation: CccProviderAttemptSubmittedReconciliation = {
                 ...scope,
                 outcome: "committed" as const,
@@ -1113,6 +1351,11 @@ function createCccProviderAttemptControlledStream(input: {
               }
               if (event && typeof event === "object" && (event as { type?: unknown }).type === "error") {
                 failure = cccProviderAttemptStreamFailure((event as { error?: unknown }).error);
+                if (planningScope && (event as { reason?: unknown }).reason === "error") {
+                  // A provider error is a known failed effect: settle it, and a retry may take the next slot (E2-1).
+                  await settlePlanningRefusal("provider-error-event", null);
+                  input.state.nextSlot += 1;
+                }
                 yield event;
                 return;
               }
@@ -3542,6 +3785,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   }
   const customProviders = readCustomProviders();
   assertCccCustomProviderEgress(options, customProviders);
+  assertCccPlanningSessionBinding(options, cccProviderAttemptBinding, customProviders);
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
   // FNXC:McpConfig 2026-06-25-22:02:
   // The pi session is the final shared forwarding seam for direct createFnAgent lanes. Forward the resolved MCP set only to MCP-capable provider/runtime combinations and keep unsupported lanes content-free by logging just provider/runtime/count metadata.

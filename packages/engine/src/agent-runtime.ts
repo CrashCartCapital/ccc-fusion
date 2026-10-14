@@ -14,15 +14,28 @@
  * - `describeModel()`: Get model description from session
  */
 
-import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
-  CccCampaignProviderControllerDecision,
+  AgentSession,
+  BashOperations,
+  EditOperations,
+  FindOperations,
+  LsOperations,
+  ReadOperations,
+  SessionManager,
+  ToolDefinition,
+  WriteOperations,
+} from "@earendil-works/pi-coding-agent";
+import type {
+  CccCampaignProviderControllerHoldReason,
   CccCampaignProviderDispatchInput,
   CccCampaignRouteReceiptAdapterId,
   CccCampaignTerminalRouteMember,
+  CccCampaignTransport,
   CccEffectReceiptStore,
+  CccPlanningRoleClass,
+  CccProviderAttemptReconciliation,
   CccProviderAttemptScope,
-  CccProviderAttemptSettlementInput,
+  CustomProvider,
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
 } from "@fusion/core";
@@ -70,18 +83,111 @@ export interface CccEffectReceiptBinding {
   keepTurnOpen: boolean;
 }
 
-/** Frozen, runtime-neutral admission/settlement binding for one CCC PI turn. */
-export type CccProviderAttemptController = Readonly<{
-  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
-  reconcile(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope>;
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-13:46:
+Request-to-code planning sessions reuse this Pi provider-attempt seam with their own scope type (CONTRACT-v3 section 2.12, D9). The seam is generic over a scope "view": any scope whose binding names the route (task, provider, model, transport). K1 defines these views in core (`ccc-campaign/types.ts`, `ccc-campaign/provider-controller.ts`), but the INT-1 core barrel does not export them yet and engine may import only what `@fusion/core` exports (D34). So the six view types below are member-for-member copies of K1's, built only from exported core names, and `ccc-provider-seam.typecheck.test.ts` compiles them against K1's own definitions in both directions. When the parent exports K1's names from the barrel, these collapse into re-exports and `CccProviderAttemptController` becomes a plain alias of K1's `CccProviderAttemptControllerView`.
+*/
+export type CccProviderAttemptRouteBindingView = Readonly<{
+  taskId: string;
+  providerId: string;
+  modelId: string;
+  transport: CccCampaignTransport;
 }>;
 
-export type CccProviderAttemptBinding = Readonly<{
+export type CccProviderAttemptScopeView = Readonly<Omit<CccProviderAttemptScope, "binding"> & {
+  binding: CccProviderAttemptRouteBindingView;
+}>;
+
+/** Why a planning or planning-linked terminal settled as a known-effect refusal (D10). */
+export type CccProviderAttemptRefusalReason =
+  | "receipt-missing"
+  | "receipt-mismatch"
+  | "effective-route-drift"
+  | "provider-error-event";
+
+/** `refusalReason` is supplied only in planning and planning-linked scope; campaign settlement never carries it. */
+export type CccProviderAttemptSettlementInputOf<S extends CccProviderAttemptScopeView> =
+  CccProviderAttemptReconciliation
+  & Pick<S, "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding">
+  & Readonly<{ refusalReason?: CccProviderAttemptRefusalReason }>;
+
+export type CccProviderControllerDecisionView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> =
+  | Readonly<{ kind: "dispatch-permit"; scope: S }>
+  | Readonly<{ kind: "hold"; reason: CccCampaignProviderControllerHoldReason; scope: S }>;
+
+export type CccProviderAttemptControllerView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> = Readonly<{
+  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccProviderControllerDecisionView<S>>;
+  reconcile(input: CccProviderAttemptSettlementInputOf<S>): Promise<S>;
+}>;
+
+/** Frozen, runtime-neutral admission/settlement binding for one CCC PI turn (one definition: the K1 view). */
+export type CccProviderAttemptController<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> =
+  CccProviderAttemptControllerView<S>;
+
+/*
+FNXC:CccSessionToolPolicy 2026-10-14-13:46:
+A planning or planning-linked session carries its closed tool policy on the binding (CONTRACT-v3 section 2.12, D11). Card C2 builds it and enforces it on the final tool set; P1 only refuses a planning binding without one, and a bash-capable policy without a confined shell.
+*/
+export type CccSessionToolPolicy = Readonly<{
+  policyId: `ccc-${CccPlanningRoleClass}-tools.v1` | `ccc-${CccPlanningRoleClass}-probe-tools.v1` | "ccc-linked-writer-tools.v1";
+  /** Frozen, sorted, unique, exact final tool names. */
+  allowedTools: readonly string[];
+  /** sha256(canonical(sorted CccExecutionToolAuthority[])). */
+  toolsetDigest: string;
+  /** Realpaths. */
+  readRoots: readonly string[];
+  /** Realpaths; empty unless the role class is "writer". */
+  writeRoots: readonly string[];
+  deniedNames: readonly string[];
+}>;
+
+/** Pi 0.81.1 tool seams for confined file access; `find` must provide `glob`, so Pi never needs `fd`. No grep: grep is a Fusion tool. */
+export type CccConfinedFsOperations = Readonly<{
+  read: ReadOperations;
+  write: WriteOperations;
+  edit: EditOperations;
+  ls: LsOperations;
+  find: FindOperations;
+}>;
+
+export type CccConfinement = Readonly<{ bash: BashOperations | null; fs: CccConfinedFsOperations }>;
+
+export type CccStreamGuardVerdict =
+  | Readonly<{ degenerate: false }>
+  | Readonly<{ degenerate: true; reason: string; metricsDigest: string }>;
+
+export type CccStreamGuard = Readonly<{
+  observeDelta(kind: "text" | "thinking", chunk: string): CccStreamGuardVerdict;
+  observeMessage(message: Readonly<{ text: string; reasoning: string; toolCallCount: number }>): CccStreamGuardVerdict;
+}>;
+
+/** Throws CCC_PROVIDER_PIN_DRIFT when the configured custom providers drift from the pins. */
+export type CccProviderPinCheck = (providers: readonly CustomProvider[]) => void;
+
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-13:52:
+The binding defaults to the campaign scope, not the view the contract names. Existing campaign code reads `CccProviderAttemptBinding["controller"]` and needs campaign-typed scopes back (ccc-campaign-provider-controller.ts reconcile, in-process-runtime.ts node resolver); both files are outside card P1, and a view default fails their typecheck. A planning binding is written `CccProviderAttemptBinding<CccPlanningCallScope>`, and pi.ts validates any view-scoped binding. Reported as a contract gap; pinning `<CccProviderAttemptScope>` in those two files would allow the view default.
+*/
+export type CccProviderAttemptBinding<S extends CccProviderAttemptScopeView = CccProviderAttemptScope> = Readonly<{
   turnKey: string;
-  controller: CccProviderAttemptController;
+  controller: CccProviderAttemptController<S>;
   receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
   terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
+  /** Defaults to "campaign". */
+  scopeKind?: "campaign" | "planning" | "planning-linked-writer";
+  /** Required for "planning" and "planning-linked-writer". */
+  toolPolicy?: CccSessionToolPolicy;
 }>;
+
+/** Session options a planning or planning-linked binding requires; createFnAgent validates them (pi.ts). */
+export type CccPlanningSessionOptions = {
+  /** Required whenever the binding carries a toolPolicy. */
+  cccConfinement?: CccConfinement;
+  /** Required for "planning" and "planning-linked-writer". */
+  cccStreamGuard?: CccStreamGuard;
+  /** Required for "planning" and "planning-linked-writer". */
+  cccProviderPinCheck?: CccProviderPinCheck;
+};
 
 /**
  * PI invokes this once per session construction after every tool filter and
@@ -107,7 +213,7 @@ export function normalizeAgentRuntimeMcpServers(
   });
 }
 
-export interface AgentRuntimeOptions {
+export interface AgentRuntimeOptions extends CccPlanningSessionOptions {
   /** Working directory for the agent session */
   cwd: string;
   /** System prompt for the agent */
@@ -286,4 +392,19 @@ export interface AgentRuntime {
    * @returns Model description (e.g., "anthropic/claude-sonnet-4-5") or "unknown model"
    */
   describeModel(session: AgentSession): string;
+}
+
+/*
+FNXC:CccPlanningSessionOptions 2026-10-14-13:52:
+CONTRACT-v3 section 2.12 adds the same three optional fields to createFnAgent's `AgentOptions`. That interface lives in pi.ts outside card P1's owned regions, so the fields are merged into it here; DefaultPiRuntime already spreads `AgentRuntimeOptions` into createFnAgent, so they reach pi.ts's validation unchanged.
+*/
+declare module "./pi.js" {
+  interface AgentOptions {
+    /** Required whenever the binding carries a toolPolicy. */
+    cccConfinement?: CccConfinement;
+    /** Required for "planning" and "planning-linked-writer". */
+    cccStreamGuard?: CccStreamGuard;
+    /** Required for "planning" and "planning-linked-writer". */
+    cccProviderPinCheck?: CccProviderPinCheck;
+  }
 }
