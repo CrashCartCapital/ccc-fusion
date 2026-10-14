@@ -2,11 +2,14 @@
 FNXC:CccPlanningProofInventory 2026-10-14-09:45:
 Proof inventory for request-to-code card K1 (core planning types, role policy, budget fit, artifact envelope, schemas, workflow IR, runtime identity and the Pi view types). Card K1 owns exactly this module; the inventory index (card P0) loads every cards/*.mjs in sorted order and rejects duplicate command ids.
 
-TARGETED is file-closed over the seven K1 test files. OFFLINE is name-closed over the same files: the 91 names below are exactly the tests in them, built as ancestor titles and the title joined by " > " (the `assertionName` rule of scripts/run-ccc-pg-proof.mjs), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. None of these tests touches PostgreSQL or the network.
+TARGETED is file-closed over the seven K1 test files. OFFLINE is name-closed over the same files: the 103 names below are exactly the tests in them, built as ancestor titles and the title joined by " > " (the `assertionName` rule of scripts/run-ccc-pg-proof.mjs), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. None of these tests touches PostgreSQL or the network.
 
 The seventh file, ccc-provider-attempt-views.typecheck.test.ts, runs the TypeScript compiler over its own source with core's compiler options, because core's `typecheck` script excludes *.test.ts and would never check the type assertions (CONTRACT-v2 card K1 says it does; reported as a contract gap).
 
-Measured on the M5 Max: about 7 s wall for all seven files, 91 tests. The 60 s command timeout is that measurement with headroom for a slower host; no test timeout is raised anywhere.
+FNXC:CccPlanningProofInventory 2026-10-14-09:21:
+The E1 repair adds 12 tests: the passed-deadline fit refusals and their non-finite controls (E1-9), the extra-field derived-key test (E1-11), the canonical-JSON envelope refusals (E1-13), the case, normalization, duplicate, .git and .env owned-path refusals (E1-10), the per-proof verify:<id> target (E1-12) and the section 2.17 proof-results shape (E1-8).
+
+Measured on the M5 Max: about 7 s wall for all seven files, 103 tests (4 s of Vitest time after the E1 repair). The 60 s command timeout is that measurement with headroom for a slower host; no test timeout is raised anywhere.
 */
 
 const FILES = Object.freeze([
@@ -58,6 +61,7 @@ export const OFFLINE = Object.freeze([
       "exact model identity classification > classifies aliases, combos and unqualified ids in the frozen order",
       "derived identifiers > derives the run id from a domain tag, a NUL and canonical JSON",
       "derived identifiers > derives turn, attempt, linked writer and event keys with their own domain tags",
+      "derived identifiers > hashes exactly the contract-named fields, so extra caller fields leave every derived key unchanged",
       "derived identifiers > formats the decision id, import key and baseline branch ref",
       "derived identifiers > hashes the grant canonically and the binding without its own hash",
       "counters and the I2 source policy > pins the frozen counter values",
@@ -80,8 +84,12 @@ export const OFFLINE = Object.freeze([
       "planning fit > refuses one leaf on Build Standard with the exact planning-call shortfall",
       "planning fit > admits L = 0 at the 1,440 floor (positive control on the same allocation)",
       "planning fit > refuses when twice the planning critical path exceeds the remaining deadline, and reports both shortfalls",
+      "planning fit > refuses with a time shortfall, never a throw, when the deadline has already passed",
+      "planning fit > still throws on a non-finite remaining time or a negative critical path",
       "build fit > admits the I2 diamond on Build Standard",
       "build fit > refuses each dimension with its exact numbers",
+      "build fit > refuses with a time shortfall, never a throw, when the deadline has passed or the clamped duration is not positive",
+      "build fit > still throws on a non-finite time or a negative campaign critical path",
       "repair chunk fit > charges 60 calls per repair node and never the fixed 300 again",
       "sequential critical path > is 11,400,000 ms for Spec regardless of the planned task count",
       "sequential critical path > is 36,000,000 ms for the Build diamond, of which the campaign is 23,400,000 ms",
@@ -95,8 +103,10 @@ export const OFFLINE = Object.freeze([
       "artifact content > stores JSON as canonical text and digests those UTF-8 bytes",
       "artifact content > keeps text bytes exact, including a byte-order mark, so the digest equals the raw-bytes digest",
       "artifact content > refuses invalid UTF-8 and NUL as NOT_UTF8, and oversize content as TOO_LARGE",
+      "artifact content > refuses JSON content canonical JSON cannot encode as ENVELOPE_INVALID",
       "identity and closure digests > digests the envelope without fence, publishedAt or identityDigest",
       "identity and closure digests > treats an absent optional producer field like an undefined one",
+      "identity and closure digests > refuses an envelope canonical JSON cannot encode as ENVELOPE_INVALID",
       "identity and closure digests > digests a closure as its sorted unique refs",
       "task plan validation (G4 prerequisites) > admits the I2 diamond with zero problems (positive control)",
       "task plan validation (G4 prerequisites) > refuses a duplicate task id",
@@ -105,6 +115,9 @@ export const OFFLINE = Object.freeze([
       "task plan validation (G4 prerequisites) > refuses an edge that names an undeclared task",
       "task plan validation (G4 prerequisites) > refuses a duplicate protected-action id and an undeclared one",
       "task plan validation (G4 prerequisites) > refuses owned paths that overlap only after normalization",
+      "task plan validation (G4 prerequisites) > refuses owned paths that differ only in letter case or Unicode normalization form",
+      "task plan validation (G4 prerequisites) > refuses a duplicate owned path within one task, including a case-only or ./ duplicate",
+      "task plan validation (G4 prerequisites) > refuses an owned path inside .git or naming an .env file, and the same for a write root",
       "task plan validation (G4 prerequisites) > refuses an owned path that is absolute, escapes the worktree or names the root",
       "task plan validation (G4 prerequisites) > refuses a write root outside the task's owned paths",
       "task plan validation (G4 prerequisites) > refuses an extra key and a wrong schema",
@@ -122,6 +135,8 @@ export const OFFLINE = Object.freeze([
       "content schema validators > admits a well-formed decision record and refuses each one-field defect",
       "content schema validators > admits a well-formed build transition and refuses each one-field defect",
       "content schema validators > admits a well-formed proof results and refuses each one-field defect",
+      "content schema validators > names each proof's own verify:<id> Taskfile target and has no root-level task",
+      "content schema validators > follows section 2.17: one settled attempt per proof id with its terminal evidence",
       "content schema validators > registers one validator per content schema id",
       "planning workflow IR > chains one gate node per IR stage in contract order for Build",
       "planning workflow IR > omits only the import stage in Spec mode",

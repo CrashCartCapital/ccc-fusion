@@ -121,6 +121,55 @@ describe("task plan validation (G4 prerequisites)", () => {
       .toMatch(/own overlapping paths/);
   });
 
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-09:21:
+  Errata E1-10: the I2 host is Darwin, whose default APFS volume ignores letter case and Unicode composed-versus-decomposed form, so `src/A.mjs` and `src/a.mjs` (or `café` in NFC and NFD) are one file there. Overlap is compared on `normalize("NFC").toLowerCase()` after `./` and `..` normalization; this is stricter than Linux needs, which is safe. A task may not list one path twice, own anything inside `.git`, or own an `.env` file.
+  */
+  it("refuses owned paths that differ only in letter case or Unicode normalization form", () => {
+    expect(problemsOf(mutate((plan) => {
+      plan.tasks[1]!.ownedPaths = ["src/Tokenizer.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["src/Tokenizer.mjs"];
+    }))).toMatch(/tasks T1 and T2 own overlapping paths src\/tokenizer\.mjs and src\/Tokenizer\.mjs/);
+    expect(problemsOf(mutate((plan) => {
+      plan.tasks[0]!.ownedPaths = ["src/café.mjs"]; plan.tasks[0]!.allowedWriteRoots = ["src/café.mjs"];
+      plan.tasks[1]!.ownedPaths = ["src/café.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["src/café.mjs"];
+    }))).toMatch(/tasks T1 and T2 own overlapping paths/);
+    expect(problemsOf(mutate((plan) => {
+      plan.tasks[2]!.ownedPaths = ["SRC"]; plan.tasks[2]!.allowedWriteRoots = ["SRC"];
+    }))).toMatch(/tasks T1 and T3 own overlapping paths src\/tokenizer\.mjs and SRC/);
+    // Control: distinct names that merely look alike stay admissible.
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => {
+      plan.tasks[1]!.ownedPaths = ["src/tokenizer2.mjs"]; plan.tasks[1]!.allowedWriteRoots = ["src/tokenizer2.mjs"];
+    }))).toEqual([]);
+  });
+
+  it("refuses a duplicate owned path within one task, including a case-only or ./ duplicate", () => {
+    for (const duplicate of ["src/tokenizer.mjs", "./src/tokenizer.mjs", "src/Tokenizer.mjs"]) {
+      expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = ["src/tokenizer.mjs", duplicate]; })), duplicate)
+        .toMatch(/task T1 owns the same path twice: src\/tokenizer\.mjs and /);
+    }
+    // Control: two different files in one task are admissible.
+    expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.ownedPaths = ["src/tokenizer.mjs", "src/tokens.mjs"]; })))
+      .toEqual([]);
+  });
+
+  it("refuses an owned path inside .git or naming an .env file, and the same for a write root", () => {
+    for (const bad of [".git", ".git/hooks/pre-commit", "src/.git/config", ".GIT/config"]) {
+      expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; plan.tasks[0]!.allowedWriteRoots = [bad]; })), bad)
+        .toMatch(/task T1 owned path .* has a \.git path segment/);
+    }
+    for (const bad of [".env", "src/.env", ".env.local", "src/.env.production", ".ENV"]) {
+      expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; plan.tasks[0]!.allowedWriteRoots = [bad]; })), bad)
+        .toMatch(/task T1 owned path .* names an \.env file/);
+    }
+    expect(problemsOf(mutate((plan) => { plan.tasks[3]!.ownedPaths = ["bin"]; plan.tasks[3]!.allowedWriteRoots = ["bin/.git"]; })))
+      .toMatch(/task T4 write root "bin\/\.git" has a \.git path segment/);
+    // Control: names that only contain "git" or "env" are admissible.
+    for (const good of ["src/git.mjs", "src/.github/workflow.mjs", "src/env.mjs", "src/.envrc", "src/app.env", "src/.environment.mjs"]) {
+      expect(validateCccPlanningTaskPlanV1(mutate((plan) => { plan.tasks[0]!.ownedPaths = [good]; plan.tasks[0]!.allowedWriteRoots = [good]; })), good)
+        .toEqual([]);
+    }
+  });
+
   it("refuses an owned path that is absolute, escapes the worktree or names the root", () => {
     for (const bad of ["/etc/passwd", "../outside.mjs", "src/../../x", ".", "", "src\\win.mjs"]) {
       expect(problemsOf(mutate((plan) => { plan.tasks[0]!.ownedPaths = [bad]; })), JSON.stringify(bad)).toMatch(/owned path/);
@@ -190,9 +239,11 @@ const ROUTING: CccPlanningRoutingPlanV1 = {
 };
 const VERIFIER: CccPlanningVerifierBundleV1 = {
   schema: "ccc-planning.verifier-bundle.v1",
-  taskfileTask: "verify",
-  files: [{ path: "verify/tokenizer.test.mjs", mode: "100644", content: "test('[REQ-1] splits', () => {});\n" }],
-  proofs: [{ id: "PROOF-1", requirementIds: ["REQ-1"], files: ["verify/tokenizer.test.mjs"] }],
+  files: [
+    { path: "Taskfile.yml", mode: "100644", content: "version: '3'\ntasks:\n  verify:tokenizer:\n    cmds: [node test/tokenizer.test.mjs src/tokenizer.mjs]\n" },
+    { path: "test/tokenizer.test.mjs", mode: "100644", content: "test('[REQ-1] splits', () => {});\n" },
+  ],
+  proofs: [{ id: "tokenizer", requirementIds: ["REQ-1"], files: ["Taskfile.yml", "test/tokenizer.test.mjs"], taskfileTask: "verify:tokenizer" }],
   controls: [{ id: "CTRL-1", requirementId: "REQ-1", files: [{ path: "src/tokenizer.mjs", content: "export const tokenize = () => [];\n" }] }],
 };
 const ADJUDICATION: CccPlanningAdjudicationV1 = {
@@ -243,9 +294,18 @@ const BUILD_TRANSITION: CccPlanningBuildTransitionV1 = {
 const PROOF_RESULTS: CccPlanningProofResultsV1 = {
   sourceCommit: "3".repeat(40),
   sourceTree: "4".repeat(40),
-  proofIds: ["PROOF-1"],
+  proofIds: ["PROOF-1", "PROOF-2"],
   phase: "task",
-  results: [{ proofId: "PROOF-1", outcome: "passed", evidenceDigest: "5".repeat(64) }],
+  results: [
+    {
+      proofId: "PROOF-1", attemptKey: `ccc-proof-attempt-${"5".repeat(64)}`, state: "committed", resultSuccess: true,
+      exitCode: 0, durationMs: 1_234, stdoutSha256: "6".repeat(64), stderrSha256: "7".repeat(64), terminalEnvelopeSha256: "8".repeat(64),
+    },
+    {
+      proofId: "PROOF-2", attemptKey: `ccc-proof-attempt-${"9".repeat(64)}`, state: "proved_failed", resultSuccess: false,
+      exitCode: null, durationMs: 0, stdoutSha256: "a".repeat(64), stderrSha256: "b".repeat(64), terminalEnvelopeSha256: "c".repeat(64),
+    },
+  ],
 };
 const SPEC_READY: CccPlanningSpecReadyV1 = {
   schema: "ccc-planning.spec-ready.v1",
@@ -327,6 +387,64 @@ describe("content schema validators", () => {
       expect(entry.validate("not an object")).not.toEqual([]);
     });
   }
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-09:21:
+  Errata E1-12 (v3 item 41): a proof id is its Taskfile name. Every proof command is `task verify:<id>`, so each proof carries its own `taskfileTask`, equal to "verify:" + id, and the id is a lowercase Taskfile-safe name. The bundle has no root-level task: item 41 leaves nothing for one to name.
+  */
+  it("names each proof's own verify:<id> Taskfile target and has no root-level task", () => {
+    const proof = VERIFIER.proofs[0]!;
+    const withProof = (next: Record<string, unknown>) => validateCccPlanningVerifierBundleV1(withField(VERIFIER, "proofs", [next]));
+    expect(withProof({ ...proof, taskfileTask: "verify:other" }))
+      .toContainEqual(expect.stringMatching(/proofs\[0\]\.taskfileTask must be verify:tokenizer/));
+    expect(withProof({ ...proof, taskfileTask: "tokenizer" }))
+      .toContainEqual(expect.stringMatching(/proofs\[0\]\.taskfileTask must be verify:tokenizer/));
+    const { taskfileTask: _dropped, ...withoutTask } = proof;
+    void _dropped;
+    expect(withProof(withoutTask)).toContainEqual(expect.stringMatching(/proofs\[0\]\.taskfileTask is required/));
+    for (const id of ["PROOF-1", "Tokenizer", "-tokenizer", "tokenizer_1", "tokenizer:a", `a${"b".repeat(63)}`, ""]) {
+      expect(withProof({ ...proof, id, taskfileTask: `verify:${id}` }), JSON.stringify(id))
+        .toContainEqual(expect.stringMatching(/proofs\[0\]\.id must be/));
+    }
+    expect(validateCccPlanningVerifierBundleV1({ ...VERIFIER, taskfileTask: "verify" }))
+      .toContainEqual(expect.stringMatching(/unexpected key taskfileTask/));
+    // Controls: the longest legal id and a hyphenated id are admitted.
+    for (const id of [`a${"b".repeat(62)}`, "word-frequency", "0tokenizer"]) {
+      expect(withProof({ ...proof, id, taskfileTask: `verify:${id}` }), id).toEqual([]);
+    }
+  });
+
+  /*
+  FNXC:CccPlanningSchemas 2026-10-14-09:21:
+  Errata E1-8 (v3 section 2.17, item 46): proof results are read from the settled proof attempts (`listCccCampaignProofAttemptsForCommit`), one entry per proof id, carrying the attempt key, the settled state and the stored terminal evidence digests. A proof attempt settles `committed` exactly when its result succeeded (proof-attempt.ts settle), so the two fields must agree. The exit code is a PostgreSQL integer or null (a killed process has none).
+  */
+  it("follows section 2.17: one settled attempt per proof id with its terminal evidence", () => {
+    const passed: Record<string, unknown> = { ...PROOF_RESULTS.results[0]! };
+    const failed: Record<string, unknown> = { ...PROOF_RESULTS.results[1]! };
+    const withResults = (...results: unknown[]) => validateCccPlanningProofResultsV1(withField(PROOF_RESULTS, "results", results));
+    const refusals: readonly [string, unknown, RegExp][] = [
+      ["v1 outcome shape", { proofId: "PROOF-1", outcome: "passed", evidenceDigest: "5".repeat(64) }, /unexpected key outcome/],
+      ["unknown state", { ...passed, state: "passed" }, /state must be one of committed, proved_failed/],
+      ["committed but failed", { ...passed, resultSuccess: false }, /committed .* resultSuccess true/],
+      ["proved_failed but succeeded", { ...failed, proofId: "PROOF-1", resultSuccess: true }, /proved_failed .* resultSuccess false/],
+      ["boolean as number", { ...passed, resultSuccess: 1 }, /resultSuccess must be a boolean/],
+      ["malformed attempt key", { ...passed, attemptKey: "ccc-plan-attempt-x" }, /attemptKey must be a proof attempt key/],
+      ["fractional exit code", { ...passed, exitCode: 1.5 }, /exitCode must be/],
+      ["exit code outside int4", { ...passed, exitCode: 2_147_483_648 }, /exitCode must be/],
+      ["negative duration", { ...passed, durationMs: -1 }, /durationMs must be an integer/],
+      ["upper-case digest", { ...passed, stdoutSha256: "A".repeat(64) }, /stdoutSha256 must be a lowercase sha256/],
+      ["missing stderr digest", { ...passed, stderrSha256: undefined }, /stderrSha256 must be a lowercase sha256/],
+      ["missing envelope digest", (({ terminalEnvelopeSha256: _x, ...rest }) => rest)(passed), /terminalEnvelopeSha256 is required/],
+    ];
+    for (const [label, bad, problem] of refusals) {
+      expect(withResults(bad, failed), label).toContainEqual(expect.stringMatching(problem));
+    }
+    expect(withResults(passed)).toContainEqual(expect.stringMatching(/proof PROOF-2 has no result/));
+    expect(withResults(passed, failed, { ...failed })).toContainEqual(expect.stringMatching(/proof PROOF-2 has more than one result/));
+    // Controls: a negative exit code within int4 and a null exit code are admitted.
+    expect(withResults({ ...passed, exitCode: -2_147_483_648, state: "proved_failed", resultSuccess: false }, failed)).toEqual([]);
+    expect(withResults(passed, { ...failed, exitCode: null })).toEqual([]);
+  });
 
   it("registers one validator per content schema id", () => {
     expect(Object.keys(CCC_PLANNING_CONTENT_VALIDATORS).sort()).toEqual(Object.values(CCC_PLANNING_CONTENT_SCHEMAS).sort());

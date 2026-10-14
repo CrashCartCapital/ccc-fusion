@@ -52,27 +52,38 @@ function withoutKey<T extends object, K extends string>(value: T, key: K): Omit<
 
 // ---------------------------------------------------------------- derived identifiers (section 2.1)
 
+/*
+FNXC:CccPlanningDerivedKeys 2026-10-14-09:21:
+Each derived key hashes exactly its contract-named fields, picked by name (errata E1-11). A caller that spreads a wider object (a binding, a call record, a row with a fence) into the input gets the same key it would get from the named fields alone, so replay identity cannot drift on metadata the contract never named.
+*/
+
 export function cccPlanningRunId(i: { projectId: string; requestDigest: string; receiptSha256: string }): string {
-  return `ccc-plan:${domainDigest("ccc-plan-run/v1", i).slice(0, 24)}`;
+  const named = { projectId: i.projectId, requestDigest: i.requestDigest, receiptSha256: i.receiptSha256 };
+  return `ccc-plan:${domainDigest("ccc-plan-run/v1", named).slice(0, 24)}`;
 }
 
 export function cccPlanningTurnKey(i: { projectId: string; runId: string; revision: number; stageId: CccPlanningStageId;
   roleId: CccPlanningRoleId; lineageId: string; nodeAttemptOrdinal: 1 | 2 | 3 }): string {
-  return `ccc-plan-turn-${domainDigest("ccc-plan-turn/v1", i)}`;
+  const named = { projectId: i.projectId, runId: i.runId, revision: i.revision, stageId: i.stageId, roleId: i.roleId,
+    lineageId: i.lineageId, nodeAttemptOrdinal: i.nodeAttemptOrdinal };
+  return `ccc-plan-turn-${domainDigest("ccc-plan-turn/v1", named)}`;
 }
 
 /** The fence is metadata, not identity: a re-leased work item replays the same attempt key. */
 export function cccPlanningAttemptKey(i: { projectId: string; runId: string; turnKey: string; dispatchKey: string }): string {
-  return `ccc-plan-attempt-${domainDigest("ccc-plan-attempt/v1", i)}`;
+  const named = { projectId: i.projectId, runId: i.runId, turnKey: i.turnKey, dispatchKey: i.dispatchKey };
+  return `ccc-plan-attempt-${domainDigest("ccc-plan-attempt/v1", named)}`;
 }
 
 /** `baseTurnKey` is the campaign key from createProviderAttemptTurnKey, which carries no retry index (challenge 18). */
 export function cccPlanningLinkedWriterTurnKey(i: { baseTurnKey: string; dispatchAttemptOrdinal: 1 | 2 | 3 }): string {
-  return `ccc-plan-writer-${domainDigest("ccc-plan-writer-turn/v1", i)}`;
+  const named = { baseTurnKey: i.baseTurnKey, dispatchAttemptOrdinal: i.dispatchAttemptOrdinal };
+  return `ccc-plan-writer-${domainDigest("ccc-plan-writer-turn/v1", named)}`;
 }
 
 export function cccPlanningEventId(i: { projectId: string; runId: string; mutationType: CccPlanningAuditMutationType; subject: string }): string {
-  return `ccc-plan-event-${domainDigest("ccc-plan-event/v1", i)}`;
+  const named = { projectId: i.projectId, runId: i.runId, mutationType: i.mutationType, subject: i.subject };
+  return `ccc-plan-event-${domainDigest("ccc-plan-event/v1", named)}`;
 }
 
 export function cccPlanningDecisionId(i: { revision: number; questionDigest: string }): string {

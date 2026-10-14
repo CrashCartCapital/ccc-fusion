@@ -62,11 +62,21 @@ function callShortfall(dimension: CccFitShortfall["dimension"], nodes: number, r
   return remaining >= required ? null : { dimension, required, remaining };
 }
 
+/*
+FNXC:CccPlanningBudgetFit 2026-10-14-09:21:
+Remaining time is `deadline - db_now` (or a duration clamped to it), which is zero or negative once the deadline has passed. That is a time shortfall the caller acts on (IB2 moves the run `importing -> budget_exhausted`, v3 item 49), never a crash (errata E1-9). Any finite value is accepted and floored toward the shortfall; zero or less is always short, even against an empty critical path. Only a non-finite time is a programming error. The critical path itself stays a non-negative integer.
+*/
+function remainingTimeMs(value: number, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new RangeError(`${label} must be a finite number of milliseconds, got ${String(value)}`);
+  }
+  return Math.floor(value) + 0; // + 0 turns -0 into 0
+}
+
 function timeShortfall(criticalPathMs: number, remaining: number): CccFitShortfall | null {
   requireCount(criticalPathMs, "criticalPathMs");
-  requireCount(remaining, "remaining time");
   const required = 2 * criticalPathMs;
-  return remaining >= required ? null : { dimension: "time", required, remaining };
+  return remaining > 0 && remaining >= required ? null : { dimension: "time", required, remaining };
 }
 
 /** G0 and leaf admission: planning calls, then 2 * planning critical path against the time left. */
@@ -76,7 +86,7 @@ export function assessCccPlanningFit(i: Readonly<{ leaves: number; remainingPlan
   const nodes = countCccPlanningNodes({ leaves: i.leaves });
   const shortfalls = [
     callShortfall("planning-calls", nodes, i.remainingPlanning),
-    timeShortfall(i.criticalPathMs, i.remainingDeadlineMs),
+    timeShortfall(i.criticalPathMs, remainingTimeMs(i.remainingDeadlineMs, "remainingDeadlineMs")),
   ].filter((entry): entry is CccFitShortfall => entry !== null);
   return shortfalls.length === 0
     ? { ok: true, nodes, floor: cccPlanningCallFloor(nodes) }
@@ -88,12 +98,12 @@ export function assessCccBuildFit(i: Readonly<{ providerTasks: number; modelProo
   remainingImplementation: number; remainingReviewProof: number; remainingDeadlineMs: number; maxDurationMs: number }>):
   Readonly<{ ok: true }> | Readonly<{ ok: false; code: "CCC_PLANNING_BUILD_FIT_INSUFFICIENT"; shortfalls: readonly CccFitShortfall[] }> {
   const nodes = countCccBuildNodes(i);
-  requireCount(i.remainingDeadlineMs, "remainingDeadlineMs");
-  requireCount(i.maxDurationMs, "maxDurationMs");
+  const remainingDeadlineMs = remainingTimeMs(i.remainingDeadlineMs, "remainingDeadlineMs");
+  const maxDurationMs = remainingTimeMs(i.maxDurationMs, "maxDurationMs");
   const shortfalls = [
     callShortfall("implementation-calls", nodes.implementation, i.remainingImplementation),
     callShortfall("review-proof-calls", nodes.reviewProof, i.remainingReviewProof),
-    timeShortfall(i.campaignCriticalPathMs, Math.min(i.remainingDeadlineMs, i.maxDurationMs)),
+    timeShortfall(i.campaignCriticalPathMs, Math.min(remainingDeadlineMs, maxDurationMs)),
   ].filter((entry): entry is CccFitShortfall => entry !== null);
   return shortfalls.length === 0 ? { ok: true } : { ok: false, code: "CCC_PLANNING_BUILD_FIT_INSUFFICIENT", shortfalls };
 }

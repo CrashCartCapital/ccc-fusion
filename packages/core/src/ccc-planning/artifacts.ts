@@ -137,10 +137,23 @@ function refuseOversize(byteLength: number): void {
   }
 }
 
+/*
+FNXC:CccPlanningArtifacts 2026-10-14-09:21:
+A value canonical JSON cannot encode (an undefined value, a Date, Map or other non-plain object, a non-finite number, a cycle) is a typed envelope refusal naming the field, never a plain Error, so a publisher can report it like every other envelope defect (errata E1-13).
+*/
+function canonicalOrRefuse(value: unknown, field: string): string {
+  try {
+    return canonicalCccPrdJson(value);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new CccPlanningRefusal("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID", `${field} is not canonical JSON: ${reason}`, field);
+  }
+}
+
 export function encodeCccPlanningArtifactContent(content: CccPlanningArtifactContent):
   Readonly<{ text: string; outputDigest: string; contentType: CccPlanningArtifactEnvelopeV1["contentType"] }> {
   if (content.type === "json") {
-    const text = canonicalCccPrdJson(content.value);
+    const text = canonicalOrRefuse(content.value, "content");
     const bytes = Buffer.from(text, "utf8");
     refuseOversize(bytes.byteLength);
     return { text, outputDigest: sha256Hex(bytes), contentType: "application/json" };
@@ -158,10 +171,20 @@ export function encodeCccPlanningArtifactContent(content: CccPlanningArtifactCon
   return { text, outputDigest: sha256Hex(content.bytes), contentType: "text/markdown; charset=utf-8" };
 }
 
-/** Drops keys whose value is undefined, at any depth, so an absent optional field and an undefined one digest the same. */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Drops keys whose value is undefined, at any depth of plain objects, so an absent optional field and an undefined one
+ * digest the same. A non-plain object (a Date, a Map) is passed through untouched so canonical JSON refuses it, instead of
+ * being flattened into `{}` and digesting like an empty object.
+ */
 function withoutUndefined(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(withoutUndefined);
-  if (value !== null && typeof value === "object") {
+  if (isPlainObject(value)) {
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) if (entry !== undefined) result[key] = withoutUndefined(entry);
     return result;
@@ -176,7 +199,7 @@ export function computeCccPlanningEnvelopeIdentityDigest(
   delete identity.fence;
   delete identity.publishedAt;
   delete identity.identityDigest;
-  return sha256Hex(canonicalCccPrdJson(withoutUndefined(identity)));
+  return sha256Hex(canonicalOrRefuse(withoutUndefined(identity), "envelope"));
 }
 
 /** sha256(canonical(refs sorted by key, duplicates removed)); one key with two digests is refused. */

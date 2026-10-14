@@ -233,6 +233,40 @@ describe("derived identifiers", () => {
       .not.toBe(eventId);
   });
 
+  /*
+  FNXC:CccPlanningPolicy 2026-10-14-09:21:
+  Errata E1-11: a derived key hashes exactly its contract-named fields, so a caller that spreads a wider object (a binding, a row, a call record) into the input replays the same key instead of silently minting a new identity.
+  */
+  it("hashes exactly the contract-named fields, so extra caller fields leave every derived key unchanged", () => {
+    const runId = cccPlanningRunId(runInput);
+    const turnInput = { projectId: "proj-a", runId, revision: 1, stageId: "spec" as const, roleId: "spec-author" as const,
+      lineageId: "spec:spec-author", nodeAttemptOrdinal: 1 as const };
+    const turnKey = cccPlanningTurnKey(turnInput);
+    const attemptInput = { projectId: "proj-a", runId, turnKey, dispatchKey: "pi-stream:1" };
+    const writerInput = { baseTurnKey: "campaign-turn-1", dispatchAttemptOrdinal: 2 as const };
+    const eventInput = { projectId: "proj-a", runId, mutationType: "ccc-planning:state" as const, subject: "admitted->running@t" };
+    const extra = { fence: { kind: "planning", attempt: 4 }, note: "metadata", bindingHash: "f".repeat(64) };
+
+    const widenedRun = { ...runInput, ...extra };
+    const widenedTurn = { ...turnInput, ...extra };
+    const widenedAttempt = { ...attemptInput, ...extra };
+    const widenedWriter = { ...writerInput, ...extra };
+    const widenedEvent = { ...eventInput, ...extra };
+    expect([
+      cccPlanningRunId(widenedRun), cccPlanningTurnKey(widenedTurn), cccPlanningAttemptKey(widenedAttempt),
+      cccPlanningLinkedWriterTurnKey(widenedWriter), cccPlanningEventId(widenedEvent),
+    ]).toEqual([
+      runId, turnKey, cccPlanningAttemptKey(attemptInput), cccPlanningLinkedWriterTurnKey(writerInput), cccPlanningEventId(eventInput),
+    ]);
+    // Control: changing a named field still changes each key.
+    expect(cccPlanningRunId({ ...widenedRun, receiptSha256: "c".repeat(64) })).not.toBe(runId);
+    expect(cccPlanningTurnKey({ ...widenedTurn, lineageId: "spec:other" })).not.toBe(turnKey);
+    expect(cccPlanningAttemptKey({ ...widenedAttempt, dispatchKey: "pi-stream:2" })).not.toBe(cccPlanningAttemptKey(attemptInput));
+    expect(cccPlanningLinkedWriterTurnKey({ ...widenedWriter, baseTurnKey: "campaign-turn-2" }))
+      .not.toBe(cccPlanningLinkedWriterTurnKey(writerInput));
+    expect(cccPlanningEventId({ ...widenedEvent, subject: "running->paused@t" })).not.toBe(cccPlanningEventId(eventInput));
+  });
+
   it("formats the decision id, import key and baseline branch ref", () => {
     const runId = cccPlanningRunId(runInput);
     expect(cccPlanningDecisionId({ revision: 1, questionDigest: "c".repeat(64) })).toBe(`ccc-plan-decision-r001-${"c".repeat(16)}`);

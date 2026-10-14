@@ -153,6 +153,36 @@ describe("artifact content", () => {
     expect(encodeCccPlanningArtifactContent({ type: "text", bytes: new Uint8Array(CCC_PLANNING_ARTIFACT_MAX_BYTES).fill(0x61) }).text)
       .toHaveLength(CCC_PLANNING_ARTIFACT_MAX_BYTES);
   });
+
+  /*
+  FNXC:CccPlanningArtifacts 2026-10-14-09:21:
+  Errata E1-13: JSON content that canonical JSON cannot encode (an undefined value, a Date or other non-plain object, a non-finite number, a cycle) is a typed envelope refusal the publisher can report, never a plain Error.
+  */
+  it("refuses JSON content canonical JSON cannot encode as ENVELOPE_INVALID", () => {
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic.self = cyclic;
+    for (const [label, value] of [
+      ["undefined value", { a: undefined }],
+      ["undefined in an array", [1, undefined]],
+      ["Date", { at: new Date(0) }],
+      ["Map", new Map([["a", 1]])],
+      ["non-finite number", { n: Number.POSITIVE_INFINITY }],
+      ["cycle", cyclic],
+    ] as const) {
+      let refusal: unknown = null;
+      try {
+        encodeCccPlanningArtifactContent({ type: "json", value });
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal, label).toBeInstanceOf(CccPlanningRefusal);
+      expect((refusal as CccPlanningRefusal).code, label).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+      expect((refusal as CccPlanningRefusal).field, label).toBe("content");
+    }
+    // Control: the same shapes with plain JSON values encode.
+    expect(encodeCccPlanningArtifactContent({ type: "json", value: { a: null, at: "1970-01-01T00:00:00.000Z", n: 1 } }).text)
+      .toBe('{"a":null,"at":"1970-01-01T00:00:00.000Z","n":1}');
+  });
 });
 
 describe("identity and closure digests", () => {
@@ -174,6 +204,20 @@ describe("identity and closure digests", () => {
     void _attemptRef;
     expect(computeCccPlanningEnvelopeIdentityDigest({ ...ENVELOPE, producer: { ...producer, attemptRef: undefined } }))
       .toBe(computeCccPlanningEnvelopeIdentityDigest({ ...ENVELOPE, producer }));
+  });
+
+  it("refuses an envelope canonical JSON cannot encode as ENVELOPE_INVALID", () => {
+    const withDate = { ...ENVELOPE, producer: { ...ENVELOPE.producer, instanceId: new Date(0) as unknown as string } };
+    let refusal: unknown = null;
+    try {
+      computeCccPlanningEnvelopeIdentityDigest(withDate);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(CccPlanningRefusal);
+    expect((refusal as CccPlanningRefusal).code).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    // Control: the same envelope with a plain string digests.
+    expect(computeCccPlanningEnvelopeIdentityDigest(ENVELOPE)).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("digests a closure as its sorted unique refs", () => {
