@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
-FNXC:CccPlanningProof 2026-10-14-09:50:
+FNXC:CccPlanningProof 2026-10-14-09:32:
 Closed-inventory proof runner for the CCC-Fusion request-to-code planning work (card P0; CONTRACT-v2 section 2.20, ADR D Q1/Q2, decisions D25, D50, D51). One command, three modes:
 - `targeted`  runs every TARGETED command of the inventory (`scripts/lib/ccc-planning-proof-inventory`). Darwin-only entries make it refuse on a non-Darwin host.
 - `offline`   runs every OFFLINE command and is Darwin-only: the lane also needs a working `sandbox-exec`, probed before anything is spawned.
@@ -15,6 +15,17 @@ Honest limits:
 - `scripts/run-ccc-pg-proof.mjs` is the model for the supervisor, but it runs side effects on import and is frozen evidence, so its policy is re-implemented here rather than imported.
 
 Exit codes: 0 pass, 1 refusal or failed proof, 2 usage error. On a pass the scratch directory is removed and the report stays; on a failure everything is preserved and the report names the directory.
+
+Credentials (errata E1-3). Every mode removes provider credential variables from every child environment: names ending `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, and names starting `OMNIROUTE_`, `ANTHROPIC_`, `OPENAI_`, `GEMINI_`, `GOOGLE_`, `AWS_`, `AZURE_`, `MINIMAX_`, `ZHIPU_` or `GLM_`. The report holds only the count (`strippedCredentialCount`), never a name or a value.
+
+Sandbox probe (errata E1-5). Offline mode starts `/usr/bin/sandbox-exec` by its absolute path, never through PATH.
+
+Types header. The report is the frozen `CccPlanningProofReport` of ADR D Q1 (CONTRACT-v3 section 2.20), including `perCommand[].files` (the files the result report held, or the files the command lists when no result was written) and `postgres.stopError` (`string | null`, redacted, present whenever `postgres.owned` is true). Errata E1-4 ratifies these additive widenings of that type, and nothing else is widened:
+- `mode` also admits "ci-linux" (the Gate step), beside "targeted" and "offline".
+- `scratch.root` is `string | null` (null before the scratch directory exists, as on an early refusal) and `scratch.cleanup` also takes "not-created" and "removal-failed: <reason>".
+- The refusal code `CCC_PLANNING_OFFLINE_NETWORK_ATTEMPT` joins the refusal codes (a recorded non-loopback attempt fails the run).
+- `runSupervised` gets extra option fields (`repoRoot`, `env`, `supervisorEnv`, `scratchRoot`, `resultRoot`, `logRoot`, `dataRoot`, `needsPostgres`, `postgresDatabase`) and returns extra fields (`database`, `startError`, `lifecycleErrors`, `interrupted`, `supervisorExitCode`; each row also carries `timeoutMs`, `forcedKill`, `spawnError`, `logFile`).
+- The report also carries `refusal`-adjacent extras: `failures[]`, `offlineGuard { attempts, reportFile, entries[] }`, `strippedCredentialCount`, and `perCommand[]` extras (`closure`, `exitCode`, `signal`, `failureDetails`).
 */
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -65,6 +76,12 @@ const SUPERVISOR_RESULT_MARKER = "CCC_PLANNING_SUPERVISOR_RESULT=";
 
 /** Settings that could point a suite at a PostgreSQL server the runner does not own. */
 const PG_ENV_PATTERN = /^(?:PG[A-Z0-9_]*|DATABASE_URL|POSTGRES(?:QL)?_[A-Z0-9_]*|FUSION_PG_[A-Z0-9_]*|CCC_PG_[A-Z0-9_]*)$/;
+
+/*
+FNXC:CccPlanningProof 2026-10-14-09:32:
+Errata E1-3. Provider credentials never reach a proof child, in any mode. A name is removed when it ends with `_API_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD`, or starts with `OMNIROUTE_`, `ANTHROPIC_`, `OPENAI_`, `GEMINI_`, `GOOGLE_`, `AWS_`, `AZURE_`, `MINIMAX_`, `ZHIPU_` or `GLM_`. The match ignores case, so a lower-case spelling is removed too (a superset of the errata list, which fails closed). The report keeps only the number of names removed, never a name or a value.
+*/
+const CREDENTIAL_ENV_PATTERN = /(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)$|^(?:OMNIROUTE_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|AWS_|AZURE_|MINIMAX_|ZHIPU_|GLM_)/i;
 
 /**
  * @param {string[]} argv arguments after the script name
@@ -137,13 +154,19 @@ function quoteNodeOption(value) {
 }
 
 /**
- * The environment every proof child gets. `NODE_OPTIONS=--import <guard>` is what loads the offline tripwire into every Node process the command starts, vitest workers and `node --test` children included.
- * @returns {{ childEnv: Record<string, string>, supervisorEnv: Record<string, string> }}
+ * The environment every proof child gets. `NODE_OPTIONS=--import <guard>` is what loads the offline tripwire into every Node process the command starts, vitest workers and `node --test` children included. Provider credential names are removed first; only their count is returned.
+ * @returns {{ childEnv: Record<string, string>, supervisorEnv: Record<string, string>, strippedCredentialCount: number }}
  */
 function buildProofEnv({ callerEnv, guardPath, guardReportFile, scratchRoot }) {
   const base = {};
+  let strippedCredentialCount = 0;
   for (const [key, value] of Object.entries(callerEnv)) {
-    if (value === undefined || PG_ENV_PATTERN.test(key)) continue;
+    if (value === undefined) continue;
+    if (CREDENTIAL_ENV_PATTERN.test(key)) {
+      strippedCredentialCount += 1;
+      continue;
+    }
+    if (PG_ENV_PATTERN.test(key)) continue;
     base[key] = String(value);
   }
   const guardImport = `--import ${quoteNodeOption(guardPath)}`;
@@ -161,7 +184,7 @@ function buildProofEnv({ callerEnv, guardPath, guardReportFile, scratchRoot }) {
   if (baseNodeOptions === "") delete supervisorEnv.NODE_OPTIONS;
   else supervisorEnv.NODE_OPTIONS = baseNodeOptions;
   delete supervisorEnv.CCC_PLANNING_OFFLINE_GUARD_REPORT;
-  return { childEnv, supervisorEnv };
+  return { childEnv, supervisorEnv, strippedCredentialCount };
 }
 
 function redact(text) {
@@ -205,13 +228,26 @@ async function hashFile(filePath) {
   }
 }
 
-async function defaultInspectSandboxReadiness() {
+/** Errata E1-5: the sandbox launcher is started by this absolute path, never by a name PATH could resolve to a shim. */
+export const CCC_PLANNING_SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
+
+/**
+ * Runs a trivial profile through `/usr/bin/sandbox-exec` to prove the Darwin sandbox is usable. `execFile` is injectable so a test can see exactly which program is started.
+ * @param {{ execFile?: typeof execFile }} [options]
+ * @returns {Promise<{ ready: boolean, detail: string }>}
+ */
+export function inspectCccPlanningSandboxReadiness(options = {}) {
+  const start = options.execFile ?? execFile;
   return new Promise((resolve) => {
-    execFile("sandbox-exec", ["-p", "(version 1)(allow default)", "/usr/bin/true"], { timeout: 5_000, encoding: "utf8" }, (error, _stdout, stderr) => {
-      if (error) resolve({ ready: false, detail: `sandbox-exec could not run a trivial profile: ${redact(stderr || error.message).trim()}` });
-      else resolve({ ready: true, detail: "sandbox-exec ran a trivial profile" });
+    start(CCC_PLANNING_SANDBOX_EXEC_PATH, ["-p", "(version 1)(allow default)", "/usr/bin/true"], { timeout: 5_000, encoding: "utf8" }, (error, _stdout, stderr) => {
+      if (error) resolve({ ready: false, detail: `${CCC_PLANNING_SANDBOX_EXEC_PATH} could not run a trivial profile: ${redact(stderr || error.message).trim()}` });
+      else resolve({ ready: true, detail: `${CCC_PLANNING_SANDBOX_EXEC_PATH} ran a trivial profile` });
     });
   });
+}
+
+function defaultInspectSandboxReadiness() {
+  return inspectCccPlanningSandboxReadiness();
 }
 
 async function defaultLoadInventory() {
@@ -252,6 +288,25 @@ function stopFailureText(error) {
     .replace(/password=[^\s&]+/gi, "password=[redacted]")).join(" | ");
 }
 
+/**
+ * The environment one command gets inside the supervisor. Self-contained on purpose: the supervisor child receives this function's source text (`Function.prototype.toString`), so it may not reference anything outside its own body.
+ * A PostgreSQL command gets only the owned server, in FUSION_PG_TEST_URL_BASE and CCC_PG_URL_BASE, and never the skip flag (errata E1-2). Every other command is told PostgreSQL is skipped and never sees a server address, which keeps the vitest global setup from probing (and so from ever touching) a server on the default shared port; a PostgreSQL test that sneaks into such a command then shows up as a skipped test, and the closed-results check fails the run.
+ * @param {Record<string, string>} childEnv
+ * @param {{ needsPostgres: boolean }} entry
+ * @param {string | null} ownedPgBase
+ * @returns {Record<string, string>}
+ */
+export function buildCccPlanningCommandEnv(childEnv, entry, ownedPgBase) {
+  const env = { ...childEnv };
+  if (entry.needsPostgres) {
+    delete env.FUSION_PG_TEST_SKIP;
+    return { ...env, FUSION_PG_TEST_URL_BASE: ownedPgBase, CCC_PG_URL_BASE: ownedPgBase };
+  }
+  delete env.FUSION_PG_TEST_URL_BASE;
+  delete env.CCC_PG_URL_BASE;
+  return { ...env, FUSION_PG_TEST_SKIP: "1" };
+}
+
 /*
 FNXC:CccPlanningProofSupervisor 2026-10-14-10:05:
 Supervisor child. It reads one JSON payload from stdin (the child environment can hold tokens, so it never touches disk or argv), optionally starts the owned embedded PostgreSQL, runs each planned command in order with its own timeout (SIGTERM, then SIGKILL after a grace period, both counted in the row), sends each command's output to its own log file, always stops PostgreSQL inside a bounded budget, and writes exactly one marker line on stdout before exiting. Unlike the frozen PG proof it keeps running the remaining commands after a failed one, so a single run reports every failure. It exits explicitly because embedded-postgres registers a natural-beforeExit hook that can misfire after an explicit stop.
@@ -273,6 +328,7 @@ const SUPERVISOR_SOURCE = `
   let stopError = null;
   ${stopWithinBudgetPolicy.toString()}
   ${stopFailureText.toString()}
+  ${buildCccPlanningCommandEnv.toString()}
   const run = (entry, env) => new Promise((resolve) => {
     const logFd = openSync(entry.logFile, "a");
     const child = spawn(entry.file, entry.args, { cwd: entry.cwd, env, stdio: ["ignore", logFd, logFd] });
@@ -319,10 +375,7 @@ const SUPERVISOR_SOURCE = `
     }
     for (const entry of payload.commands) {
       if (interrupted) break;
-      // A PostgreSQL command gets only the owned server. Every other command is told PostgreSQL is skipped, which keeps the vitest global setup from probing (and so from ever touching) a server on the default shared port; a PostgreSQL test that sneaks into such a command then shows up as a skipped test, and the closed-results check fails the run.
-      const env = entry.needsPostgres
-        ? { ...payload.childEnv, FUSION_PG_TEST_URL_BASE: ownedPgBase, CCC_PG_URL_BASE: ownedPgBase }
-        : { ...payload.childEnv, FUSION_PG_TEST_SKIP: "1" };
+      const env = buildCccPlanningCommandEnv(payload.childEnv, entry, ownedPgBase);
       const outcome = await run(entry, env);
       results.push({ id: entry.id, timeoutMs: entry.timeoutMs, ...outcome, outputFile: entry.outputFile, logFile: entry.logFile });
     }
@@ -432,6 +485,7 @@ function emptyReport({ mode, platform }) {
     perCommand: [],
     postgres: { owned: false },
     offlineGuard: { attempts: 0, reportFile: null, entries: [] },
+    strippedCredentialCount: 0,
     scratch: { root: null, cleanup: "not-created" },
   };
 }
@@ -534,6 +588,12 @@ export async function runCccPlanningProof(input) {
   }
   report.inventorySha256 = typeof inventory.sha256 === "string" ? inventory.sha256 : "";
 
+  // Errata E1-6: the loader enforces this too, but the inventory arrives through an injectable loader, so the runner checks it for itself. It holds in every mode because the inventory, not the selection, is what is invalid.
+  const notNamesClosedOffline = (Array.isArray(inventory.offline) ? inventory.offline : []).filter((command) => command?.closure !== "names").map((command) => String(command?.id));
+  if (notNamesClosedOffline.length > 0) {
+    return refuse(CODE.INVENTORY, `OFFLINE entries must be names-closed; a files-closed (or otherwise not names-closed) command is only allowed in TARGETED: ${notNamesClosedOffline.join(", ")}`);
+  }
+
   const commands = selectCommands(mode, inventory);
   if (commands.length === 0) {
     return refuse(CODE.INVENTORY, `mode ${mode} selected no command; an empty inventory proves nothing`);
@@ -557,7 +617,7 @@ export async function runCccPlanningProof(input) {
 
   const needsPostgres = commands.some((command) => command.needsPostgres);
   const postgresDatabase = needsPostgres ? `ccc_planning_proof_${randomBytes(4).toString("hex")}` : null;
-  report.postgres = needsPostgres ? { owned: true, database: postgresDatabase } : { owned: false };
+  report.postgres = needsPostgres ? { owned: true, database: postgresDatabase, stopError: null } : { owned: false };
 
   const proofRoot = await mkdtemp(path.join(scratchParent, "ccc-planning-proof-"));
   const scratchRoot = path.join(proofRoot, "scratch");
@@ -568,7 +628,8 @@ export async function runCccPlanningProof(input) {
   for (const directory of [scratchRoot, resultRoot, logRoot]) await mkdir(directory, { recursive: true });
   report.scratch = { root: proofRoot, cleanup: "preserved-on-failure" };
 
-  const { childEnv, supervisorEnv } = buildProofEnv({ callerEnv, guardPath, guardReportFile, scratchRoot });
+  const { childEnv, supervisorEnv, strippedCredentialCount } = buildProofEnv({ callerEnv, guardPath, guardReportFile, scratchRoot });
+  report.strippedCredentialCount = strippedCredentialCount;
 
   report.manifestHashes = {
     "package.json": await hashFile(path.join(repoRoot, "package.json")),
@@ -599,6 +660,7 @@ export async function runCccPlanningProof(input) {
       expected: command.closure === "names" ? command.expectedNames.length : null,
       skipped: 0,
       failed: 0,
+      files: command.files.length,
       timedOut: false,
       exitCode: null,
       signal: null,
@@ -626,6 +688,7 @@ export async function runCccPlanningProof(input) {
   if (supervised) {
     if (supervised.startError) fail(CODE.SUPERVISOR, `embedded PostgreSQL did not start: ${supervised.startError}`);
     if (supervised.stopError) fail(CODE.SUPERVISOR, `embedded PostgreSQL stop failed: ${supervised.stopError}`);
+    if (report.postgres.owned) report.postgres.stopError = supervised.stopError ? redact(String(supervised.stopError)) : null;
     if (supervised.interrupted) fail(CODE.SUPERVISOR, `supervisor interrupted by ${supervised.interrupted}`);
     if (Array.isArray(supervised.lifecycleErrors) && supervised.lifecycleErrors.length > 0) {
       fail(CODE.SUPERVISOR, `embedded PostgreSQL lifecycle reported errors: ${supervised.lifecycleErrors.join(" | ")}`);
@@ -673,6 +736,7 @@ export async function runCccPlanningProof(input) {
       let resultsClosed = false;
       if (json && typeof json === "object" && Array.isArray(json.testResults)) {
         const tally = tallyVitestReport(json);
+        summary.files = tally.files;
         summary.passed = tally.passed;
         summary.skipped = tally.skipped;
         summary.failed = tally.failed;

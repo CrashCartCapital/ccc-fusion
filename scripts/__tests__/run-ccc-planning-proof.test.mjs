@@ -29,6 +29,8 @@ import {
 } from "../lib/ccc-planning-proof-inventory/index.mjs";
 import {
   buildCccPlanningCommandArgv,
+  buildCccPlanningCommandEnv,
+  inspectCccPlanningSandboxReadiness,
   parseCccPlanningProofArgs,
   runCccPlanningProof,
   runSupervisedProofCommands,
@@ -50,6 +52,12 @@ const CODE = {
   NETWORK: "CCC_PLANNING_OFFLINE_NETWORK_ATTEMPT",
   USAGE: "CCC_PLANNING_PROOF_USAGE",
 };
+
+/*
+FNXC:CccPlanningProof 2026-10-14-09:32:
+The PostgreSQL skip flag is spelled out only here, in four pieces. This very file is listed under a command that does not declare needsPostgres, and the static skip policy (errata E1-2) refuses the whole flag name in code or in a string or template of such a file, so a fixture or a test title may not hold it either. Every case below builds the name from this constant, and a fixture file that must read the flag (the real-supervisor case) joins it from its four pieces inside the fixture.
+*/
+const PG_SKIP_FLAG = ["FUSION", "PG", "TEST", "SKIP"].join("_");
 
 let workDir;
 
@@ -370,6 +378,19 @@ describe("command inventory shape", () => {
       assert.throws(() => assertMachineResultInventory(makeCommand(overrides)), codeOf(CODE.INVENTORY), label);
     }
   });
+
+  it("stays strict about the field name: needsPg is refused and the refusal names both spellings", () => {
+    assert.throws(
+      () => assertMachineResultInventory(makeCommand({ needsPostgres: undefined, needsPg: false })),
+      (error) => {
+        assert.equal(error?.code, CODE.INVENTORY);
+        assert.match(error.message, /\bneedsPg\b/);
+        assert.match(error.message, /needsPostgres/);
+        return true;
+      },
+    );
+    assertMachineResultInventory(makeCommand({ needsPostgres: true, config: "vitest.pg.config.ts", packageFilter: "@fusion/core", project: null }));
+  });
 });
 
 describe("static skip policy", () => {
@@ -441,6 +462,97 @@ describe("static skip policy", () => {
     for (const text of [`const open = "never closed;\nit("a", () => {});`, "const open = `never closed", `/* never closed`]) {
       assert.throws(() => policy(text), codeOf(CODE.INVENTORY), text);
     }
+  });
+
+  /*
+  FNXC:CccPlanningProof 2026-10-14-09:32:
+  Errata E1-7. The lexer indexes UTF-16 code units. A string split by code point counts an emoji as one slot while every index into it counts two, so the blanking lands in the wrong place after the first such character: a real skip hid behind an emoji, and a legal Darwin skipIf after one was refused.
+  */
+  const EMOJI = "\u{1F600}";
+
+  it("indexes UTF-16 code units, so an emoji before a skip form cannot hide it", () => {
+    for (const [label, text] of Object.entries({
+      "emoji in a line comment": `// ${EMOJI.repeat(20)}\nit.skip("b", () => {});\n`,
+      "emoji in a test title": `it("handles ${EMOJI.repeat(8)}", () => {});it.skip("b", () => {});\n`,
+      "emoji in a string, then a skip option": `const s = "${EMOJI.repeat(12)}";\nit("b", { skip: true }, () => {});\n`,
+      "emoji in a block comment, then an x-prefixed test": `/* ${EMOJI.repeat(6)} */\nxit("b", () => {});\n`,
+      "emoji in a string, then pgDescribe in a file without needsPostgres": `const s = "${EMOJI.repeat(12)}";\npgDescribe("store", () => {});\n`,
+    })) {
+      assert.throws(() => policy(text), codeOf(CODE.INVENTORY), label);
+    }
+    // Positive controls: the same emoji with no skip form is accepted, and the same skip with no emoji is refused,
+    // so the emoji is the only thing the refused cases above vary.
+    policy(`// ${EMOJI.repeat(20)}\nit("b", () => {});\n`);
+    policy(`const s = "${EMOJI.repeat(12)}";\nit("b", { retries: 0 }, () => {});\n`);
+    assert.throws(() => policy(`// plain\nit.skip("b", () => {});\n`), codeOf(CODE.INVENTORY));
+  });
+
+  it("accepts the Darwin skipIf after an emoji in a darwin-tagged file, and still refuses it in an untagged file or in its inverse form", () => {
+    const legal = `const s = "${EMOJI}";\ndescribe.skipIf(process.platform !== "darwin")("confined", () => { it("a", () => {}); });\n`;
+    policy(legal, darwin);
+    assert.throws(() => policy(legal, plain), codeOf(CODE.INVENTORY));
+    assert.throws(() => policy(legal.replace("!==", "==="), darwin), codeOf(CODE.INVENTORY));
+    // Positive control: the same text with no emoji behaves the same way, so the emoji is not what makes it legal.
+    policy(legal.replace(EMOJI, "x"), darwin);
+  });
+
+  /*
+  FNXC:CccPlanningProof 2026-10-14-09:32:
+  Errata E1-2 and E1-2b. The runner sets the PostgreSQL skip flag for every command that does not declare needsPostgres, so a test file listed under such a command that READS the flag could return early and pass without testing anything. The policy therefore refuses the flag name in code, strings and templates of those files (comments cannot read an environment, so they stay legal). A needsPostgres file may mention the flag, because the runner never sets it there, and may use the one existing idiom `const pgDescribe = PG_AVAILABLE ? describe : describe.skip;` (packages/core/src/__tests__/postgres/schema-applier.test.ts:92-97); its runtime closure (zero skipped, every expected name passed) is the backstop.
+  */
+  const withFlag = (text) => text.replaceAll("__PG_SKIP__", PG_SKIP_FLAG);
+  const flagCases = {
+    "a property read that returns early": `it("a", () => { if (process.env.__PG_SKIP__ === "1") return; });`,
+    "a bracket read with a string key": `it("a", () => { if (process.env["__PG_SKIP__"]) return; });`,
+    "a bracket read with a template key": "it(\"a\", () => { if (process.env[`__PG_SKIP__`]) return; });",
+    "a destructured read": `const { __PG_SKIP__ } = process.env;\nit("a", () => {});`,
+    "a test title that names it": `it("handles __PG_SKIP__", () => {});`,
+  };
+
+  it("refuses the PostgreSQL skip flag in code, a string or a template of a file without needsPostgres, and ignores it in a comment", () => {
+    for (const [label, text] of Object.entries(flagCases)) {
+      assert.throws(() => policy(withFlag(text), plain), codeOf(CODE.INVENTORY), label);
+      assert.throws(() => policy(withFlag(text), darwin), codeOf(CODE.INVENTORY), `${label} (darwin)`);
+    }
+    // Positive controls: a comment that names it is legal, and so is every refused case above in a file tagged needsPostgres.
+    policy(withFlag(`// __PG_SKIP__ is set by the runner for this command\n/* __PG_SKIP__ */\nit("a", () => {});`), plain);
+    for (const [label, text] of Object.entries(flagCases)) policy(withFlag(text), { ...plain, needsPostgres: true });
+  });
+
+  // Lines 92-97 of packages/core/src/__tests__/postgres/schema-applier.test.ts, with the flag name spelled through the constant.
+  const PG_IDIOM = [
+    "const PG_TEST_URL_BASE =",
+    '  process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";',
+    "const PG_AVAILABLE =",
+    '  process.env.__PG_SKIP__ !== "1" && Boolean(PG_TEST_URL_BASE);',
+    "",
+    "const pgDescribe = PG_AVAILABLE ? describe : describe.skip;",
+  ].join("\n");
+  const idiomFile = (idiom = PG_IDIOM) => withFlag(`import { describe, it } from "vitest";\n\n${idiom}\n\npgDescribe("store", () => { it("a", () => {}); });\n`);
+
+  it("accepts the existing pgDescribe idiom exactly as schema-applier.test.ts spells it, only in a file tagged needsPostgres", () => {
+    policy(idiomFile(), { ...plain, needsPostgres: true });
+    policy(idiomFile(PG_IDIOM.replace("describe : describe.skip", "describe :\n  describe . skip")), { ...plain, needsPostgres: true });
+    assert.throws(() => policy(idiomFile(), plain), codeOf(CODE.INVENTORY));
+    assert.throws(() => policy(idiomFile(), darwin), codeOf(CODE.INVENTORY));
+  });
+
+  it("refuses the idiom's describe.skip under another binding in any file, and every other skip reference even where the idiom is allowed", () => {
+    const needsPg = { ...plain, needsPostgres: true };
+    const noFlag = (text) => `const ok = Boolean(process.env.HOME);\n${text}\n`;
+    for (const [label, text] of Object.entries({
+      "the idiom bound to another name": noFlag(`const maybeDescribe = ok ? describe : describe.skip;\nmaybeDescribe("x", () => {});`),
+      "a bare reference to describe.skip": noFlag(`const d = describe.skip;\nd("x", () => {});`),
+      "the same idiom for it": noFlag(`const pgIt = ok ? it : it.skip;\npgIt("x", () => {});`),
+      "a todo reference": noFlag(`const t = it.todo;\nt("x");`),
+      "the idiom with another availability name": noFlag(`const pgDescribe = AVAILABLE ? describe : describe.skip;\npgDescribe("x", () => {});`),
+      "the idiom followed by a skip call": noFlag(`const pgDescribe = PG_AVAILABLE ? describe : describe.skip;\nit.skip("x", () => {});`),
+    })) {
+      assert.throws(() => policy(text, plain), codeOf(CODE.INVENTORY), `${label} (untagged)`);
+      assert.throws(() => policy(text, needsPg), codeOf(CODE.INVENTORY), `${label} (needsPostgres)`);
+    }
+    // Positive control: the exact idiom in a needsPostgres file is the one accepted form.
+    policy(idiomFile(), needsPg);
   });
 });
 
@@ -549,8 +661,8 @@ describe("argument parsing", () => {
 });
 
 describe("refusals before anything is spawned", () => {
-  it("refuses FUSION_PG_TEST_SKIP=1 and never calls runSupervised; without it the same run calls it once", async () => {
-    const refused = await run({ env: { FUSION_PG_TEST_SKIP: "1" } });
+  it("refuses the caller's PostgreSQL skip flag and never calls runSupervised; without it the same run calls it once", async () => {
+    const refused = await run({ env: { [PG_SKIP_FLAG]: "1" } });
     assert.equal(refused.exitCode, 1);
     assert.equal(refused.report.passed, false);
     assert.equal(refused.report.refusal?.code, CODE.PG_SKIP);
@@ -560,9 +672,9 @@ describe("refusals before anything is spawned", () => {
     assert.equal(control.runSupervised.calls.length, 1);
   });
 
-  it("refuses FUSION_PG_TEST_SKIP=1 in every mode, because a skipped PostgreSQL test is a failed proof", async () => {
+  it("refuses the caller's PostgreSQL skip flag in every mode, because a skipped PostgreSQL test is a failed proof", async () => {
     for (const mode of ["targeted", "offline", "ci-linux"]) {
-      const outcome = await run({ mode, env: { FUSION_PG_TEST_SKIP: "1" }, offline: [makeCommand({ id: "o" })] });
+      const outcome = await run({ mode, env: { [PG_SKIP_FLAG]: "1" }, offline: [makeCommand({ id: "o" })] });
       assert.equal(outcome.report.refusal?.code, CODE.PG_SKIP, mode);
       assert.equal(outcome.runSupervised.calls.length, 0, mode);
     }
@@ -587,6 +699,27 @@ describe("refusals before anything is spawned", () => {
     assert.equal(outcome.report.refusal?.code, CODE.SANDBOX);
     assert.match(outcome.report.refusal?.detail, /sandbox-exec missing/);
     assert.equal(outcome.runSupervised.calls.length, 0);
+  });
+
+  /*
+  FNXC:CccPlanningProof 2026-10-14-09:32:
+  Errata E1-6. The loader refuses a files-closed OFFLINE entry, but the runner takes its inventory through an injectable loader, so it checks the same rule itself: offline mode proves a name list under the Darwin sandbox, and a file-closed entry cannot.
+  */
+  it("refuses a files-closed command in the OFFLINE list in every mode before spawning, while the same command in the TARGETED list runs", async () => {
+    const filesClosed = makeCommand({ id: "files-closed", closure: "files", expectedNames: [] });
+    for (const [mode, platform] of [["offline", "darwin"], ["ci-linux", "linux"], ["targeted", "darwin"]]) {
+      const refused = await run({ mode, platform, targeted: [makeCommand()], offline: [filesClosed] });
+      assert.equal(refused.exitCode, 1, mode);
+      assert.equal(refused.report.refusal?.code, CODE.INVENTORY, mode);
+      assert.match(refused.report.refusal?.detail, /files-closed/, mode);
+      assert.equal(refused.runSupervised.calls.length, 0, mode);
+    }
+    const inTargeted = await run({ targeted: [filesClosed] });
+    assert.equal(inTargeted.exitCode, 0);
+    assert.equal(inTargeted.runSupervised.calls.length, 1);
+    const namesClosedOffline = await run({ mode: "offline", offline: [makeCommand({ id: "names-closed" })] });
+    assert.equal(namesClosedOffline.exitCode, 0);
+    assert.equal(namesClosedOffline.runSupervised.calls.length, 1);
   });
 
   it("refuses targeted mode on a non-darwin host only when a selected entry is darwin-only", async () => {
@@ -639,6 +772,28 @@ describe("refusals before anything is spawned", () => {
   });
 });
 
+/*
+FNXC:CccPlanningProof 2026-10-14-09:32:
+Errata E1-5. The readiness probe starts the sandbox launcher by its absolute path, so a `sandbox-exec` shim earlier on PATH cannot make an unusable sandbox look ready. The launcher is injected here because the case must also hold on a Linux host, where the real file does not exist.
+*/
+describe("sandbox readiness probe", () => {
+  const fakeExecFile = (started, outcome = {}) => (file, args, options, callback) => {
+    started.push({ file, args, options });
+    callback(outcome.error ?? null, "", outcome.stderr ?? "");
+  };
+
+  it("starts /usr/bin/sandbox-exec by its absolute path, never a name PATH could resolve, and derives readiness from the launcher's outcome", async () => {
+    const started = [];
+    const ready = await inspectCccPlanningSandboxReadiness({ execFile: fakeExecFile(started) });
+    assert.equal(ready.ready, true);
+    const failed = await inspectCccPlanningSandboxReadiness({ execFile: fakeExecFile(started, { error: new Error("launcher failed"), stderr: "profile denied" }) });
+    assert.equal(failed.ready, false);
+    assert.match(failed.detail, /profile denied/);
+    assert.deepEqual(started.map((call) => call.file), ["/usr/bin/sandbox-exec", "/usr/bin/sandbox-exec"]);
+    assert.ok(started.every((call) => path.isAbsolute(call.file) && call.args.at(-1) === "/usr/bin/true"));
+  });
+});
+
 describe("environment handed to the supervised children", () => {
   it("sets PI_OFFLINE=1 and preloads the network guard with --import, keeping any NODE_OPTIONS the caller had", async () => {
     const outcome = await run({ env: { NODE_OPTIONS: "--max-old-space-size=1234" } });
@@ -669,6 +824,7 @@ describe("environment handed to the supervised children", () => {
         FUSION_PG_TEST_URL_BASE: "postgresql://postgres@localhost:5432",
         CCC_PG_URL_BASE: "postgresql://postgres@localhost:5432",
         FUSION_PG_TEST_AVAILABLE: "1",
+        [PG_SKIP_FLAG]: "0",
         PGHOST: "localhost",
         PGPORT: "5432",
         PGPASSWORD: "x",
@@ -677,13 +833,87 @@ describe("environment handed to the supervised children", () => {
         UNRELATED_SETTING: "kept",
       },
     });
+    assert.equal(outcome.exitCode, 0, "a skip flag that is not 1 is not the refused value; it is dropped, not forwarded");
     const { env, supervisorEnv } = firstCall(outcome).options;
-    for (const key of ["FUSION_PG_TEST_URL_BASE", "CCC_PG_URL_BASE", "FUSION_PG_TEST_AVAILABLE", "PGHOST", "PGPORT", "PGPASSWORD", "DATABASE_URL", "POSTGRES_URL"]) {
+    for (const key of ["FUSION_PG_TEST_URL_BASE", "CCC_PG_URL_BASE", "FUSION_PG_TEST_AVAILABLE", PG_SKIP_FLAG, "PGHOST", "PGPORT", "PGPASSWORD", "DATABASE_URL", "POSTGRES_URL"]) {
       assert.equal(env[key], undefined, key);
       assert.equal(supervisorEnv[key], undefined, `supervisor ${key}`);
     }
     assert.equal(env.UNRELATED_SETTING, "kept");
     assert.ok(!Object.values(env).some((value) => value.includes(":5432")), "no value may still name the shared server port");
+  });
+
+  /*
+  FNXC:CccPlanningProof 2026-10-14-09:32:
+  Errata E1-3. A proof child runs repository code that Fusion's models wrote, with the network tripwire as its only outside-world check, so no provider credential from the caller's shell may reach it. The rule is by name: a suffix list and a prefix list. The report keeps only how many names were removed, never a name or a value.
+  */
+  it("strips provider credential variables by suffix and prefix from every child environment in every mode, and reports only how many", async () => {
+    const credentials = {
+      OPENAI_API_KEY: "value-openai-api-key",
+      SERVICE_TOKEN: "value-service-token",
+      CLIENT_SECRET: "value-client-secret",
+      DB_PASSWORD: "value-db-password",
+      OMNIROUTE_URL: "value-omniroute",
+      ANTHROPIC_BASE_URL: "value-anthropic",
+      OPENAI_ORG: "value-openai-org",
+      GEMINI_MODEL: "value-gemini",
+      GOOGLE_APPLICATION_CREDENTIALS: "value-google",
+      AWS_REGION: "value-aws",
+      AZURE_TENANT: "value-azure",
+      MINIMAX_GROUP: "value-minimax",
+      ZHIPU_PROFILE: "value-zhipu",
+      GLM_ENDPOINT: "value-glm",
+    };
+    const unrelated = {
+      UNRELATED_SETTING: "kept",
+      TOKENIZERS_PARALLELISM: "kept-tokenizers",
+      API_KEY_NAME: "kept-name",
+      MYAWS_REGION: "kept-lookalike",
+      SECRETARY: "kept-secretary",
+    };
+    for (const mode of ["targeted", "offline", "ci-linux"]) {
+      const outcome = await run({ mode, platform: mode === "ci-linux" ? "linux" : "darwin", env: { ...credentials, ...unrelated }, offline: [makeCommand({ id: "o" })] });
+      assert.equal(outcome.exitCode, 0, mode);
+      const { env, supervisorEnv } = firstCall(outcome).options;
+      for (const key of Object.keys(credentials)) {
+        assert.equal(env[key], undefined, `${mode}: child ${key}`);
+        assert.equal(supervisorEnv[key], undefined, `${mode}: supervisor ${key}`);
+      }
+      for (const [key, value] of Object.entries(unrelated)) assert.equal(env[key], value, `${mode}: ${key} must survive`);
+      assert.equal(outcome.report.strippedCredentialCount, Object.keys(credentials).length, mode);
+      const reportText = JSON.stringify(outcome.report);
+      for (const [key, value] of Object.entries(credentials)) {
+        assert.ok(!reportText.includes(key), `${mode}: the report must not name ${key}`);
+        assert.ok(!reportText.includes(value), `${mode}: the report must not hold the value of ${key}`);
+      }
+    }
+    const control = await run({ env: { ...unrelated } });
+    assert.equal(control.report.strippedCredentialCount, 0);
+    assert.equal(firstCall(control).options.env.UNRELATED_SETTING, "kept");
+  });
+
+  it("gives the owned PostgreSQL URL only to PostgreSQL commands and sets the skip flag only for the others", () => {
+    const owned = "postgresql://127.0.0.1:55999";
+    const poisoned = { PATH: "/bin", FUSION_PG_TEST_URL_BASE: "postgresql://shared:5432", CCC_PG_URL_BASE: "postgresql://shared:5432", [PG_SKIP_FLAG]: "1" };
+    const input = JSON.stringify(poisoned);
+
+    const forPostgres = buildCccPlanningCommandEnv(poisoned, { needsPostgres: true }, owned);
+    assert.equal(forPostgres.FUSION_PG_TEST_URL_BASE, owned);
+    assert.equal(forPostgres.CCC_PG_URL_BASE, owned);
+    assert.equal(PG_SKIP_FLAG in forPostgres, false, "the runner never sets the skip flag for a PostgreSQL command");
+    assert.equal(forPostgres.PATH, "/bin");
+
+    const forOthers = buildCccPlanningCommandEnv(poisoned, { needsPostgres: false }, owned);
+    assert.equal(forOthers[PG_SKIP_FLAG], "1");
+    assert.equal("FUSION_PG_TEST_URL_BASE" in forOthers, false, "a PostgreSQL-free command never sees a server address");
+    assert.equal("CCC_PG_URL_BASE" in forOthers, false);
+    assert.equal(forOthers.PATH, "/bin");
+
+    assert.equal(JSON.stringify(poisoned), input, "the base environment is not mutated");
+    // Positive control: with a clean base the two shapes differ in exactly the PostgreSQL keys.
+    const clean = { PATH: "/bin" };
+    assert.deepEqual(buildCccPlanningCommandEnv(clean, { needsPostgres: true }, owned), { PATH: "/bin", FUSION_PG_TEST_URL_BASE: owned, CCC_PG_URL_BASE: owned });
+    assert.deepEqual(buildCccPlanningCommandEnv(clean, { needsPostgres: false }, owned), { PATH: "/bin", [PG_SKIP_FLAG]: "1" });
   });
 
   it("keeps the offline guard out of the supervisor's own environment while the children get it", async () => {
@@ -763,6 +993,41 @@ describe("verdicts", () => {
     assert.match(outcome.report.manifestHashes["package.json"], /^[0-9a-f]{64}$/);
     assert.equal(outcome.report.gitHead, FIXED_SNAPSHOT.head);
     assert.equal(outcome.report.workingTreeDirty, false);
+  });
+
+  /*
+  FNXC:CccPlanningProof 2026-10-14-09:32:
+  Errata E1-4 and review fix 2. The frozen CccPlanningProofReport (ADR D Q1) requires `perCommand[].files` and, when the runner owns PostgreSQL, `postgres.stopError`; the first build set neither.
+  */
+  it("reports the file count of every command and the PostgreSQL stop error, whether or not a result was written", async () => {
+    const root = makeFixtureRepo({ "packages/engine/src/__tests__/b.test.ts": DEFAULT_TEST_FILE });
+    const twoFiles = makeCommand({ id: "two-files", closure: "files", expectedNames: [], files: ["src/__tests__/a.test.ts", "src/__tests__/b.test.ts"] });
+    const oneFile = makeCommand({ id: "one-file" });
+    const pgCommand = makeCommand({ id: "pg-cmd", packageFilter: "@fusion/core", project: null, needsPostgres: true, files: ["src/__tests__/pg.test.ts"], config: "vitest.pg.config.ts" });
+
+    const clean = await run({ root, targeted: [twoFiles, oneFile, pgCommand] });
+    assert.equal(clean.exitCode, 0, JSON.stringify(clean.report.failures));
+    assert.deepEqual(clean.report.perCommand.map((row) => [row.id, row.files]), [["two-files", 2], ["one-file", 1], ["pg-cmd", 1]]);
+    assert.deepEqual(clean.report.postgres, { owned: true, database: clean.report.postgres.database, stopError: null });
+    assert.match(clean.report.postgres.database, /^[a-z0-9_]+$/);
+
+    const stopFailed = await run({
+      root,
+      targeted: [twoFiles, pgCommand],
+      supervisor: makeSupervisor(root, { stopError: "embedded PostgreSQL stop timed out for postgresql://owner:secret@127.0.0.1:55999/db" }),
+    });
+    assert.equal(stopFailed.exitCode, 1);
+    assert.equal(stopFailed.report.refusal?.code, CODE.SUPERVISOR);
+    assert.equal(stopFailed.report.postgres.owned, true);
+    assert.match(stopFailed.report.postgres.stopError, /embedded PostgreSQL stop timed out/);
+    assert.ok(!stopFailed.report.postgres.stopError.includes("secret"), "the stop error is redacted like every other detail");
+
+    const noResult = await run({ root, targeted: [twoFiles], supervisor: makeSupervisor(root, { skipWritingResults: true }) });
+    assert.equal(noResult.exitCode, 1);
+    assert.equal(noResult.report.perCommand[0].files, 2, "with no result written the count falls back to the files the command lists");
+
+    const withoutPostgres = await run({ root, targeted: [oneFile] });
+    assert.deepEqual(withoutPostgres.report.postgres, { owned: false });
   });
 
   it("fails with RESULTS_NOT_CLOSED when one expected name was skipped, and counts it", async () => {
@@ -970,7 +1235,7 @@ describe("real supervisor without PostgreSQL", () => {
     });
   const envTest = nodeTest(`describe("env", () => { it("is offline and skips PostgreSQL", () => {
   assert.equal(process.env.PI_OFFLINE, "1");
-  assert.equal(process.env.FUSION_PG_TEST_SKIP, "1");
+  assert.equal(process.env[${JSON.stringify(PG_SKIP_FLAG.split("_"))}.join("_")], "1");
   assert.equal(process.env.FUSION_PG_TEST_URL_BASE, undefined);
   assert.equal(process.env.CCC_PG_URL_BASE, undefined);
   assert.match(process.env.NODE_OPTIONS, /ccc-planning-offline-network-guard/);

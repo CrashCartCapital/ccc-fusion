@@ -1,4 +1,4 @@
-// FNXC:CccPlanningProofInventory 2026-10-14-10:40:
+// FNXC:CccPlanningProofInventory 2026-10-14-09:34:
 // Card P0 (proof runner, offline guard and Linux lane) owns exactly this module.
 // The inventory index loads every cards/*.mjs in sorted filename order; each card
 // exports the closed ClosedSuiteCommand lists the runner executes.
@@ -6,7 +6,7 @@
 // Closure choices:
 // - p0-runner-scripts and p0-offline-network-guard are NAME-closed: the card owns
 //   both script test files, so a renamed, deleted, extra or skipped test fails the
-//   run (72 runner tests, 13 guard tests, all node:test).
+//   run (83 runner tests, 13 guard tests, all node:test).
 // - p0-ci-workflow-shape is FILE-closed: ci-workflow.test.ts pre-exists with many
 //   assertions the card does not own, so the claim is only that the file executes
 //   at least one test and every test in it passes.
@@ -38,6 +38,7 @@ export const TARGETED = Object.freeze([
       "file-closed results > refuses a report whose counters lie about the assertions",
       "command inventory shape > accepts every package and project pairing the contract admits",
       "command inventory shape > refuses every malformed field, each against the valid control above",
+      "command inventory shape > stays strict about the field name: needsPg is refused and the refusal names both spellings",
       "static skip policy > accepts ordinary tests",
       "static skip policy > refuses it.skip, describe.skip, test.skip, todo, x-prefixed tests and a dynamic skip in a body",
       "static skip policy > refuses an inverse platform skipIf, an arbitrary skipIf and any runIf",
@@ -46,6 +47,11 @@ export const TARGETED = Object.freeze([
       "static skip policy > ignores skip-shaped text inside comments, strings, template literals and regular expressions",
       "static skip policy > still sees a real skip that follows a regular expression holding a quote character",
       "static skip policy > fails closed on text it cannot read to the end",
+      "static skip policy > indexes UTF-16 code units, so an emoji before a skip form cannot hide it",
+      "static skip policy > accepts the Darwin skipIf after an emoji in a darwin-tagged file, and still refuses it in an untagged file or in its inverse form",
+      "static skip policy > refuses the PostgreSQL skip flag in code, a string or a template of a file without needsPostgres, and ignores it in a comment",
+      "static skip policy > accepts the existing pgDescribe idiom exactly as schema-applier.test.ts spells it, only in a file tagged needsPostgres",
+      "static skip policy > refuses the idiom's describe.skip under another binding in any file, and every other skip reference even where the idiom is allowed",
       "planning proof inventory > loads the shipped b2, b4, c6b and p0 modules as they are, in sorted filename order",
       "planning proof inventory > documents which closure applies where: c6b is name-closed in targeted, b2 is file-closed in targeted and name-closed in offline",
       "planning proof inventory > gives a stable 64-hex digest that changes when one expected-name byte changes",
@@ -55,24 +61,29 @@ export const TARGETED = Object.freeze([
       "argument parsing > accepts a mode as two arguments or one, with or without a leading --",
       "argument parsing > returns a usage error for a missing, unknown, repeated or extra argument",
       "argument parsing > exits 2 with the usage code when asked to run an unknown mode",
-      "refusals before anything is spawned > refuses FUSION_PG_TEST_SKIP=1 and never calls runSupervised; without it the same run calls it once",
-      "refusals before anything is spawned > refuses FUSION_PG_TEST_SKIP=1 in every mode, because a skipped PostgreSQL test is a failed proof",
+      "refusals before anything is spawned > refuses the caller's PostgreSQL skip flag and never calls runSupervised; without it the same run calls it once",
+      "refusals before anything is spawned > refuses the caller's PostgreSQL skip flag in every mode, because a skipped PostgreSQL test is a failed proof",
       "refusals before anything is spawned > refuses offline mode on an injected linux platform before probing the sandbox or spawning; darwin with a ready sandbox runs once",
       "refusals before anything is spawned > refuses offline mode on darwin when the sandbox is not ready",
+      "refusals before anything is spawned > refuses a files-closed command in the OFFLINE list in every mode before spawning, while the same command in the TARGETED list runs",
       "refusals before anything is spawned > refuses targeted mode on a non-darwin host only when a selected entry is darwin-only",
       "refusals before anything is spawned > selects only platform-any, PostgreSQL-free entries in ci-linux and runs on a linux host without the sandbox probe",
       "refusals before anything is spawned > fails ci-linux on an empty selection, and the same for an empty targeted or offline list",
       "refusals before anything is spawned > refuses an inventory that does not load, a listed file that does not exist, and a listed file that breaks the skip policy",
+      "sandbox readiness probe > starts /usr/bin/sandbox-exec by its absolute path, never a name PATH could resolve, and derives readiness from the launcher's outcome",
       "environment handed to the supervised children > sets PI_OFFLINE=1 and preloads the network guard with --import, keeping any NODE_OPTIONS the caller had",
       "environment handed to the supervised children > quotes a guard path that holds a space so NODE_OPTIONS still parses",
       "environment handed to the supervised children > points scratch, TMPDIR and the proof environment at the owned scratch root",
       "environment handed to the supervised children > drops every caller PostgreSQL setting, so no address of the shared host server survives into the children",
+      "environment handed to the supervised children > strips provider credential variables by suffix and prefix from every child environment in every mode, and reports only how many",
+      "environment handed to the supervised children > gives the owned PostgreSQL URL only to PostgreSQL commands and sets the skip flag only for the others",
       "environment handed to the supervised children > keeps the offline guard out of the supervisor's own environment while the children get it",
       "environment handed to the supervised children > asks the supervisor to own PostgreSQL only when a selected command needs it",
       "command argv > pins the engine project and passes the output file and files after the flags",
       "command argv > maps core with a config, cli, and the dashboard project that card C6b needs",
       "command argv > runs node-test commands through node --test with the closed-results reporter",
       "verdicts > passes a closed all-passed run and reports per-command counts, a digest and provenance fields",
+      "verdicts > reports the file count of every command and the PostgreSQL stop error, whether or not a result was written",
       "verdicts > fails with RESULTS_NOT_CLOSED when one expected name was skipped, and counts it",
       "verdicts > fails on a failed test, a missing name and a renamed test, each with RESULTS_NOT_CLOSED",
       "verdicts > fails a file-closed command whose listed file executed zero tests",

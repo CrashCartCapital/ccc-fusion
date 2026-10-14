@@ -309,14 +309,21 @@ export function assertMachineResultInventory(command) {
   }
 }
 
+/*
+FNXC:CccPlanningProof 2026-10-14-09:32:
+Errata E1-7. Every index in this lexer is a UTF-16 code unit, so the output buffer is `text.split("")`. `Array.from(text)` splits by code point, counts an emoji as one slot while `text.length` and every `index` count two, and so shifts the blanking after the first character outside the Basic Multilingual Plane: a real skip hid behind an emoji and a legal Darwin skipIf after one was refused. Never switch this buffer back to code points.
+*/
 /**
  * Replaces comments, string literals, template-literal text and regular-expression literals with spaces (newlines kept), so the skip patterns below only ever see code. Fails closed: text it cannot read to the end throws instead of passing quietly, because a scanner that gives up midway could hide a real skip.
+ * With `keepLiterals`, string and template text stays visible (comments and regular expressions are still blanked): the PostgreSQL skip flag rule needs it, because `process.env["NAME"]` reads an environment variable through a string.
  * @param {string} text
  * @param {string} file
+ * @param {{ keepLiterals?: boolean }} [options]
  * @returns {string}
  */
-function maskNonCode(text, file) {
-  const out = Array.from(text);
+function maskNonCode(text, file, options = {}) {
+  const keepLiterals = options.keepLiterals === true;
+  const out = text.split("");
   const length = text.length;
   const REGEX_KEYWORDS = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
   const REGEX_PRECEDERS = new Set(["", "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
@@ -328,6 +335,9 @@ function maskNonCode(text, file) {
   };
   const blank = (from, to) => {
     for (let at = from; at < to; at += 1) if (out[at] !== "\n") out[at] = " ";
+  };
+  const blankLiteral = (from, to) => {
+    if (!keepLiterals) blank(from, to);
   };
 
   function scanTemplate() {
@@ -341,11 +351,11 @@ function maskNonCode(text, file) {
       }
       if (char === "`") {
         index += 1;
-        blank(start, index);
+        blankLiteral(start, index);
         return;
       }
       if (char === "$" && text[index + 1] === "{") {
-        blank(start, index);
+        blankLiteral(start, index);
         index += 2;
         scanCode(true);
         // scanCode returns just past the closing brace; resume blanking template text from there.
@@ -366,11 +376,11 @@ function maskNonCode(text, file) {
       }
       if (char === "`") {
         index += 1;
-        blank(start, index);
+        blankLiteral(start, index);
         return;
       }
       if (char === "$" && text[index + 1] === "{") {
-        blank(start, index);
+        blankLiteral(start, index);
         index += 2;
         scanCode(true);
         return scanTemplateRest(index);
@@ -392,7 +402,7 @@ function maskNonCode(text, file) {
       if (char === "\n") fail("unterminated string literal", start);
       if (char === quote) {
         index += 1;
-        blank(start, index);
+        blankLiteral(start, index);
         return;
       }
       index += 1;
@@ -503,8 +513,17 @@ function maskNonCode(text, file) {
 
 const DARWIN_SKIP_IF = /^\.skipIf\(\s*process\.platform\s*!==\s*(["'])darwin\1\s*\)/;
 
+/*
+FNXC:CccPlanningProof 2026-10-14-09:32:
+Errata E1-2 and E1-2b. The runner sets the PostgreSQL skip flag in the environment of every command that does not declare needsPostgres, so a test file listed under such a command that READS the flag could return early and pass without testing anything. The policy therefore refuses the flag name anywhere in such a file except a comment (a comment cannot read an environment): in code, in a string such as `process.env["NAME"]`, in a template. A needsPostgres file may name the flag, because the runner never sets it for those commands, and may use exactly one skip-shaped form, the existing idiom `const pgDescribe = PG_AVAILABLE ? describe : describe.skip;` (packages/core/src/__tests__/postgres/schema-applier.test.ts:92-97). Its runtime closure (zero skipped, every expected name passed) is the backstop.
+*/
+const PG_SKIP_FLAG_NAME = "FUSION_PG_TEST_SKIP";
+const PG_DESCRIBE_IDIOM = /\bconst\s+pgDescribe\s*=\s*PG_AVAILABLE\s*\?\s*describe\s*:\s*describe\s*\.\s*skip\s*;/g;
+/** A skip or todo modifier read off a test-runner API without being called (`describe.skip` as a value, `it.concurrent.skip`, a tagged template). A call is caught by the first rule. */
+const BARE_SKIP_REFERENCE = /\b(?:it|test|describe|suite|bench)(?:\s*\.\s*(?:concurrent|sequential|only|each|fails|shuffle|random))*\s*\.\s*(skip|todo)\b/g;
+
 /**
- * Static skip policy for a planning test file (contract section 2.20): the only allowed skip form is `skipIf(process.platform !== "darwin")`, and only in a file tagged `platform: "darwin"`; `pgDescribe` (which collapses to `describe.skip` when no server answers) only in a file tagged `needsPostgres`. Skip-shaped text inside comments, strings, template text and regular expressions is ignored.
+ * Static skip policy for a planning test file (contract section 2.20, errata E1-2/E1-2b/E1-7): the only allowed skip form is `skipIf(process.platform !== "darwin")`, and only in a file tagged `platform: "darwin"`; `pgDescribe` (which collapses to `describe.skip` when no server answers) only in a file tagged `needsPostgres`, where the single idiom above is also allowed; the PostgreSQL skip flag name only in a file tagged `needsPostgres` (or in a comment). Skip-shaped text inside comments, strings, template text and regular expressions is ignored, except for the flag name, which is also refused inside strings and templates.
  * @param {string} fileText
  * @param {{ file: string, platform: "any" | "darwin", needsPostgres: boolean }} input
  */
@@ -514,9 +533,19 @@ export function assertCccPlanningSuiteSkipPolicy(fileText, input) {
   const refuse = (at, reason) => {
     throw new CccPlanningProofError(CCC_PLANNING_INVENTORY_INVALID, `${input.file}:${lineOf(at)}: ${reason}`);
   };
+  const allowedIdioms = input.needsPostgres ? [...code.matchAll(PG_DESCRIBE_IDIOM)].map((match) => [match.index, match.index + match[0].length]) : [];
+  const insideAllowedIdiom = (at) => allowedIdioms.some(([from, to]) => at >= from && at < to);
 
   for (const match of code.matchAll(/\.\s*(skip|todo)\s*(?:\(|\.\s*each\b|\.\s*(?:concurrent|sequential)\b)/g)) {
+    if (insideAllowedIdiom(match.index)) continue;
     refuse(match.index, `.${match[1]}() is not an allowed skip form in a planning suite`);
+  }
+  for (const match of code.matchAll(BARE_SKIP_REFERENCE)) {
+    if (insideAllowedIdiom(match.index)) continue;
+    refuse(
+      match.index,
+      `a bare .${match[1]} reference is not an allowed skip form in a planning suite${input.needsPostgres ? " (only 'const pgDescribe = PG_AVAILABLE ? describe : describe.skip;' is allowed)" : ""}`,
+    );
   }
   for (const match of code.matchAll(/\b(skip|todo)\s*:\s*(?!false\b)/g)) {
     refuse(match.index, `a '${match[1]}' test option is not an allowed skip form in a planning suite`);
@@ -540,6 +569,11 @@ export function assertCccPlanningSuiteSkipPolicy(fileText, input) {
   if (!input.needsPostgres) {
     for (const match of code.matchAll(/\bpgDescribe\b/g)) {
       refuse(match.index, "pgDescribe collapses to describe.skip without a server and is only allowed in a file tagged needsPostgres");
+    }
+    const withLiterals = maskNonCode(fileText, input.file, { keepLiterals: true });
+    const flagAt = withLiterals.indexOf(PG_SKIP_FLAG_NAME);
+    if (flagAt !== -1) {
+      refuse(flagAt, `${PG_SKIP_FLAG_NAME} is set by the runner for every command without needsPostgres, so a test that reads it can pass without testing anything; the name is only allowed in a file tagged needsPostgres or in a comment`);
     }
   }
 }
