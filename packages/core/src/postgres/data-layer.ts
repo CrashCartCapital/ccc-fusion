@@ -208,6 +208,15 @@ export interface RunAuditEventInput {
   readonly target: string;
   readonly metadata?: Record<string, unknown> | null;
   readonly campaign?: RunAuditCampaignEvent;
+  /**
+   * FNXC:CccPlanningRuns 2026-10-14-09:00:
+   * Optional deterministic id for request-to-code planning events (D39). It must match
+   * `/^ccc-plan-event-[0-9a-f]{64}$/` and is never combined with `campaign`. With it the
+   * insert is idempotent: a replay with the same content (timestamp aside) returns the
+   * persisted event, and different content under the same id throws
+   * `RunAuditEventCollisionError`. Without it, behaviour is unchanged (random id).
+   */
+  readonly eventId?: string;
 }
 
 export interface RunAuditCampaignEvent {
@@ -350,6 +359,14 @@ export async function recordRunAuditEventWithinTransaction(
   if (projectId !== undefined && !explicitProjectId) {
     throw new TypeError("run-audit event explicit projectId must be a non-blank string");
   }
+  if (input.eventId !== undefined) {
+    if (input.campaign !== undefined) {
+      throw new TypeError("run-audit event eventId is never combined with a campaign event");
+    }
+    if (typeof input.eventId !== "string" || !CCC_PLANNING_EVENT_ID_PATTERN.test(input.eventId)) {
+      throw new TypeError("run-audit event eventId must match /^ccc-plan-event-[0-9a-f]{64}$/");
+    }
+  }
   const campaign = input.campaign ? normalizeCampaignEvent(input.campaign) : undefined;
   if (campaign && explicitProjectId !== undefined && explicitProjectId !== campaign.binding.projectId) {
     throw new CccCampaignContextError("run-audit event explicit projectId must match campaign binding projectId");
@@ -358,7 +375,7 @@ export async function recordRunAuditEventWithinTransaction(
     ? requireCanonicalCampaignTimestamp(input.timestamp)
     : (input.timestamp ?? new Date().toISOString());
   const event: RunAuditEvent = {
-    id: campaign ? campaignRunAuditEventId(campaign.eventKey) : randomUUID(),
+    id: campaign ? campaignRunAuditEventId(campaign.eventKey) : (input.eventId ?? randomUUID()),
     timestamp,
     taskId: input.taskId ?? null,
     agentId: input.agentId,
@@ -369,6 +386,10 @@ export async function recordRunAuditEventWithinTransaction(
     metadata: input.metadata ?? null,
     ...(campaign ? { campaign } : {}),
   };
+
+  if (input.eventId !== undefined) {
+    return recordPlanningRunAuditEvent(tx, event, input.eventId, explicitProjectId);
+  }
 
   if (!campaign) {
     await tx.insert(schema.project.runAuditEvents).values({
@@ -432,6 +453,58 @@ export async function recordRunAuditEventWithinTransaction(
     throw new RunAuditEventCollisionError(campaign.eventKey);
   }
   return existingEvent;
+}
+
+const CCC_PLANNING_EVENT_ID_PATTERN = /^ccc-plan-event-[0-9a-f]{64}$/;
+
+/**
+ * FNXC:CccPlanningRuns 2026-10-14-09:00:
+ * D39 deterministic planning audit event. Reuses the campaign path's shape: INSERT ... ON
+ * CONFLICT DO NOTHING RETURNING, then re-read by (project_id, id) and compare. The comparison
+ * omits `timestamp` because a replay happens at a later clock; everything else must match or
+ * the existing `RunAuditEventCollisionError` is thrown. An equal replay returns the persisted
+ * event, including its original timestamp.
+ */
+async function recordPlanningRunAuditEvent(
+  tx: DbTransaction,
+  event: RunAuditEvent,
+  eventId: string,
+  explicitProjectId: string | undefined,
+): Promise<RunAuditEvent> {
+  const inserted = await tx.insert(schema.project.runAuditEvents).values({
+    id: event.id,
+    timestamp: event.timestamp,
+    taskId: event.taskId,
+    agentId: event.agentId,
+    runId: event.runId,
+    domain: event.domain,
+    mutationType: event.mutationType,
+    target: event.target,
+    metadata: event.metadata,
+    ...(explicitProjectId === undefined ? {} : {projectId: explicitProjectId}),
+  }).onConflictDoNothing().returning();
+  if (inserted.length > 0) return event;
+
+  const projectScope = explicitProjectId === undefined
+    ? sql`COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__')`
+    : sql`${explicitProjectId}`;
+  const existingRows = await tx.select().from(schema.project.runAuditEvents).where(and(
+    eq(schema.project.runAuditEvents.id, eventId),
+    sql`${schema.project.runAuditEvents.projectId} = ${projectScope}`,
+  ));
+  const existing = existingRows[0];
+  if (!existing) throw new RunAuditEventCollisionError(eventId);
+  const existingEvent = rowToRunAuditEvent(existing);
+  if (canonicalCccPrdJson(planningRunAuditComparable(existingEvent))
+    !== canonicalCccPrdJson(planningRunAuditComparable(event))) {
+    throw new RunAuditEventCollisionError(eventId);
+  }
+  return existingEvent;
+}
+
+function planningRunAuditComparable(event: RunAuditEvent): Record<string, unknown> {
+  const { timestamp: _timestamp, ...comparable } = runAuditComparable(event);
+  return comparable;
 }
 
 function assertCampaignEventMatchesBinding(

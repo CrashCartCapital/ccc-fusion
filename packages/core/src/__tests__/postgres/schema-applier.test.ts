@@ -83,6 +83,8 @@ import {
   CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
   CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
   CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+  CCC_PLANNING_RUNS_VERSION,
+  CCC_PLANNING_ARTIFACT_GUARD_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -228,7 +230,7 @@ describe("schema-applier: immutable migration identities", () => {
     expect(CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION).toBe("0039");
     expect(CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION).toBe("0040");
     expect(CCC_PRD_IMPORT_STOPPED_STATE_VERSION).toBe("0041");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0041");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0043");
     const applierSource = readFileSync(
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
@@ -246,6 +248,11 @@ describe("schema-applier: immutable migration identities", () => {
     // campaign keeps re-projecting its task directories.
     expect(applierSource).toContain("0041_ccc_prd_import_stopped_state.sql");
     expect(applierSource).toMatch(/cccPrdImportStoppedStateAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_PRD_IMPORT_STOPPED_STATE_VERSION\s*,?\s*\)/);
+    // FNXC:CccPlanningRuns 2026-10-14: the request-to-code anchor and artifact guard follow 0041.
+    expect(CCC_PLANNING_RUNS_VERSION).toBe("0042");
+    expect(CCC_PLANNING_ARTIFACT_GUARD_VERSION).toBe("0043");
+    expect(applierSource).toContain("0042_ccc_planning_runs.sql");
+    expect(applierSource).toContain("0043_ccc_planning_artifact_guard.sql");
   });
 });
 
@@ -671,7 +678,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 103 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 104 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -693,8 +700,9 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
     // + 1 ccc_effect_receipts table, its authority turn, 3 CCC PRD custody tables,
     // 1 exact-commit proof-attempt table, and 2 aggregate execution-authorization tables.
+    // + 1 ccc_planning_runs request-to-code anchor (FNXC:CccPlanningRuns 2026-10-14, migration 0042).
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(103);
+    expect(bySchema.project).toBe(104);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1574,6 +1582,18 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       missing relation project.missions.
       */
       CREATE TABLE project.missions (id text PRIMARY KEY);
+      /* FNXC:CccPlanningArtifacts 2026-10-14: 0043 attaches the planning-artifact guard trigger to this pre-existing document surface. */
+      CREATE TABLE project.task_documents (
+        id text PRIMARY KEY,
+        task_id text NOT NULL,
+        key text NOT NULL,
+        content text NOT NULL DEFAULT '',
+        revision integer NOT NULL DEFAULT 1,
+        author text NOT NULL DEFAULT 'user',
+        metadata jsonb,
+        created_at text NOT NULL,
+        updated_at text NOT NULL
+      );
       /* slice_id required before 0023 research provenance unique index can attach. */
       CREATE TABLE project.mission_features (id text PRIMARY KEY, slice_id text);
       CREATE TABLE project.automations (
@@ -1675,6 +1695,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
       CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+      CCC_PLANNING_RUNS_VERSION,
+      CCC_PLANNING_ARTIFACT_GUARD_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1740,6 +1762,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
       CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+      CCC_PLANNING_RUNS_VERSION,
+      CCC_PLANNING_ARTIFACT_GUARD_VERSION,
     ]);
   });
 
@@ -1941,6 +1965,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
       CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+      CCC_PLANNING_RUNS_VERSION,
+      CCC_PLANNING_ARTIFACT_GUARD_VERSION,
     ]);
   });
 
@@ -2020,6 +2046,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
       CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+      CCC_PLANNING_RUNS_VERSION,
+      CCC_PLANNING_ARTIFACT_GUARD_VERSION,
     ]);
   });
 
@@ -2099,6 +2127,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
       CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
+      CCC_PLANNING_RUNS_VERSION,
+      CCC_PLANNING_ARTIFACT_GUARD_VERSION,
     ]);
   });
 });

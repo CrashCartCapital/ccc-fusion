@@ -22,6 +22,28 @@ export type RunAuditMutationType =
   | "task:handoff"
   | "task:handoff-invariant-violation"
   | "overseer:intervention"
+  // FNXC:CccPlanningRuns 2026-10-14-09:00: the 19 request-to-code planning audit literals
+  // (CCC_PLANNING_AUDIT_MUTATION_TYPES), in contract order. Their payloads stay small, and
+  // prompts, outputs and answers live only in planning artifacts.
+  | "ccc-planning:call:reserved"
+  | "ccc-planning:call:dispatched"
+  | "ccc-planning:call:terminal"
+  | "ccc-planning:lineage:created"
+  | "ccc-planning:control"
+  | "ccc-planning:decision:answered"
+  | "ccc-planning:repair-chunk"
+  | "ccc-planning:repair-epoch-closed"
+  | "ccc-planning:review-epoch"
+  | "ccc-planning:fetch:reserved"
+  | "ccc-planning:fetch:settled"
+  | "ccc-planning:artifact-published"
+  | "ccc-planning:import-intent"
+  | "ccc-planning:import-linked"
+  | "ccc-planning:live-execution-released"
+  | "ccc-planning:state"
+  | "ccc-planning:writer-refused"
+  | "ccc-planning:campaign-unmapped"
+  | "ccc-planning:build-baseline"
   | (string & {});
 
 /** Complete immutable provenance for a campaign-bound run-audit receipt. */
