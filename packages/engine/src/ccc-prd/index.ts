@@ -35,8 +35,16 @@ export {
 export type { CccPrdQuoteMatchPolicy } from "./anchor-resolver.js";
 export type { CccPrdFuzzyQuoteReviewNotice } from "./chunk-verification.js";
 export type { CccPrdQuoteReview } from "./chunk-orchestrator.js";
-export { compileCccPrdPacket, validateCccPrdPacket, validateNeoCandidate } from "./compiler.js";
-export type { CompileCccPrdInput } from "./compiler.js";
+export {
+  compileCccPrdPacket,
+  diagnoseCccPrdProductGraphAdmission,
+  validateCccPrdPacket,
+  validateNeoCandidate,
+} from "./compiler.js";
+export type { CccPrdProductGraphAdmissionInput, CompileCccPrdInput } from "./compiler.js";
+// Planning (G4 and the import bridge) reuses the freeze path's packet writer.
+export { writeCccPrdPacketFiles } from "./intake.js";
+export type { CccPrdPacketSourceInput } from "./intake.js";
 export {
   CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
   CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_PURPOSE,
