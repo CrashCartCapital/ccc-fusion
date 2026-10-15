@@ -1,15 +1,17 @@
 /*
-FNXC:CccPlanningInstalledRuntime 2026-10-14-18:57:
+FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
 Installed-runtime receipt for the planning proof (card IP, CONTRACT-v3.3 section 3.2 IP, section 2.20, D26, D48, 0.25; ADR D Q2). It packs the CLI from a committed tree, installs the tarball with `--ignore-scripts` under an isolated HOME, and writes `ccc-planning.installed-runtime.v1`. Four claims are derived from bytes and never assumed:
 - `distManifestSha256` is the SHA-256 of the canonical JSON of the sorted `[relativePath, sha256]` pairs of every installed js file under `dist`, so one changed byte in one installed file changes it.
 - `piAi.workspacePatch` is read from the installed pi-ai `openai-completions.js`: the pnpm patch adds the `identitySubstantive` marker, an npm install of the registry copy does not carry it. (CCC_PI_AI_PATCH_MARKER is pinned to the checked-in patch by a test.)
 - `piAi.shipping` is `external` only when the packed manifest lists pi-ai as an exactly pinned runtime dependency, no tsup `noExternal` rule would bundle it, and the packed receipt adapter still imports it instead of inlining it.
 - `piAi.keepaliveModelSource` is always `fusion-receipt-adapter` and is refused unless the installed adapter exists: the keepalive model rule lives in Fusion's adapter (`dist/ccc-route-receipt-adapter.js`), not in a pi-ai patch the packed install does not carry.
 The verifier recomputes every digest from the installed tree and refuses unknown or missing keys. It cannot see the tsup config, so for `shipping` it uses the packed manifest and the adapter bytes; the capture step additionally applies the `noExternal` rules.
+
+Layout (E9 IP item 1, section 4.2 step 1 literally: `node scripts/ccc-planning-install-runtime.mjs "$ROOT/install"`): the argument is the INSTALL directory and the runtime root is its parent. fn lands at `<installDir>/node_modules/.bin/fn`, the packed tarball in `<root>/evidence/pack`, HOME at `<root>/home`, and the receipt at `<root>/evidence/installed-runtime.json`. Only the install directory must be missing or empty (the root may already hold other things), and the run refuses before any git, pnpm or npm step when the receipt file already exists.
 */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -443,20 +445,46 @@ async function defaultReadNoExternal(input) {
   return parseCccCliNoExternalRules(await readFile(path.join(path.resolve(input.cliRoot), "tsup.config.ts"), "utf8"));
 }
 
-async function assertEmptyInstallRoot(root) {
+/** Where the planning proof puts everything, from the install directory step 1 receives (its parent is the runtime root). */
+export function resolveCccPlanningInstalledRuntimePaths(installDirInput) {
+  if (typeof installDirInput !== "string" || installDirInput === "") throw invalid("install", "the install directory is required");
+  const installDir = path.resolve(installDirInput);
+  const root = path.dirname(installDir);
+  return {
+    root,
+    installDir,
+    packDir: path.join(root, "evidence", "pack"),
+    homeDir: path.join(root, "home"),
+    evidenceDir: path.join(root, "evidence"),
+    receiptPath: path.join(root, "evidence", "installed-runtime.json"),
+  };
+}
+
+async function assertEmptyInstallDir(installDir) {
   let entries;
   try {
-    entries = await readdir(root);
+    entries = await readdir(installDir);
   } catch (error) {
     if (error?.code === "ENOENT") return;
-    throw invalid("install", `cannot read the install root ${root}: ${error.message}`);
+    throw invalid("install", `cannot read the install directory ${installDir}: ${error.message}`);
   }
-  if (entries.length > 0) throw invalid("install", `the install root ${root} is not empty`);
+  if (entries.length > 0) throw invalid("install", `the install directory ${installDir} is not empty`);
+}
+
+async function assertNoEarlierReceipt(receiptPath) {
+  try {
+    await lstat(receiptPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw invalid("receipt", `cannot check ${receiptPath}: ${error.message}`);
+  }
+  throw invalid("receipt", `${receiptPath} already exists; a receipt is written once, so use a fresh runtime root`);
 }
 
 /**
- * Refuse a dirty tracked tree, read provenance and toolchain, then pack, install and capture.
- * Everything that can refuse runs before the build starts. `deps` replaces git, the toolchain read, the tsup read, the pack step and the capture.
+ * Refuse a used install directory, an earlier receipt and a dirty tracked tree, read provenance and toolchain, then pack, install and capture.
+ * Everything that can refuse runs before the build starts. `input.installDir` is step 1's argument (its parent is the runtime root).
+ * `deps` replaces git, the toolchain read, the tsup read, the pack step and the capture.
  */
 export async function prepareCccPlanningInstalledRuntime(input, deps = {}) {
   const resolved = {
@@ -467,8 +495,9 @@ export async function prepareCccPlanningInstalledRuntime(input, deps = {}) {
     capture: captureCccPlanningInstalledRuntimeReceipt,
     ...deps,
   };
-  const root = path.resolve(input.root);
-  await assertEmptyInstallRoot(root);
+  const paths = resolveCccPlanningInstalledRuntimePaths(input.installDir);
+  await assertEmptyInstallDir(paths.installDir);
+  await assertNoEarlierReceipt(paths.receiptPath);
   const gitOptions = { cwd: input.repoRoot };
   const status = await resolved.git(["status", "--porcelain", "--untracked-files=no"], gitOptions);
   const gitHead = (await resolved.git(["rev-parse", "HEAD"], gitOptions)).stdout.trim();
@@ -478,13 +507,9 @@ export async function prepareCccPlanningInstalledRuntime(input, deps = {}) {
   if (status.stdout.trim() !== "") {
     throw new CccPlanningInstalledRuntimeError(CCC_PLANNING_INSTALLED_SOURCE_DIRTY, "source", "the tracked source tree has uncommitted changes; an exact candidate must be a committed tree");
   }
-  const layout = {
-    packDir: path.join(root, "evidence", "pack"),
-    installDir: path.join(root, "install"),
-    homeDir: path.join(root, "home"),
-  };
+  const layout = { packDir: paths.packDir, installDir: paths.installDir, homeDir: paths.homeDir };
   const installed = await resolved.packAndInstall({
-    root,
+    root: paths.root,
     cliRoot: input.cliRoot,
     env: allowlistedEnv(),
     layout,

@@ -15,7 +15,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   CCC_INSTALLED_FN_ENV_ALLOWLIST,
@@ -258,6 +258,22 @@ describe("pi-ai shipping from the packed manifest and the tsup rule", () => {
     assert.throws(() => parseCccCliNoExternalRules("export default { noExternal: [someRule, /^@fusion\\//] };"), (error) => error.code === CCC_PLANNING_INSTALLED_RUNTIME_INVALID);
     assert.deepEqual(parseCccCliNoExternalRules("export default { noExternal: ['a', /^@b\\//u] };").map(String), ["a", "/^@b\\//u"]);
   });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 5 (mutant I27, fail-open): a tsup config whose noExternal is not a literal array would parse as an empty rule list, and an empty list makes `shipping` come out "external". Without a literal array the parser must refuse instead.
+  */
+  test("refuses a tsup config with no literal noExternal array instead of reading it as an empty rule list", () => {
+    for (const text of ["export default { noExternal: rules };", "export default { noExternal: buildRules() };", "export default { entry: ['src/bin.ts'] };", ""]) {
+      assert.throws(
+        () => parseCccCliNoExternalRules(text),
+        (error) => error.code === CCC_PLANNING_INSTALLED_RUNTIME_INVALID && error.field === "noExternal",
+        JSON.stringify(text),
+      );
+    }
+    assert.deepEqual(parseCccCliNoExternalRules("export default { noExternal: [] };"), [], "an explicit empty literal array is still a readable config");
+    assert.deepEqual(parseCccCliNoExternalRules("export default { noExternal: ['a'] };"), ["a"]);
+  });
 });
 
 describe("installed runtime receipt capture", () => {
@@ -328,6 +344,33 @@ describe("installed runtime receipt capture", () => {
       await rejectsWith(captureCccPlanningInstalledRuntimeReceipt(captureInput(fixture)), CCC_PLANNING_INSTALLED_RUNTIME_INVALID, "piAi.shipping");
     });
     await withScratch("ccc-ip-capture-adapter-ok-", async (root) => {
+      const fixture = await makeInstall(root);
+      assert.equal((await captureCccPlanningInstalledRuntimeReceipt(captureInput(fixture))).piAi.keepaliveModelSource, "fusion-receipt-adapter");
+    });
+  });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 5 (mutant I9b): an installed adapter that lacks the terminal route receipt rule must not be admitted as `keepaliveModelSource`. Each half of the rule (the api name and the trailing-comment prefix) is removed on its own, so the check cannot shrink to one marker.
+  */
+  test("refuses to capture an installed adapter that lacks the terminal route receipt rule, whichever half is missing", async () => {
+    const withoutRule = [
+      ["api name", ADAPTER_SOURCE.replaceAll("ccc-terminal-route-receipt.v1", "ccc-other-api.v1")],
+      ["trailing comment prefix", ADAPTER_SOURCE.replaceAll("x-omniroute-", "x-other-")],
+    ];
+    for (const [label, source] of withoutRule) {
+      await withScratch("ccc-ip-capture-rule-", async (root) => {
+        const fixture = await makeInstall(root);
+        await writeFile(fixture.adapterPath, source);
+        await assert.rejects(captureCccPlanningInstalledRuntimeReceipt(captureInput(fixture)), (error) => {
+          assert.equal(error.code, CCC_PLANNING_INSTALLED_RUNTIME_INVALID, `${label}: ${error.message}`);
+          assert.equal(error.field, "piAi.keepaliveModelSource", label);
+          assert.match(error.message, /terminal route receipt rule/u, label);
+          return true;
+        });
+      });
+    }
+    await withScratch("ccc-ip-capture-rule-ok-", async (root) => {
       const fixture = await makeInstall(root);
       assert.equal((await captureCccPlanningInstalledRuntimeReceipt(captureInput(fixture))).piAi.keepaliveModelSource, "fusion-receipt-adapter");
     });
@@ -512,19 +555,19 @@ describe("prepare refuses before building and captures provenance first", () => 
   test("refuses a tracked-dirty source tree before the pack and install step runs", async () => {
     const dirty = fakeDeps({ dirty: true });
     await rejectsWith(
-      prepareCccPlanningInstalledRuntime({ root: "/scratch/root", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, dirty.deps),
+      prepareCccPlanningInstalledRuntime({ installDir: "/scratch/root/install", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, dirty.deps),
       "CCC_PLANNING_INSTALLED_SOURCE_DIRTY",
     );
     assert.ok(!dirty.calls.includes("packAndInstall"), "the build never started");
     assert.ok(!dirty.calls.includes("capture"));
     const clean = fakeDeps();
-    assert.deepEqual(await prepareCccPlanningInstalledRuntime({ root: "/scratch/root", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, clean.deps), { marker: "captured" });
+    assert.deepEqual(await prepareCccPlanningInstalledRuntime({ installDir: "/scratch/root/install", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, clean.deps), { marker: "captured" });
     assert.equal(clean.calls.filter((call) => call === "packAndInstall").length, 1);
   });
 
   test("reads the git status, head and tree and the toolchain before the build and hands them to the capture", async () => {
     const { calls, deps } = fakeDeps();
-    await prepareCccPlanningInstalledRuntime({ root: "/scratch/root", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, deps);
+    await prepareCccPlanningInstalledRuntime({ installDir: "/scratch/root/install", cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, deps);
     const build = calls.indexOf("packAndInstall");
     assert.ok(build > 0);
     assert.deepEqual(calls.slice(0, build).sort(), ["git rev-parse HEAD", "git rev-parse HEAD^{tree}", "git status --porcelain --untracked-files=no", "noExternal", "toolchain"].sort());
@@ -536,6 +579,46 @@ describe("prepare refuses before building and captures provenance first", () => 
       homeDir: path.join("/scratch/root", "home"),
     });
     assert.equal(calls.input.cliRoot, "/repo/packages/cli");
+    assert.equal(calls.input.root, "/scratch/root", "the runtime root is the parent of the install directory");
+  });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 1 (section 4.2 step 1, literal): `node scripts/ccc-planning-install-runtime.mjs "$ROOT/install"` passes the INSTALL directory. fn lands at `<installDir>/node_modules/.bin/fn`, the pack at `<root>/evidence/pack`, HOME at `<root>/home`, and the receipt at `<root>/evidence/installed-runtime.json`, which also must not exist yet. Only the install directory must be empty: the runtime root may already hold other things.
+  */
+  test("refuses before any step when the receipt file next to the install directory already exists, and runs without it", async () => {
+    await withScratch("ccc-ip-prepare-receipt-", async (scratch) => {
+      const runtimeRoot = path.join(scratch, "ROOT");
+      const receiptPath = path.join(runtimeRoot, "evidence", "installed-runtime.json");
+      await put(receiptPath, "an earlier receipt\n");
+      const input = { installDir: path.join(runtimeRoot, "install"), cliRoot: "/repo/packages/cli", repoRoot: "/repo" };
+      const refused = fakeDeps();
+      await rejectsWith(prepareCccPlanningInstalledRuntime(input, refused.deps), CCC_PLANNING_INSTALLED_RUNTIME_INVALID, "receipt");
+      assert.deepEqual(refused.calls, [], "no git, toolchain, pack or install step ran");
+      assert.equal(await readFile(receiptPath, "utf8"), "an earlier receipt\n", "the earlier receipt is untouched");
+      const oldShape = fakeDeps();
+      await rejectsWith(prepareCccPlanningInstalledRuntime({ root: runtimeRoot, cliRoot: "/repo/packages/cli", repoRoot: "/repo" }, oldShape.deps), CCC_PLANNING_INSTALLED_RUNTIME_INVALID, "install");
+      assert.deepEqual(oldShape.calls, [], "an input without installDir is refused by name, before any step");
+      await rm(receiptPath);
+      const clean = fakeDeps();
+      assert.deepEqual(await prepareCccPlanningInstalledRuntime(input, clean.deps), { marker: "captured" });
+      assert.equal(clean.calls.filter((call) => call === "packAndInstall").length, 1);
+    });
+  });
+
+  test("checks only the install directory for emptiness: a runtime root that holds other things is fine, a used install directory is not", async () => {
+    await withScratch("ccc-ip-prepare-empty-", async (scratch) => {
+      const runtimeRoot = path.join(scratch, "ROOT");
+      await put(path.join(runtimeRoot, "target", "keep.txt"), "the runtime root already holds other things\n");
+      const input = { installDir: path.join(runtimeRoot, "install"), cliRoot: "/repo/packages/cli", repoRoot: "/repo" };
+      const clean = fakeDeps();
+      assert.deepEqual(await prepareCccPlanningInstalledRuntime(input, clean.deps), { marker: "captured" });
+      assert.equal(clean.calls.input.root, runtimeRoot);
+      await put(path.join(input.installDir, "stale.txt"), "leftover\n");
+      const busy = fakeDeps();
+      await rejectsWith(prepareCccPlanningInstalledRuntime(input, busy.deps), CCC_PLANNING_INSTALLED_RUNTIME_INVALID, "install");
+      assert.deepEqual(busy.calls, [], "nothing ran against a used install directory");
+    });
   });
 });
 
@@ -597,11 +680,24 @@ describe("shared installed CLI helpers", () => {
     });
   });
 
-  test("refuses extra environment names that are credentials, PORT, preload hooks or the isolation variables, and accepts the names it is meant for", () => {
+  test("refuses every extra environment name outside the allowlist DATABASE_URL, FUSION_HOME and TMPDIR, and accepts those three", () => {
     const home = "/scratch/home";
-    for (const name of ["OMNIROUTE_API_KEY", "ANTHROPIC_API_KEY", "GH_TOKEN", "AWS_REGION", "OPENAI_BASE_URL", "DB_PASSWORD", "PORT", "NODE_OPTIONS", "VITEST_WORKER_ID", "HOME", "PI_OFFLINE", "NO_COLOR"]) {
+    /*
+    FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+    E9 IP item 3 (ADR D Q2 signature): `extraEnv` is exactly DATABASE_URL, FUSION_HOME and TMPDIR. The first twelve names are the ones the old deny pattern already refused; the rest are the names it let through (a key that does not end in API_KEY, a PAT, a module path, a preload hook, a proxy, a registry, an agent socket) plus the allowlisted parent names, which a caller may not override either.
+    */
+    const refused = [
+      "OMNIROUTE_API_KEY", "ANTHROPIC_API_KEY", "GH_TOKEN", "AWS_REGION", "OPENAI_BASE_URL", "DB_PASSWORD", "PORT", "NODE_OPTIONS", "VITEST_WORKER_ID", "HOME", "PI_OFFLINE", "NO_COLOR",
+      "OPENROUTER_KEY", "GITHUB_PAT", "NODE_PATH", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "HTTPS_PROXY", "NPM_CONFIG_REGISTRY", "SSH_AUTH_SOCK",
+      "PATH", "LANG", "LC_ALL", "TZ",
+    ];
+    for (const name of refused) {
       assert.throws(() => buildInstalledFnEnv({ home, extraEnv: { [name]: "x" }, parentEnv: {} }), /not allowed/u, name);
     }
+    for (const name of ["DATABASE_URL", "FUSION_HOME", "TMPDIR"]) {
+      assert.equal(buildInstalledFnEnv({ home, extraEnv: { [name]: "/scratch/value" }, parentEnv: {} })[name], "/scratch/value", `${name} is one of the three allowed extras`);
+    }
+    assert.throws(() => buildInstalledFnEnv({ home, extraEnv: { DATABASE_URL: "postgresql://postgres@127.0.0.1:55401/fusion", OPENROUTER_KEY: "x" }, parentEnv: {} }), /not allowed: OPENROUTER_KEY/u, "one bad name among good ones still refuses");
     assert.throws(() => buildInstalledFnEnv({ home: "relative/home", extraEnv: {}, parentEnv: {} }), /absolute/u);
     assert.deepEqual(
       buildInstalledFnEnv({
@@ -754,6 +850,68 @@ describe("pack and install sequence", () => {
       assert.equal((await npmArgs()).length, 1, "a failure other than ENOTCACHED is never retried online");
     });
   });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 1: with an explicit layout the emptiness check belongs to the three directories the sequence writes (pack, install, home), not to the runtime root that merely contains them. The real `$ROOT` already holds other things when step 1 runs, and a stale file in any of the three directories still refuses before any tool starts.
+  */
+  test("an explicit layout checks its own pack, install and home directories, not the runtime root that holds them", async () => {
+    await withScratch("ccc-ip-pack-layout-", async (root) => {
+      const fake = await fakeToolchain(root);
+      const layoutIn = (runtimeRoot) => ({ packDir: path.join(runtimeRoot, "evidence", "pack"), installDir: path.join(runtimeRoot, "install"), homeDir: path.join(runtimeRoot, "home") });
+      const runtimeRoot = path.join(root, "ROOT");
+      await put(path.join(runtimeRoot, "target", "keep.txt"), "other things already live in the runtime root\n");
+      const layout = layoutIn(runtimeRoot);
+      const done = await packAndInstallFusionCli({ root: runtimeRoot, cliRoot: fake.cliRoot, env: childEnv(fake), layout });
+      assert.equal(done.tarballPath, path.join(layout.packDir, "runfusion-fusion-1.2.3.tgz"));
+      assert.equal(done.executablePath, path.join(layout.installDir, "node_modules/.bin/fn"));
+      assert.equal(done.home, layout.homeDir);
+      for (const [key, label] of [["packDir", "pack"], ["installDir", "install"], ["homeDir", "home"]]) {
+        const busyRoot = path.join(root, `busy-${label}`);
+        const busyLayout = layoutIn(busyRoot);
+        await put(path.join(busyLayout[key], "stale.txt"), "leftover\n");
+        await writeFile(fake.log, "");
+        await assert.rejects(
+          packAndInstallFusionCli({ root: busyRoot, cliRoot: fake.cliRoot, env: childEnv(fake), layout: busyLayout }),
+          new RegExp(`${label} directory is not empty`, "u"),
+          label,
+        );
+        assert.deepEqual(await readLog(fake.log), [], `${label}: no tool ran`);
+      }
+    });
+  });
+
+  test("the planning entry layout puts fn inside the install directory it was given and the pack, home and receipt beside it", async () => {
+    await withScratch("ccc-ip-entry-layout-", async (root) => {
+      const fake = await fakeToolchain(root);
+      const runtimeRoot = path.join(root, "ROOT");
+      await put(path.join(runtimeRoot, "target", "keep.txt"), "other things already live in the runtime root\n");
+      const installDir = path.join(runtimeRoot, "install");
+      const captured = [];
+      const result = await prepareCccPlanningInstalledRuntime(
+        { installDir, cliRoot: fake.cliRoot, repoRoot: "/repo", npmMode: "offline", toolCaches: { npmCache: path.join(root, "npm-cache") } },
+        {
+          git: async (args) => ({ stdout: args[0] === "status" ? "" : `${"e".repeat(40)}\n` }),
+          readToolchain: async () => ({ node: "v24.0.0", npm: "11.0.0", pnpm: "10.33.0" }),
+          readNoExternal: async () => [],
+          packAndInstall: (input) => packAndInstallFusionCli({ ...input, env: childEnv(fake) }),
+          capture: async (input) => { captured.push(input); return { marker: "captured" }; },
+        },
+      );
+      assert.deepEqual(result, { marker: "captured" });
+      assert.equal(captured.length, 1);
+      assert.equal(captured[0].executablePath, path.join(installDir, "node_modules/.bin/fn"), "step 3 runs $ROOT/install/node_modules/.bin/fn");
+      assert.equal(captured[0].installedRoot, path.join(installDir, "node_modules/@runfusion/fusion"));
+      assert.equal(captured[0].tarballPath, path.join(runtimeRoot, "evidence", "pack", "runfusion-fusion-1.2.3.tgz"));
+      assert.equal(captured[0].home, path.join(runtimeRoot, "home"));
+      assert.equal((await readFile(captured[0].executablePath, "utf8")).includes("1.2.3"), true, "the fake fn is really there");
+      await assert.rejects(readFile(path.join(installDir, "install", "node_modules", ".bin", "fn")), { code: "ENOENT" }, "no install/install tree");
+      const calls = await readLog(fake.log);
+      const npm = calls.find((call) => call.tool === "npm");
+      assert.equal(npm.cwd, await realpathOf(installDir), "npm installs into the install directory itself");
+      assert.ok(calls.filter((call) => call.tool !== "postpack").every((call) => call.home === path.join(runtimeRoot, "home")), "every step runs under $ROOT/home");
+    });
+  });
 });
 
 describe("planning install entry script", () => {
@@ -786,5 +944,85 @@ describe("planning install entry script", () => {
       assert.match(result.stderr, /install/u);
       await assert.rejects(readFile(marker, "utf8"), { code: "ENOENT" }, "no build tool was started");
     });
+  });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 1: the frozen step-1 command passes `"$ROOT/install"`. A receipt already sitting at `$ROOT/evidence/installed-runtime.json` (the parent of the argument, not a child of it) refuses before the source tree is even read, so no pnpm or npm step starts and the earlier receipt survives.
+  */
+  test("reads its argument as the install directory: a receipt already at the parent's evidence path refuses before any step", async () => {
+    await withScratch("ccc-ip-entry-receipt-", async (root) => {
+      const bin = path.join(root, "bin");
+      const marker = path.join(root, "marker.txt");
+      for (const name of ["corepack", "npm", "pnpm"]) {
+        await put(path.join(bin, name), `#!/bin/sh\necho "$0 $@" >> ${JSON.stringify(marker)}\nexit 3\n`);
+        await chmod(path.join(bin, name), 0o755);
+      }
+      const runtimeRoot = path.join(root, "ROOT");
+      const receiptPath = path.join(runtimeRoot, "evidence", "installed-runtime.json");
+      await put(receiptPath, "an earlier receipt\n");
+      const installDir = path.join(runtimeRoot, "install");
+      const result = runScript([installDir], { PATH: `${bin}${path.delimiter}${process.env.PATH}` });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /CCC_PLANNING_INSTALLED_RUNTIME_INVALID/u);
+      assert.match(result.stderr, /evidence[\\/]installed-runtime\.json/u);
+      assert.match(result.stderr, /already exists/u);
+      assert.equal(await readFile(receiptPath, "utf8"), "an earlier receipt\n", "the earlier receipt is untouched");
+      await assert.rejects(readFile(marker, "utf8"), { code: "ENOENT" }, "no build tool was started");
+      await assert.rejects(readFile(path.join(installDir, "package.json")), { code: "ENOENT" }, "nothing was written into the install directory");
+    });
+  });
+});
+
+describe("card IP inventory and the installed keepalive lane", () => {
+  const cardPath = path.join(repoRoot, "scripts/lib/ccc-planning-proof-inventory/cards/ip.mjs");
+  const laneFile = "scripts/__tests__/ccc-planning-installed-keepalive.test.mjs";
+  const laneText = () => readFile(path.join(repoRoot, laneFile), "utf8");
+  const headerOf = (text) => text.slice(0, text.indexOf("*/"));
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 2: the installed keepalive lane builds the CLI, packs it and `npm install`s the tarball. The D50 offline guard wraps every runner mode, so it cannot run there without a warm npm cache, and it would rewrite packages/cli/package.json in the integration checkout on every `pnpm test:ccc-planning`. It is parent-run (section 4.2 step 0, card LV); the card header carries its four names for that run.
+  */
+  test("keeps the installed keepalive lane out of the runner inventory and lists its four names in the card header", async () => {
+    const card = await import(pathToFileURL(cardPath).href);
+    const commands = [...card.TARGETED, ...card.OFFLINE];
+    assert.ok(commands.length >= 2, "the card still lists its offline commands");
+    for (const command of commands) {
+      assert.ok(!command.files.includes(laneFile), `${command.id} must not run the installed lane`);
+      assert.ok(!command.id.includes("keepalive"), `${command.id}: no keepalive command in the inventory`);
+    }
+    const text = await laneText();
+    const suite = /^describe\("([^"]+)"/mu.exec(text)?.[1];
+    assert.ok(suite, "the lane file has one describe title");
+    const titles = [...text.matchAll(/^\s*test\("([^"]+)"/gmu)].map((match) => match[1]);
+    assert.equal(titles.length, 4, "the lane has four tests");
+    const header = headerOf(await readFile(cardPath, "utf8"));
+    for (const title of titles) {
+      const name = `${suite} > ${title}`;
+      assert.ok(header.includes(name), `the card header lists the parent-run name: ${name}`);
+      for (const command of commands) assert.ok(!command.expectedNames.includes(name), `${command.id} must not expect ${name}`);
+    }
+    assert.match(header, /section 4\.2 step 0/u);
+    assert.match(header, /parent-run/u);
+  });
+
+  /*
+  FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+  E9 IP item 4: arm A drives the sibling bundle `dist/ccc-route-receipt-adapter.js`, not the `bin.js` that `fn` runs (tsup `splitting: false` inlines a separate copy of the adapter and of the D48 selection into bin.js). The arm that runs a session with custom provider equal to defaultProvider through the installed `fn` is deferred to card LV (wave W9). Nothing may claim RED (A) is satisfied by arm A.
+  */
+  test("the installed lane describes arm A as the sibling bundle and defers the fn-path arm to card LV", async () => {
+    const text = await laneText();
+    const header = headerOf(text);
+    assert.match(header, /sibling bundle/u);
+    assert.match(header, /dist\/ccc-route-receipt-adapter\.js/u);
+    assert.match(header, /not the `?bin\.js`? that fn runs/u);
+    assert.match(header, /deferred to card LV/u);
+    assert.match(header, /RED \(A\) is NOT satisfied/u);
+    assert.doesNotMatch(text, /(?<!NOT )satisf(?:y|ies|ied) RED \(A\)/u);
+    const armA = [...text.matchAll(/^\s*test\("(arm A[^"]*)"/gmu)].map((match) => match[1]);
+    assert.equal(armA.length, 1);
+    assert.match(armA[0], /sibling bundle/u);
+    assert.match(armA[0], /not the fn path/u);
   });
 });

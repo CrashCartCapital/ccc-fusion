@@ -1,9 +1,9 @@
 /*
-FNXC:CccInstalledCli 2026-10-14-18:53:
+FNXC:CccInstalledCli 2026-10-14-21:13:
 Shared pack, install and run helpers for the installed Fusion CLI (card IP, CONTRACT-v3.3 section 3.2 IP, ADR D Q2 decision 1). The build, pack, manifest-restore and install sequence is extracted unchanged from `prepareGate2InstalledRuntime` so Gate 2 and the planning installed-runtime proof pack the CLI the same way; Gate 2 keeps its receipt, its schema and its default arguments, and the planning proof opts into the extension points (`layout`, `npmMode`, `toolCaches`) it needs.
 
 Two safety rules live here and nowhere else:
-- `runInstalledFnProcess` and `runInstalledFnJsonCommand` build the child environment from an allowlist (PATH, LANG, LC_ALL, TZ) plus the isolated HOME, so a provider credential, PORT or a VITEST variable in the caller never reaches an installed `fn`. Gate 2's own PRD runner keeps its wider environment; ADR D Q2 rejects reusing it for planning for exactly that reason.
+- `runInstalledFnProcess` and `runInstalledFnJsonCommand` build the child environment from an allowlist (PATH, LANG, LC_ALL, TZ) plus the isolated HOME, so a provider credential, PORT or a VITEST variable in the caller never reaches an installed `fn`. The caller's own `extraEnv` is an allowlist too, exactly `DATABASE_URL`, `FUSION_HOME` and `TMPDIR` (ADR D Q2 signature, E9 IP item 3): any other name is refused, because a deny pattern cannot list every credential, preload or proxy name. Gate 2's own PRD runner keeps its wider environment; ADR D Q2 rejects reusing it for planning for exactly that reason.
 - npm `--offline` is the first choice when a cache is given; the online retry happens only for `offline-first` and only after ENOTCACHED, so a broken registry or a bad tarball is never hidden behind a second attempt.
 */
 import { spawn, spawnSync } from "node:child_process";
@@ -14,10 +14,10 @@ import path from "node:path";
 export const CCC_INSTALLED_FN_ENV_ALLOWLIST = Object.freeze(["PATH", "LANG", "LC_ALL", "TZ"]);
 export const CCC_INSTALLED_CLI_NPM_MODES = Object.freeze(["default", "offline", "offline-first"]);
 
+/** The only names a caller may add to an installed `fn` child through `extraEnv` (ADR D Q2: `Readonly<{ DATABASE_URL?; FUSION_HOME?; TMPDIR? }>`). */
+export const CCC_INSTALLED_FN_EXTRA_ENV_ALLOWLIST = Object.freeze(["DATABASE_URL", "FUSION_HOME", "TMPDIR"]);
+
 const STEP_MAX_BUFFER = 64 * 1024 * 1024;
-/** Names a caller may never push into an installed `fn` through `extraEnv` (credentials, PORT, test-runner state, preload hooks). */
-const FORBIDDEN_EXTRA_ENV =
-  /(?:^|_)(?:API_KEY|TOKEN|SECRET|PASSWORD)$|^(?:OMNIROUTE|ANTHROPIC|OPENAI|GEMINI|GOOGLE|AWS|AZURE|MINIMAX|ZHIPU|GLM)_|^PORT$|^VITEST(?:_|$)|^NODE_OPTIONS$/u;
 
 /**
  * Run one build step to completion and throw with its output on failure.
@@ -39,7 +39,7 @@ export function runCheckedCommand(command, args, options) {
   return result.stdout.trim();
 }
 
-/** The sealed child environment for an installed `fn`: allowlisted names, the isolated home, offline and no colour, then the vetted extras. */
+/** The sealed child environment for an installed `fn`: allowlisted names, the isolated home, offline and no colour, then the extras, which must be one of `CCC_INSTALLED_FN_EXTRA_ENV_ALLOWLIST`. */
 export function buildInstalledFnEnv(input) {
   if (typeof input?.home !== "string" || !path.isAbsolute(input.home)) {
     throw new Error("installed fn home must be an absolute path");
@@ -56,7 +56,7 @@ export function buildInstalledFnEnv(input) {
   env.PI_OFFLINE = "1";
   for (const [name, value] of Object.entries(extraEnv)) {
     if (value === undefined || value === null) continue;
-    if (name === "HOME" || name === "NO_COLOR" || name === "PI_OFFLINE" || FORBIDDEN_EXTRA_ENV.test(name)) {
+    if (!CCC_INSTALLED_FN_EXTRA_ENV_ALLOWLIST.includes(name)) {
       throw new Error(`installed fn extra environment name is not allowed: ${name}`);
     }
     env[name] = String(value);
@@ -126,15 +126,15 @@ export async function runInstalledFnJsonCommand(input) {
   return { exitCode, values, stderr };
 }
 
-async function assertEmptyRoot(root) {
+async function assertEmptyDirectory(directory, label) {
   let entries;
   try {
-    entries = await readdir(root);
+    entries = await readdir(directory);
   } catch (error) {
     if (error?.code === "ENOENT") return;
     throw error;
   }
-  if (entries.length > 0) throw new Error("installed runtime root is not empty");
+  if (entries.length > 0) throw new Error(label === "root" ? "installed runtime root is not empty" : `installed runtime ${label} directory is not empty: ${directory}`);
 }
 
 function resolveLayout(root, layout) {
@@ -156,7 +156,8 @@ function npmInstallArguments(tarballPath, { offline, npmCache }) {
 
 /**
  * Build the CLI package, pack it, restore the packed manifest and `npm install` the tarball into a clean root.
- * Defaults are Gate 2's: `<root>/{pack,install,home}`, plain `npm install`, the caller's `env` plus HOME and NO_COLOR.
+ * Defaults are Gate 2's: `<root>/{pack,install,home}` (the root itself must be empty), plain `npm install`, the caller's `env` plus HOME and NO_COLOR.
+ * An explicit `layout` moves the emptiness check from the root to its own `packDir`, `installDir` and `homeDir`.
  * `npmMode` is "default" | "offline" | "offline-first"; the offline modes pass `--offline` and need `toolCaches.npmCache` because HOME is isolated.
  */
 export async function packAndInstallFusionCli(input) {
@@ -165,8 +166,18 @@ export async function packAndInstallFusionCli(input) {
     throw new Error(`unknown npm mode ${String(npmMode)}`);
   }
   const root = path.resolve(input.root);
-  await assertEmptyRoot(root);
   const { packRoot, installRoot, home } = resolveLayout(root, input.layout);
+  if (input.layout) {
+    /*
+    FNXC:CccInstalledCli 2026-10-14-21:13:
+    E9 IP item 1: with an explicit layout the runtime root may hold other things (the real `$ROOT` does when step 1 runs); the three directories this sequence writes must be missing or empty, so a stale tarball in the pack directory is still refused before the build.
+    */
+    await assertEmptyDirectory(packRoot, "pack");
+    await assertEmptyDirectory(installRoot, "install");
+    await assertEmptyDirectory(home, "home");
+  } else {
+    await assertEmptyDirectory(root, "root");
+  }
   const cliRoot = path.resolve(input.cliRoot);
   await mkdir(packRoot, { recursive: true });
   await mkdir(installRoot, { recursive: true });

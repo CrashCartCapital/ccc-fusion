@@ -1,17 +1,18 @@
 /*
-FNXC:CccPlanningInstalledRuntime 2026-10-14-18:48:
-Card IP installed lane (CONTRACT-v3.3 section 3.2 IP RED "installed lane", section 4.2 step 0, D48, 0.25, challenge 15). PARENT-RUN: it builds the CLI package, packs it, and `npm install`s the tarball with `--ignore-scripts` into a scratch root, so it takes minutes and needs either a warm npm cache or a read-only fetch of public packages from the public registry (the section 5 npm ruling). It installs nothing globally, runs no lifecycle script and edits nothing in the installed tree.
+FNXC:CccPlanningInstalledRuntime 2026-10-14-21:13:
+Card IP installed lane (CONTRACT-v3.3 section 3.2 IP, section 4.2 step 0, D48, 0.25, challenge 15; errata E9 IP items 2 and 4). PARENT-RUN and NOT in the runner inventory: it builds the CLI package, packs it, and `npm install`s the tarball with `--ignore-scripts` into a scratch root, so it takes minutes, rewrites `packages/cli/package.json` for the duration of `pnpm pack`, and needs either a warm npm cache or a read-only fetch of public packages from the public registry (the section 5 npm ruling). It installs nothing globally, runs no lifecycle script and edits nothing in the installed tree.
 
-The set-up tries the offline cache first (`--offline`), and goes to the registry only when the cache cannot satisfy the install (ENOTCACHED). `CCC_PLANNING_INSTALLED_NPM_MODE=offline` forbids the fallback: the run then fails at set-up with the npm error instead of fetching. Under the proof runner the offline network guard (D50) refuses a registry fetch, so run it with a warm cache or directly: `PI_OFFLINE=1 node --test scripts/__tests__/ccc-planning-installed-keepalive.test.mjs`.
+Why it is not in `cards/ip.mjs`: the D50 offline network guard wraps every runner mode, so the registry fallback a cold cache needs is refused there (E9 IP item 2). The parent runs it directly, first, at section 4.2 step 0 and again in card LV: `PI_OFFLINE=1 node --test scripts/__tests__/ccc-planning-installed-keepalive.test.mjs`.
+
+The set-up tries the offline cache first (`--offline`) and goes to the registry only when the cache cannot satisfy the install (ENOTCACHED). `CCC_PLANNING_INSTALLED_NPM_MODE=offline` forbids the fallback: the run then fails at set-up with the npm error instead of fetching.
 
 A loopback fake OmniRoute (127.0.0.1, port 0) emits keepalive chunks that carry a placeholder model, then a content chunk and a finish chunk that carry the upstream model, then the trailing route SSE comments and `[DONE]`:
-- Arm A drives the PACKED `dist/ccc-route-receipt-adapter.js` (the module `pi.ts` selects for every bound route, D48), as the existing publish smoke test does, and must report the true route.
+- Arm A drives the sibling bundle `dist/ccc-route-receipt-adapter.js` of the packed install, as the existing publish smoke test does, and must report the true route. It is not the `bin.js` that fn runs: tsup builds with `splitting: false`, so `bin.js` carries its own inlined copy of the adapter and of the D48 provider selection in `pi.ts` and never imports the sibling entry. Arm A therefore exercises neither the code fn runs nor the provider selection, and RED (A) is NOT satisfied by it.
+- The fn-path arm of RED (A) (a session whose custom provider equals defaultProvider, receipt adapter `terminal-route-sse-comments.v1`, run through the packed and npm-installed fn) is deferred to card LV (wave W9). The packaged CLI exports no session factory and this card may not add a tsup entry. The third test below checks two strings in `bin.js` and nothing more; the engine tests cover the selection itself.
 - Arm B drives the INSTALLED `@earendil-works/pi-ai` `openai-completions` stream directly, the path a route without the adapter would take. With the registry copy (no pnpm patch) it reports the placeholder, which is why the adapter, not the patch, carries the rule. The receipt's `piAi.workspacePatch` is read from the installed file bytes; this test checks that reading against what arm B actually did, in both directions, so a patched registry copy is recorded as `carried` instead of failing.
-Arm A passing is only meaningful because arm B shows the placeholder is real; the third and fourth tests pin the static facts the live run relies on (the bundle selects the adapter, pi-ai ships external and pinned).
+Arm A passing is only meaningful because arm B shows the placeholder is real; the fourth test pins the static fact the live run relies on (pi-ai ships external and pinned).
 
-Gap, stated plainly: arm A exercises the packed adapter module, not a full `createFnAgent` session. The packaged CLI exports no session factory and this card may not add a tsup entry, so the adapter-selection logic in `pi.ts` is checked only as strings in the packed `dist/bin.js`; the engine tests cover the selection itself.
-
-Not measured: the section 4.2 step 0 duration (the card could not run this file, the npm cache lacks the CLI's dependencies and the card may not fetch). The inventory timeout is a generous hang bound, not a measurement.
+Not measured: the section 4.2 step 0 duration (this file was never run by the card: the npm cache lacks the CLI's dependencies and the card may not fetch). Its set-up hook gives up at 3,000,000 ms, which is a hang bound, not a measurement.
 */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
@@ -144,7 +145,7 @@ describe("installed keepalive model rule", () => {
     if (scratch) await rm(scratch, { recursive: true, force: true });
   });
 
-  test("arm A: the packed receipt adapter reports the true model although the keepalive chunks carry a placeholder", () => {
+  test("arm A (sibling bundle dist/ccc-route-receipt-adapter.js, not the fn path): the packed receipt adapter reports the true model although the keepalive chunks carry a placeholder", () => {
     assert.equal(armA.api, "ccc-terminal-route-receipt.v1");
     assert.equal(armA.result.stopReason, "stop", armA.result.errorMessage);
     assert.deepEqual(armA.result.omniRoute, { provider: ROUTE_PROVIDER, model: ROUTE_MODEL }, "the route comes from the trailing comments");
@@ -166,7 +167,7 @@ describe("installed keepalive model rule", () => {
     assert.equal(block.workspacePatch, observedPlaceholder ? "not_carried" : "carried", "the receipt block repeats the observation");
   });
 
-  test("the packed dist ships the adapter entry and selects it by name for bound routes", async () => {
+  test("the packed dist ships the adapter entry, and bin.js carries the adapter id and api name strings (string presence only)", async () => {
     const bin = await readFile(path.join(installed.installedRoot, "dist/bin.js"), "utf8");
     assert.ok(bin.includes("terminal-route-sse-comments.v1"), "bin.js carries the receipt adapter id");
     assert.ok(bin.includes("ccc-terminal-route-receipt.v1"), "bin.js carries the adapter api name");

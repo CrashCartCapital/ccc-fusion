@@ -291,7 +291,7 @@ function fakeHost(options = {}) {
     nextId: options.nextId ?? 41,
     snapshots: options.snapshots ?? [`ccc-planning-serve-lane pid=4242\n${cleanLog(55123)}`],
     taskStatus: options.taskStatus ?? "Running",
-    listener: options.listener ?? "127.0.0.1:55123",
+    listeners: options.listeners ?? [options.listener ?? "127.0.0.1:55123"],
     descendants: options.descendants ?? [],
     calls: [],
     envs: [],
@@ -319,7 +319,7 @@ function fakeHost(options = {}) {
         return reply(JSON.stringify({ [String(argv.at(-1))]: { task: { id: Number(argv.at(-1)), status }, output: state.snapshots[index] } }));
       }
       if (tool === "pueue" && sub === "kill") { state.kills.push(argv); state.taskStatus = "Done"; return reply(); }
-      if (tool === "lsof") return reply(`p4242\nn${state.listener}\n`);
+      if (tool === "lsof") return reply(`p4242\n${state.listeners.map((address) => `n${address}`).join("\n")}\n`);
       if (tool === "pgrep") return state.descendants.length ? reply(`${state.descendants.join("\n")}\n`) : reply("", 1);
       return reply("", 127, `unexpected command ${argv.join(" ")}`);
     },
@@ -417,6 +417,44 @@ describe("serve lane start and stop through a fake Pueue", () => {
     await rejectsLane(startCccPlanningServeLane(laneInput(), foreign.deps), "CCC_PLANNING_SERVE_LISTENER_MISMATCH");
     const ok = fakeHost({ listener: "127.0.0.1:55123" });
     assert.equal((await startCccPlanningServeLane(laneInput(), ok.deps)).port, 55123);
+  });
+
+  /*
+  FNXC:CccPlanningServeLane 2026-10-14-21:13:
+  E9 IP item 5 (mutant S25): the module header promises that a serve pid listening on the announced loopback port AND on any other non-loopback address is refused. The earlier test only covered a single foreign listener, so removing the `every loopback` half survived.
+  */
+  test("refuses a serve pid that listens on the announced loopback port and also on a non-loopback address, with one kill", async () => {
+    for (const extra of ["*:55124", "0.0.0.0:55124", "192.168.1.20:55124"]) {
+      const wide = fakeHost({ listeners: ["127.0.0.1:55123", extra] });
+      await rejectsLane(startCccPlanningServeLane(laneInput(), wide.deps), "CCC_PLANNING_SERVE_LISTENER_MISMATCH");
+      assert.deepEqual(wide.kills, [["pueue", "kill", "41"]], `${extra}: exactly one kill, of this task id`);
+      assert.equal(wide.calls.filter((argv) => argv[0] === "lsof").length, 1, `${extra}: one listener question`);
+    }
+    const loopbackOnly = fakeHost({ listeners: ["127.0.0.1:55123", "[::1]:55124"] });
+    assert.equal((await startCccPlanningServeLane(laneInput(), loopbackOnly.deps)).port, 55123, "a second loopback listener is fine");
+    assert.deepEqual(loopbackOnly.kills, []);
+  });
+
+  /*
+  FNXC:CccPlanningServeLane 2026-10-14-21:13:
+  E9 IP item 5 (mutant S26): a clean bound log without exactly one pid line cannot be tied to the Pueue task, so the lane refuses before it asks lsof anything. The earlier fake lsof answered for any pid, so removing the refusal survived.
+  */
+  test("refuses a clean bound log that carries no single pid line, without asking lsof, with one kill", async () => {
+    const pidLine = (pid) => `ccc-planning-serve-lane pid=${pid}`;
+    const unusable = {
+      "no pid line": cleanLog(55123),
+      "two pid lines": `${pidLine(4242)}\n${pidLine(4243)}\n${cleanLog(55123)}`,
+      "a malformed pid line": `ccc-planning-serve-lane pid=12abc\n${cleanLog(55123)}`,
+    };
+    for (const [label, log] of Object.entries(unusable)) {
+      const host = fakeHost({ snapshots: [log] });
+      await rejectsLane(startCccPlanningServeLane(laneInput(), host.deps), "CCC_PLANNING_SERVE_TASK_FAILED");
+      assert.ok(!host.calls.some((argv) => argv[0] === "lsof"), `${label}: lsof was never asked`);
+      assert.deepEqual(host.kills, [["pueue", "kill", "41"]], `${label}: exactly one kill, of this task id`);
+    }
+    const withPid = fakeHost({ snapshots: [`${pidLine(4242)}\n${cleanLog(55123)}`] });
+    assert.deepEqual(await startCccPlanningServeLane(laneInput(), withPid.deps), { pueueTaskId: 41, port: 55123, pid: 4242 });
+    assert.deepEqual(withPid.kills, []);
   });
 
   test("times out with CCC_PLANNING_SERVE_NOT_BOUND and kills the task, and reports a task that ended early", async () => {
