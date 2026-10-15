@@ -271,8 +271,17 @@ async function runCccTerminalRouteReceiptRequest(
         "non-sse-response",
       );
     }
+    /*
+    FNXC:CccRouteReceiptFailureMarker 2026-10-14-21:09:
+    P1z repair 1 (E8-P item 2). A 2xx with no body (a 204 or 205 naming text/event-stream) is never read either, so its route is unverified: the same receipt-missing marker and non-sse-response detail as a non-SSE 200, settled once and never retried. Without the marker pi.ts read it as the upstream's own error and retried.
+    */
     if (!response.body) {
-      throw new Error("CCC terminal route receipt provider returned no response body");
+      throw terminalRouteFailure(
+        "receipt-missing",
+        "CCC terminal route receipt provider returned no response body",
+        undefined,
+        "non-sse-response",
+      );
     }
     stream.push({ type: "start", partial: output as never });
     const completion = await consumeReceiptAdapterSse(

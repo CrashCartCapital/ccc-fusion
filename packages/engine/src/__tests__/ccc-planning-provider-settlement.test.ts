@@ -35,6 +35,10 @@ Repair 2 (errata E7-P, final). Through the real adapter, any error raised after 
 FNXC:CccPlanningProviderSeam 2026-10-14-20:44:
 Card P1z (errata E8-P items 1-3). A body that fails to process after [DONE] (a data line cut mid-JSON, or a malformed one) and an HTTP 200 whose content type is not text/event-stream both leave the route unverified: no terminal receipt was ever checked. Through the real adapter each settles exactly one route refusal (receipt-missing), never provider-error-event, so the session never reaches pi-stream:2 and the upstream sees one request (probes B1, B2, B3 and A7). Each RED has a control on the same fixture without the failure: B0 (the drifted receipt of B1 with a clean end) settles receipt-mismatch, B5 (a valid data line after [DONE]) settles receipt-missing as before, the missing-receipt case above is B2 without its cut line, the E7-P item 3 case above is B3 without its malformed line, and the HTTP 500 control above is A7 with a non-2xx status, which stays provider-error-event.
 */
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-21:09:
+P1z repair 1 (E8-P item 2). A 2xx with no body is never read either: a 204 or a 205 whose content type is text/event-stream settles one receipt-missing refusal (detail non-sse-response), keys [pi-stream:1], one upstream request, like A7. Controls: a bare 204 with no content type is refused the same way by the content-type check, and the same empty text/event-stream reply with HTTP 503 stays an upstream error that settles provider-error-event and retries on pi-stream:2.
+*/
 
 vi.mock("../skill-resolver.js", () => ({
   resolveSessionSkills: vi.fn(),
@@ -1324,6 +1328,25 @@ describe("a body failure after [DONE] and a non-SSE 200 refuse the route through
       detail: "non-sse-response",
       message: /did not return text\/event-stream/,
     },
+    // P1z repair 1: a 2xx with no body is never read either, whatever content type it names (review probes P01-P03).
+    ...[204, 205].map((status) => ({
+      name: `A8 (HTTP ${status}): a 2xx whose content type is text/event-stream but has no body, never read`,
+      reply: ((_request, response) => {
+        response.writeHead(status, SSE_HEADERS);
+        response.end();
+      }) as LoopbackReply,
+      detail: "non-sse-response",
+      message: /returned no response body/,
+    })),
+    {
+      name: "control A8 (HTTP 204, no content type): refused by the content-type check as before",
+      reply: ((_request, response) => {
+        response.writeHead(204);
+        response.end();
+      }) as LoopbackReply,
+      detail: "non-sse-response",
+      message: /did not return text\/event-stream/,
+    },
   ];
 
   for (const { name, reply, detail, message } of ROUTE_REFUSAL_CASES) it(`${name}, settles one receipt-missing route refusal and never provider-error-event: keys [pi-stream:1], one upstream request`, async () => {
@@ -1381,5 +1404,37 @@ describe("a body failure after [DONE] and a non-SSE 200 refuse the route through
     expect(errorEvent).toMatchObject({ type: "error", reason: "error", cccRouteFailure: "receipt-not-terminal" });
     expect(errorEvent).not.toHaveProperty("cccRouteFailureDetail");
     expect(errorEvent).not.toHaveProperty("cccTransportFailure");
+  });
+
+  it("control A8 (HTTP 503): the same empty text/event-stream reply with a non-2xx status stays an upstream error, settles provider-error-event and the retry advances to pi-stream:2", async () => {
+    const reply: LoopbackReply = (request, response, ordinal) => {
+      if (ordinal === 1) {
+        response.writeHead(503, SSE_HEADERS);
+        response.end();
+        return;
+      }
+      sseReply(receiptComments("minimax", "MiniMax-M3"))(request, response, ordinal);
+    };
+    const run = await observeStreamAndReentry(reply);
+
+    expect(run.first.outcome.ok).toBe(false);
+    expect(outcomeError(run.first.outcome)).not.toBeInstanceOf(CccProviderRouteReceiptError);
+    expect(String(outcomeError(run.first.outcome))).toMatch(/HTTP 503/);
+    const errorEvent = firstAdapterErrorEvent(run);
+    expect(errorEvent).toMatchObject({ type: "error", reason: "error" });
+    expect(errorEvent).not.toHaveProperty("cccRouteFailure");
+    expect(errorEvent).not.toHaveProperty("cccTransportFailure");
+    expect(run.second.outcome.ok).toBe(true);
+    expect(run.settlements.map((input) => ({
+      dispatchKey: input.dispatchKey,
+      outcome: input.outcome,
+      refusalReason: input.refusalReason,
+    }))).toEqual([
+      { dispatchKey: "pi-stream:1", outcome: "proved_failed", refusalReason: "provider-error-event" },
+      { dispatchKey: "pi-stream:2", outcome: "committed", refusalReason: undefined },
+    ]);
+    expect(run.settlements[0]).toMatchObject({ evidenceDigest: refusalDigest("provider-error-event", null) });
+    expect(run.distinctKeys).toEqual(["pi-stream:1", "pi-stream:2"]);
+    expect(run.upstreamRequests).toBe(2);
   });
 });
