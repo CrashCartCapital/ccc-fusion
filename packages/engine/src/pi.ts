@@ -4114,6 +4114,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
    */
   assertCccFusionSubscriptionReady(options);
   const cccProviderAttemptBinding = validateCccProviderAttemptBinding(options.cccProviderAttemptBinding);
+  const cccToolPolicy = cccProviderAttemptBinding?.toolPolicy;
   if (cccProviderAttemptBinding && options.profile !== CCC_FUSION_PROFILE) {
     throw new Error("cccProviderAttemptBinding is only allowed for the ccc-fusion profile");
   }
@@ -4218,7 +4219,13 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   // and resource loading all use the correct root when cwd is a worktree,
   // subdirectory, or any path other than the project root itself.
   const resolvedProjectRoot = getProjectRootFromWorktree(options.cwd) ?? resolvePiExtensionProjectRoot(options.cwd);
-  await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
+  /*
+  FNXC:CccSessionToolPolicy 2026-10-15-05:07:
+  Policy-bound planning and linked writer sessions must not execute discovered project or user extension factories during provider bootstrap. The resource loader's noExtensions flag comes later; skip this discovery before it can execute, while keeping explicit custom-provider registration below.
+  */
+  if (cccToolPolicy === undefined) {
+    await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
+  }
 
   for (const provider of customProviders) {
     try {
@@ -4295,7 +4302,6 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   FNXC:CccSessionToolPolicy 2026-10-14-21:20:
   Card C2 (D11, CONTRACT-v3 section 2.13). A binding with a tool policy closes the session tool set: options.tools and the allowlists stop selecting tools, Pi's built-ins are never created, and the session gets only the policy's tools, the confined ones built over cccConfinement (grep is Fusion's) and the rest from customTools. Any MCP server, and any builtin allowlist, tools allowlist or custom tool outside the policy, is refused here with CCC_SESSION_TOOL_POLICY_REFUSED, before an MCP connection or a session exists. Host extensions, skills and RTK are skipped below, and the final list is checked again after the wrapper chain.
   */
-  const cccToolPolicy = cccProviderAttemptBinding?.toolPolicy;
   const cccPolicyTools = cccToolPolicy
     ? resolveCccPolicySessionTools({
         policy: cccToolPolicy,
