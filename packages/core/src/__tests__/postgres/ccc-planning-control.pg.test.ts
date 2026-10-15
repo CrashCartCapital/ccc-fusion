@@ -15,7 +15,9 @@ import {
   pgDescribe,
   type PgTestHarness,
 } from "../../__test-utils__/pg-test-harness.js";
-import type { AsyncDataLayer } from "../../postgres/data-layer.js";
+import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
+import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
+import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
 import { cccPlanningRuns, type CccPlanningRunInsert } from "../../postgres/schema/ccc-planning.js";
 import {
   cccPlanningBindingHash,
@@ -35,6 +37,7 @@ import {
   answerCccPlanningDecision,
   completeCccPlanningCancellation,
   getCccPlanningRunForTask,
+  proveCccPlanningCallNotDispatched,
   recordCccPlanningBuildControl,
   requestCccPlanningControl,
   resolveCccPlanningRunProject,
@@ -71,16 +74,53 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
   let harness: PgTestHarness;
   let db: PostgresJsDatabase;
   let layer: AsyncDataLayer;
+  let runtimeConnections: PostgresConnections;
+  let runtimeLayer: AsyncDataLayer;
 
   beforeAll(async () => {
     harness = await createTaskStoreForTest({ prefix: "fusion_ccc_planning_l1_control", copyFromGolden: true });
     db = harness.adminDb;
     layer = harness.layer;
+    // Errata E5-L1 item 14: the application's own non-superuser role, bound to PROJECT with the bypass off, so row-level
+    // security is live (the harness layer connects as a superuser and never exercises it).
+    const backend: ResolvedBackend = {
+      mode: "external", runtimeUrl: harness.testUrl, migrationUrl: harness.testUrl, migrationUrlOverridden: false,
+    };
+    runtimeConnections = await createConnectionSetFromUrl(backend, {
+      poolMax: 2, connectTimeoutSeconds: 5, projectId: PROJECT, useRuntimeRole: true,
+    });
+    runtimeLayer = createAsyncDataLayer(runtimeConnections, { projectId: PROJECT });
   });
 
   afterAll(async () => {
+    await runtimeConnections?.close();
     await harness?.teardown();
   });
+
+  async function lockWaiters(): Promise<number> {
+    const rows = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND wait_event_type = 'Lock'
+    `)) as unknown as Array<{ n: number }>;
+    return Number(rows[0]!.n);
+  }
+
+  /** Bounded poll (at most 200 x 25 ms) until `count` backends of this database wait on a lock. */
+  async function awaitLockWaiters(count: number): Promise<number> {
+    let waiters = await lockWaiters();
+    for (let poll = 0; poll < 200 && waiters < count; poll += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      waiters = await lockWaiters();
+    }
+    return waiters;
+  }
+
+  function expireLease(run: Run): Promise<unknown> {
+    return db.execute(sql`
+      UPDATE project.workflow_work_items SET lease_expires_at = ${PAST}
+       WHERE project_id = ${run.projectId} AND id = ${run.workItemId}
+    `);
+  }
 
   let ordinal = 0;
   function next(): number {
@@ -341,8 +381,18 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
       inputs: [expect.objectContaining({ artifactKey: run.questionKey })],
     });
     expect((await events(run.runId, "ccc-planning:decision:answered")).map((row) => row.agent_id)).toEqual(["operator:ryan"]);
-    expect((await events(run.runId, "ccc-planning:artifact-published")).map((row) => row.target))
-      .toEqual([answered.answerArtifactKey]);
+    const published = await events(run.runId, "ccc-planning:artifact-published");
+    expect(published.map((row) => row.target)).toEqual([answered.answerArtifactKey]);
+    // Errata E5-L1 item 11: the answer goes through card A1's publisher, so its audit event has A1's shape exactly.
+    expect(Object.keys(published[0]!.metadata as Row).sort()).toEqual([
+      "artifactKey", "fenceKind", "identityDigest", "inputCount", "kind", "outputDigest", "producerKind", "producerRoleId",
+      "runRevision", "slot", "stageId", "status", "version",
+    ]);
+    expect(published[0]).toMatchObject({
+      agent_id: "ccc-planning-controller",
+      metadata: { identityDigest: (docs[0]!.metadata as Row).identityDigest, producerKind: "operator", fenceKind: "operator",
+        inputCount: 1, slot: "answer1", status: "complete" },
+    });
   });
 
   it("resume from paused moves the run to running and the held work item to runnable; resume of a running run is refused", async () => {
@@ -379,13 +429,14 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
       .toEqual({ controlSeq: 1, appliedDirectly: true });
     expect(await anchor(run)).toMatchObject({ state: "cancelling" });
     expect(await workItem(run)).toMatchObject({ state: "running" });
-    expect((await events(run.runId, "ccc-planning:control"))[0]!.metadata).toMatchObject({ outcome: "deferred-leased" });
+    // Errata E5-L1 item 12: the cancel itself was applied (the run is cancelling); there is no `deferred-leased` outcome.
+    // Why completion waits is recorded beside it.
+    const control = (await events(run.runId, "ccc-planning:control"))[0]!.metadata as Row;
+    expect(control).toMatchObject({ outcome: "applied", cancellation: { completed: false, reason: "live-lease" } });
+    expect(JSON.stringify(control)).not.toContain("deferred-leased");
     expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: false });
 
-    await db.execute(sql`
-      UPDATE project.workflow_work_items SET lease_expires_at = ${PAST}
-       WHERE project_id = ${PROJECT} AND id = ${run.workItemId}
-    `);
+    await expireLease(run);
     expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: true });
     expect(await anchor(run)).toMatchObject({ state: "cancelled" });
     expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
@@ -536,5 +587,124 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
     });
     expect(await anchor(paused)).toMatchObject({ state: "paused", control_request: null, control_seq: 1 });
     expect((await events(paused.runId, "ccc-planning:state")).map((row) => row.agent_id)).toEqual(["ccc-planning-controller"]);
+  });
+
+  /*
+  FNXC:CccPlanningControl 2026-10-14-17:37:
+  Errata E5-L1 items 5, 7, 8 and 14. A pending control blocks every transition except to paused, cancelling or
+  cancelled (ADV-11, ADV-12); only completion reaches cancelled, and only once no lease is live by the database clock
+  and no call of the run is unsettled (ADV-10, D45); the run-project lookup is proved under the runtime role, where
+  row-level security is live.
+  */
+  it("refuses spec_ready -> importing with CONTROL_PENDING while a pause is pending; -> paused still moves and an unpaused twin imports (ADV-12)", async () => {
+    const run = await seedRun();
+    await move(run, "spec_ready");
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "pause", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: false });
+    await expectRefusal(transitionCccPlanningRunState(layer, {
+      runId: run.runId, from: "spec_ready", to: "importing", stateCode: null, fence: run.fence,
+    }), "CCC_PLANNING_CONTROL_PENDING");
+    expect(await anchor(run)).toMatchObject({ state: "spec_ready", control_request: "pause", control_seq: 1 });
+    expect(await events(run.runId, "ccc-planning:state")).toHaveLength(0);
+
+    await transitionCccPlanningRunState(layer, { runId: run.runId, from: "spec_ready", to: "paused", stateCode: null, fence: run.fence });
+    expect(await anchor(run)).toMatchObject({ state: "paused", control_request: null });
+
+    const twin = await seedRun();
+    await move(twin, "spec_ready");
+    await transitionCccPlanningRunState(layer, { runId: twin.runId, from: "spec_ready", to: "importing", stateCode: null, fence: twin.fence });
+    expect(await anchor(twin)).toMatchObject({ state: "importing", control_request: null });
+  });
+
+  it("refuses a transition with CONTROL_PENDING when the pause commits after the caller's read (ADV-11)", async () => {
+    const run = await seedRun();
+    await move(run, "spec_ready");
+    let transition: Promise<unknown> | undefined;
+    let waiters = 0;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`
+        SELECT 1 FROM project.ccc_planning_runs WHERE project_id = ${PROJECT} AND run_id = ${run.runId} FOR UPDATE
+      `);
+      transition = transitionCccPlanningRunState(layer, {
+        runId: run.runId, from: "spec_ready", to: "importing", stateCode: null, fence: run.fence,
+      }).then(() => "resolved", (error: unknown) => error);
+      waiters = await awaitLockWaiters(1);
+      await tx.execute(sql`
+        UPDATE project.ccc_planning_runs
+           SET control_seq = control_seq + 1, control_request = 'pause', control_revision = revision,
+               control_requested_at = ${NOW}, updated_at = ${NOW}
+         WHERE project_id = ${PROJECT} AND run_id = ${run.runId}
+      `);
+    });
+    expect(waiters).toBe(1);
+    expect(await transition!).toMatchObject({ name: "CccPlanningRefusal", code: "CCC_PLANNING_CONTROL_PENDING" });
+    expect(await anchor(run)).toMatchObject({ state: "spec_ready", control_request: "pause" });
+    expect(await events(run.runId, "ccc-planning:state")).toHaveLength(0);
+  });
+
+  it("a caller-supplied now in the future does not complete a cancellation while the lease is live by the database clock", async () => {
+    const run = await seedRun();
+    await move(run, "blocked_provider");
+    await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" });
+    const future = "3000-01-01T00:00:00.000Z";
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId, now: future })).toEqual({ completed: false });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+    expect(await workItem(run)).toMatchObject({ state: "running", lease_owner: LEASE_OWNER });
+
+    await expireLease(run);
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId, now: future })).toEqual({ completed: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+  });
+
+  it("refuses the generic cancelling -> cancelled with STATE_TRANSITION_REFUSED even after the lease expires; completion ends the run (ADV-10)", async () => {
+    const run = await seedRun();
+    await move(run, "blocked_provider");
+    await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" });
+    const generic = () => transitionCccPlanningRunState(layer, {
+      runId: run.runId, from: "cancelling", to: "cancelled", stateCode: "CCC_PLANNING_CANCELLED", fence: null,
+    });
+    await expectRefusal(generic(), "CCC_PLANNING_STATE_TRANSITION_REFUSED");
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+    await expireLease(run);
+    await expectRefusal(generic(), "CCC_PLANNING_STATE_TRANSITION_REFUSED");
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+    expect(await workItem(run)).toMatchObject({ state: "running" });
+
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled", state_code: "CCC_PLANNING_CANCELLED" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled" });
+  });
+
+  it("a cancellation with an unsettled call stays cancelling with DESCENDANTS_UNSETTLED recorded and completes once the call is settled", async () => {
+    const run = await seedRun();
+    const decision = await admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 1, run.fence));
+    expect(decision.kind).toBe("dispatch-permit");
+    await move(run, "blocked_provider");
+    await expireLease(run);
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+    expect((await events(run.runId, "ccc-planning:control"))[0]!.metadata).toMatchObject({
+      outcome: "applied",
+      cancellation: { completed: false, reason: "descendants-unsettled", code: "CCC_PLANNING_DESCENDANTS_UNSETTLED" },
+    });
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: false });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+
+    await proveCccPlanningCallNotDispatched(layer, decision.scope, sha("never-sent"));
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled" });
+  });
+
+  it("resolves a run of another project through the runtime role with row-level security live (E5-L1 item 14)", async () => {
+    const elsewhere = await seedRun({ projectId: OTHER_PROJECT });
+    const visible = await runtimeLayer.transactionImmediate(async (tx) => (await tx.execute(sql`
+      SELECT count(*)::int AS n FROM project.ccc_planning_runs WHERE run_id = ${elsewhere.runId}
+    `)) as unknown as Array<{ n: number }>);
+    expect(Number(visible[0]!.n)).toBe(0);
+    expect(await resolveCccPlanningRunProject(runtimeLayer, { runId: elsewhere.runId })).toEqual({ projectId: OTHER_PROJECT });
+    await expectRefusal(resolveCccPlanningRunProject(runtimeLayer, { runId: elsewhere.runId, projectId: PROJECT }),
+      "CCC_PLANNING_RUN_PROJECT_MISMATCH");
   });
 });

@@ -11,6 +11,11 @@ Every file declares `pgDescribe` blocks, so every entry needs PostgreSQL (`needs
 
 Measured on the M5 Max under parallel-agent load: 11 to 16 s wall for the four files (37 tests). The command timeouts
 are hang bounds over that measurement; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProof 2026-10-14-17:46:
+Repair 1 (errata E5-L1) renames the split test and adds 13 tests (items 3 to 12 and 14), so the name list is 50 names,
+exactly the passing names of the card command. Measured again on the same host at load average 32.8 (1 min): 7 to 8 s
+wall for the four files. The 180 s timeouts stay hang bounds.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -53,7 +58,7 @@ export const OFFLINE = Object.freeze([
     expectedNames: Object.freeze([
       `${LEDGER} > admits pi-stream:11 in one turn key and refuses pi-stream:12 with iteration-cap`,
       `${LEDGER} > admits three turn keys in a fresh lineage and refuses the 4th distinct turn key with dispatch-cap`,
-      `${LEDGER} > a split child inheriting 2 attempts has its 2nd attempt refused; an unsplit sibling lineage admits it`,
+      `${LEDGER} > a split child inheriting 2 attempts has its 2nd attempt refused; a sibling split before any attempt admits it`,
       `${LEDGER} > a repair lineage claimed after the author used 2 attempts inherits 2 and its 2nd attempt is refused`,
       `${LEDGER} > refuses a chunk with DISPATCH_CAP when a repair author has no attempt left and writes nothing; another author is admitted`,
       `${LEDGER} > re-reviews open review nodes with 0 inherited attempts (rv1, rv2) and a 5th chunk is REPAIR_EXHAUSTED`,
@@ -70,6 +75,13 @@ export const OFFLINE = Object.freeze([
       `${LEDGER} > calls the linked-outcome port exactly once before reading a linked run and never for an unlinked one`,
       `${LEDGER} > two stagnant review epochs in a row give stop: true; an improving epoch resets the count`,
       `${LEDGER} > grants one research fetch at a time and charges the settled raw bytes`,
+      `${LEDGER} > refuses an unclaimed repair lineage, an unclaimed review node and a lineage outside its stage; claimed lineages are admitted (ADV-1)`,
+      `${LEDGER} > refuses a repair lineage above CCC_PLANNING_MAX_REPAIR_CHUNKS even with a lineage:created event; the highest allowed ordinal is admitted`,
+      `${LEDGER} > after a repair chunk claims lineages for a role, earlier lineages of that role take no new turn key (ADV-9)`,
+      `${LEDGER} > refuses a repair chunk with UNRECONCILED_DISPATCH while an earlier lineage of the role is dispatched_unknown and writes nothing (ADV-8)`,
+      `${LEDGER} > refuses a settlement whose refusal reason is outside the union with INTERNAL_ERROR and writes nothing (ADV-2)`,
+      `${LEDGER} > an earlier epoch's digest redelivered after a later epoch is a replay that records nothing (ADV-5)`,
+      `${LEDGER} > refuses an audit id over 256 characters or a malformed digest with INTERNAL_ERROR before any write; bounded values are admitted`,
       `${CONTROL} > pause while running sets control_request and the next dispatch is refused control-pending; an unpaused run admits`,
       `${CONTROL} > answering the awaited decision moves the run to running and the held work item to runnable in one transaction`,
       `${CONTROL} > resume from paused moves the run to running and the held work item to runnable; resume of a running run is refused`,
@@ -85,6 +97,12 @@ export const OFFLINE = Object.freeze([
       `${CONTROL} > resolves the run's project and refuses RUN_NOT_FOUND, RUN_AMBIGUOUS and RUN_PROJECT_MISMATCH`,
       `${CONTROL} > returns the custody of a planning task and null for an ordinary task`,
       `${CONTROL} > transitions by CAS on from, derives the awaited decision id, and clears a pending control on pause`,
+      `${CONTROL} > refuses spec_ready -> importing with CONTROL_PENDING while a pause is pending; -> paused still moves and an unpaused twin imports (ADV-12)`,
+      `${CONTROL} > refuses a transition with CONTROL_PENDING when the pause commits after the caller's read (ADV-11)`,
+      `${CONTROL} > a caller-supplied now in the future does not complete a cancellation while the lease is live by the database clock`,
+      `${CONTROL} > refuses the generic cancelling -> cancelled with STATE_TRANSITION_REFUSED even after the lease expires; completion ends the run (ADV-10)`,
+      `${CONTROL} > a cancellation with an unsettled call stays cancelling with DESCENDANTS_UNSETTLED recorded and completes once the call is settled`,
+      `${CONTROL} > resolves a run of another project through the runtime role with row-level security live (E5-L1 item 14)`,
       `${RETENTION} > keeps an old ccc-plan: audit row and deletes an equally old non-planning row on the same task`,
       `${PARITY} > K1 and the SQL function agree on all 400 pairs, and exactly 65 non-identity pairs are allowed`,
       `${PARITY} > refuses a pair outside the table before any write and applies an allowed pair with a state event`,

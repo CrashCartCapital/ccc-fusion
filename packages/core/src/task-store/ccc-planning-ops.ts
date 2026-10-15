@@ -10,7 +10,7 @@ Audit events go through `recordRunAuditEventWithinTransaction` directly, because
 the deterministic `eventId` (errata E1 carry-forward). Metadata never carries an `undefined` value: optional keys are
 added only when present, so a replay compares equal without relying on any normalization in the data layer.
 */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { sql, type SQL } from "drizzle-orm";
 import {
   recordRunAuditEventWithinTransaction,
@@ -26,6 +26,7 @@ import {
   CCC_PLANNING_MAX_REPAIR_CHUNKS,
   CCC_PLANNING_PREFLIGHT_LINEAGES,
   CCC_PLANNING_PREFLIGHT_MAX_CALLS_PER_ATTEMPT,
+  CCC_PLANNING_ROLE_POLICY_FULL_V2,
   CCC_PLANNING_SOURCE_POLICY_I2,
   CCC_PLANNING_STAGNATION_EPOCHS,
   cccPlanningAttemptKey,
@@ -35,13 +36,8 @@ import {
   cccPlanningRole,
   cccPlanningTurnKey,
 } from "../ccc-planning/policy.js";
-import { assessCccRepairChunkFit } from "../ccc-planning/budget-fit.js";
-import {
-  CCC_PLANNING_ARTIFACT_ENVELOPE_SCHEMA,
-  computeCccPlanningEnvelopeIdentityDigest,
-  encodeCccPlanningArtifactContent,
-  encodeCccPlanningArtifactKey,
-} from "../ccc-planning/artifacts.js";
+import { assessCccRepairChunkFit, cccPlanningMaxNodes, countCccPlanningNodes } from "../ccc-planning/budget-fit.js";
+import { publishCccPlanningArtifactWithinTransaction } from "./ccc-planning-artifact-ops.js";
 import {
   CCC_PLANNING_IR_STAGES,
   CCC_PLANNING_RUN_STATES,
@@ -99,6 +95,17 @@ const STATE_CODE_REQUIRED: ReadonlySet<string> = new Set([
   "verification_failed", "failed",
 ]);
 const ROUTE_REFUSALS: ReadonlySet<string> = new Set(["receipt-missing", "receipt-mismatch", "effective-route-drift"]);
+/** The 4-member CccProviderAttemptRefusalReason union (errata E5-L1 item 6): anything else fails closed. */
+const REFUSAL_REASONS: ReadonlySet<string> = new Set([...ROUTE_REFUSALS, "provider-error-event"]);
+/** Audit id strings (errata E5-L1 item 10), the same bound as card A1's envelope fields. */
+const AUDIT_ID_MAX = 256;
+/** The states a pending control may still move a run to (errata E5-L1 item 5, ADV-11/ADV-12). */
+const CONTROL_EXEMPT_TARGETS: ReadonlySet<string> = new Set(["paused", "cancelling", "cancelled"]);
+/** A G7 lineage names its PRD semantic task id, an entity id of the import admission grammar (ccc-prd/import-admission.ts). */
+const SEMANTIC_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u;
+const AUTHOR_REPAIR_LINEAGE_PATTERN = /^repair:([1-9][0-9]{0,8}):(.+)$/u;
+const REVIEW_NODE_LINEAGE_PATTERN = /^(.+):rv([1-9][0-9]{0,8})$/u;
+const LEAF_LINEAGE_PATTERN = /^research:leaf-([1-9][0-9]{0,8})$/u;
 
 type Row = Record<string, unknown>;
 
@@ -286,12 +293,19 @@ async function lockFence(tx: DbTransaction, anchor: AnchorRow, fence: CccPlannin
   if (locked.length !== 1) refuse("CCC_PLANNING_FENCE_STALE", `work item ${fence.workItemId} lease is not current`, "fence");
 }
 
-type PlanningItem = { id: string; state: string; attempt: number; lease_expires_at: string | null };
+type PlanningItem = { id: string; state: string; attempt: number; lease_expires_at: string | null; live: boolean };
 
-/** The run's planning work items (run_id = runId on the planning task), locked before the anchor. */
+/**
+ * The run's planning work items (run_id = runId on the planning task), locked before the anchor.
+ * FNXC:CccPlanningControl 2026-10-14-17:37:
+ * Errata E5-L1 item 7: `live` (a running item whose lease has not expired) is judged by the database clock at lock
+ * time, the same predicate as the lease fence, never by a caller-supplied `now`, which only stamps the writes.
+ */
 async function lockPlanningItems(tx: DbTransaction, anchor: AnchorRow): Promise<PlanningItem[]> {
   return rows<PlanningItem>(tx, sql`
-    SELECT id, state, attempt, lease_expires_at FROM project.workflow_work_items
+    SELECT id, state, attempt, lease_expires_at,
+           (state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at::timestamptz > clock_timestamp()) AS live
+      FROM project.workflow_work_items
      WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id} AND task_id = ${anchor.planning_task_id}
      ORDER BY id FOR UPDATE
   `);
@@ -306,9 +320,15 @@ async function appendEvent(tx: DbTransaction, anchor: AnchorRow, i: Readonly<{
   }, anchor.project_id);
 }
 
-/** CAS state move plus its state event. Leaving a pending control behind is impossible for paused/cancelling/cancelled. */
+/**
+ * CAS state move plus its state event. Leaving a pending control behind is impossible for paused/cancelling/cancelled.
+ * FNXC:CccPlanningControl 2026-10-14-17:37:
+ * Errata E5-L1 item 5 (ADV-11, ADV-12): with `respectControl` the UPDATE itself carries the pending-control predicate,
+ * so a control that is pending when the row is written blocks every target except paused, cancelling and cancelled,
+ * whatever the caller read before; the refusal is CONTROL_PENDING and nothing is written.
+ */
 async function moveRun(tx: DbTransaction, anchor: AnchorRow, i: Readonly<{ to: CccPlanningRunState; stateCode: string | null;
-  now: string; agentId: string; bumpControlSeq?: boolean; decisionId?: string }>): Promise<AnchorRow> {
+  now: string; agentId: string; bumpControlSeq?: boolean; decisionId?: string; respectControl?: boolean }>): Promise<AnchorRow> {
   const from = anchor.state;
   if (from === i.to || !cccPlanningTransitionAllowed(from, i.to)) {
     refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", `run ${anchor.run_id} ${from} -> ${i.to} is not allowed`, "state");
@@ -329,12 +349,24 @@ async function moveRun(tx: DbTransaction, anchor: AnchorRow, i: Readonly<{ to: C
     ...(clearsControl ? [sql`control_request = NULL`, sql`control_revision = NULL`, sql`control_requested_at = NULL`] : []),
     ...(i.bumpControlSeq ? [sql`control_seq = control_seq + 1`] : []),
   ];
+  const controlPredicate = i.respectControl
+    ? sql`AND (control_request IS NULL OR ${i.to}::text IN ('paused', 'cancelling', 'cancelled'))`
+    : sql``;
   const updated = await rows(tx, sql`
     UPDATE project.ccc_planning_runs SET ${sql.join(assignments, sql`, `)}
-     WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id} AND state = ${from}
+     WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id} AND state = ${from} ${controlPredicate}
     RETURNING ${ANCHOR_COLUMNS}
   `);
-  if (updated.length !== 1) refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", `run ${anchor.run_id} changed concurrently`, "state");
+  if (updated.length !== 1) {
+    const current = i.respectControl ? (await rows<{ state: string; control_request: string | null }>(tx, sql`
+      SELECT state, control_request FROM project.ccc_planning_runs WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id}
+    `))[0] : undefined;
+    if (current && current.state === from && current.control_request !== null && !CONTROL_EXEMPT_TARGETS.has(i.to)) {
+      refuse("CCC_PLANNING_CONTROL_PENDING", `run ${anchor.run_id} has a pending ${current.control_request}; ${from} -> ${i.to} waits`,
+        "state");
+    }
+    refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", `run ${anchor.run_id} changed concurrently`, "state");
+  }
   const row = normalizeAnchor(updated[0]!);
   await appendEvent(tx, row, {
     mutationType: "ccc-planning:state", subject: `${from}->${i.to}@${anchor.updated_at}`, agentId: i.agentId, timestamp: updatedAt,
@@ -394,6 +426,112 @@ function dispatchAttempts(history: History, lineageId: string): number {
   const turns = new Set<string>();
   for (const call of history.calls.values()) if (call.lineageId === lineageId) turns.add(call.turnKey);
   return inherited + turns.size;
+}
+
+// ---------------------------------------------------------------- lineage admission (errata E5-L1 items 3 and 4)
+
+type LineageOwner = Readonly<{ roleId: CccPlanningRoleId; stageId: string }>;
+
+/** A repair lineage or a review node: these exist only once a `lineage:created` event records them (D13). */
+function isClaimedLineageForm(lineageId: string): boolean {
+  return lineageId.startsWith("repair:") || REVIEW_NODE_LINEAGE_PATTERN.test(lineageId);
+}
+
+/**
+ * The leaf cap: the largest L whose planning node count (14 + L + 1, K1 `countCccPlanningNodes`) fits the allocation's
+ * node ceiling (K1 `cccPlanningMaxNodes`). K1 exports no leaf-cap constant, so it is derived from those two functions.
+ */
+function cccPlanningLeafCap(planningAllocation: number): number {
+  return Math.max(0, cccPlanningMaxNodes(planningAllocation) - countCccPlanningNodes({ leaves: 1 }) + 1);
+}
+
+/** The fixed lineages of CONTRACT section 2.1 that spell this id, each with the one role and stage it admits. */
+function fixedLineageOwners(lineageId: string, leafCap: number): LineageOwner[] {
+  if (isClaimedLineageForm(lineageId)) return [];
+  const owners: LineageOwner[] = [];
+  for (const entry of CCC_PLANNING_PREFLIGHT_LINEAGES) {
+    if (entry.lineageId === lineageId) owners.push({ roleId: entry.roleId, stageId: cccPlanningRole(entry.roleId).stageId });
+  }
+  for (const spec of CCC_PLANNING_ROLE_POLICY_FULL_V2.roles) {
+    if ((spec.counting === "fixed" || spec.counting === "once-if-leaves") && lineageId === `${spec.stageId}:${spec.roleId}`) {
+      owners.push({ roleId: spec.roleId, stageId: spec.stageId });
+    }
+  }
+  const leaf = LEAF_LINEAGE_PATTERN.exec(lineageId);
+  if (leaf && Number(leaf[1]) <= leafCap) owners.push({ roleId: "extraction-leaf", stageId: "research" });
+  if (lineageId.startsWith("review:") && SEMANTIC_TASK_ID_PATTERN.test(lineageId.slice("review:".length))) {
+    owners.push({ roleId: "task-reviewer", stageId: "g7" });
+  }
+  if (lineageId === "judge:final") owners.push({ roleId: "final-judge", stageId: "g8" });
+  return owners;
+}
+
+/** The role and stage a `lineage:created` record admits, or null when the record is not one this module writes. */
+function recordedLineageOwner(record: LineageRecord): LineageOwner | null {
+  if (typeof record.roleId !== "string") return null;
+  const roleId = record.roleId as CccPlanningRoleId;
+  let role;
+  try {
+    role = cccPlanningRole(roleId);
+  } catch {
+    return null;
+  }
+  const lineageId = record.lineageId;
+  if (record.kind === "author-repair") {
+    const match = AUTHOR_REPAIR_LINEAGE_PATTERN.exec(lineageId);
+    return match && match[2] === roleId && Number(match[1]) <= CCC_PLANNING_MAX_REPAIR_CHUNKS ? { roleId, stageId: "repair" } : null;
+  }
+  if (record.kind === "review-node") {
+    const match = REVIEW_NODE_LINEAGE_PATTERN.exec(lineageId);
+    return match && match[1] === `${role.stageId}:${roleId}` && Number(match[2]) <= CCC_PLANNING_MAX_REPAIR_CHUNKS
+      ? { roleId, stageId: role.stageId } : null;
+  }
+  if (record.kind === "split" && typeof record.stageId === "string" && !isClaimedLineageForm(lineageId)) {
+    return { roleId, stageId: record.stageId };
+  }
+  return null;
+}
+
+/*
+FNXC:CccPlanningLedger 2026-10-14-17:37:
+Errata E5-L1 item 3 (ADV-1). A lineage takes a call only when it is the fixed lineage of the binding's role and stage
+(`${stage}:${role}`, `research:leaf-N` up to the leaf cap, `research:leaf-reviewer`, the preflight ids,
+`review:<semanticTaskId>` for G7, `judge:final` for G8), or when a `lineage:created` event of this run records it for the
+same role: `repair:k:<role>` at stage repair and `<stage>:<role>:rv<k>` at the role's stage, both with k at most
+CCC_PLANNING_MAX_REPAIR_CHUNKS, or a split child at its parent's role and stage. A repair or review-node id is never
+fixed. Anything else is ROUTE_NOT_ADMITTED and nothing is written.
+*/
+function requireLineageAdmitted(history: History, anchor: AnchorRow, binding: CccPlanningRouteBinding): void {
+  const matches = (owner: LineageOwner | null) => owner !== null && owner.roleId === binding.roleId && owner.stageId === binding.stageId;
+  if (fixedLineageOwners(binding.lineageId, cccPlanningLeafCap(anchor.planning_allocation)).some(matches)) return;
+  const record = history.lineages.get(binding.lineageId);
+  if (record && matches(recordedLineageOwner(record))) return;
+  refuse("CCC_PLANNING_ROUTE_NOT_ADMITTED", `lineage-not-admitted: ${binding.lineageId} is neither the fixed lineage of `
+    + `${binding.roleId} at stage ${binding.stageId} nor recorded for that role by a lineage:created event`, "lineageId");
+}
+
+/** The repair chunk a lineage belongs to: its claim's chunk, a split child's parent's, 0 for a fixed lineage. */
+function lineageChunk(history: History, lineageId: string): number {
+  const seen = new Set<string>();
+  let current = history.lineages.get(lineageId);
+  while (current && !seen.has(current.lineageId)) {
+    seen.add(current.lineageId);
+    if (current.kind === "author-repair" || current.kind === "review-node") return Number(current.chunkOrdinal) || 0;
+    if (current.kind !== "split") return 0;
+    current = history.lineages.get(String(current.parentLineageId));
+  }
+  return 0;
+}
+
+/** The newest repair chunk that claimed a lineage (author repair or review node) for this role, 0 when none has. */
+function newestClaimChunk(history: History, roleId: string): number {
+  let newest = 0;
+  for (const record of history.lineages.values()) {
+    if ((record.kind === "author-repair" || record.kind === "review-node") && record.roleId === roleId) {
+      newest = Math.max(newest, Number(record.chunkOrdinal) || 0);
+    }
+  }
+  return newest;
 }
 
 function callsInTurn(history: History, turnKey: string): CallRecord[] {
@@ -495,7 +633,7 @@ export async function inspectCccPlanningRun(layer: AsyncDataLayer, runId: string
         request: lastControlEvent.metadata.request as "pause" | "cancel" | "resume",
         controlSeq: Number(lastControlEvent.metadata.controlSeq), actor: String(lastControlEvent.metadata.actor),
         at: lastControlEvent.timestamp, route: lastControlEvent.metadata.route as "planning" | "campaign-bridge",
-        outcome: lastControlEvent.metadata.outcome as "applied" | "pending" | "deferred-leased",
+        outcome: lastControlEvent.metadata.outcome as "applied" | "pending",   // E5-L1 item 12: no deferred-leased
       },
       awaitingDecision: anchor.awaiting_decision_id === null ? null : {
         decisionId: anchor.awaiting_decision_id, questionArtifactKey: question?.key ?? "", questionDigest: question?.digest ?? "",
@@ -560,10 +698,47 @@ function isPreflightLineage(binding: CccPlanningRouteBinding): boolean {
   return CCC_PLANNING_PREFLIGHT_LINEAGES.some((entry) => entry.lineageId === binding.lineageId && entry.roleId === binding.roleId);
 }
 
+/*
+FNXC:CccPlanningLedger 2026-10-14-17:37:
+Errata E5-L1 item 10. Every value an audit event copies is bounded before any write: id strings 1 to 256 characters,
+digests 64 lowercase hex. A caller passing anything else is an internal caller bug, refused with INTERNAL_ERROR and the
+offending field, so an unbounded or malformed value never reaches run_audit_events.
+*/
+function requireAuditId(value: unknown, field: string): void {
+  if (typeof value !== "string" || value.length < 1 || value.length > AUDIT_ID_MAX) {
+    refuse("CCC_PLANNING_INTERNAL_ERROR", `${field} must be a string of 1 to ${AUDIT_ID_MAX} characters`, field);
+  }
+}
+
+function requireAuditDigest(value: unknown, field: string): void {
+  if (typeof value !== "string" || !DIGEST_PATTERN.test(value)) {
+    refuse("CCC_PLANNING_INTERNAL_ERROR", `${field} must be 64 lowercase hex characters`, field);
+  }
+}
+
+function requireCallAuditBounds(request: CccPlanningCallRequest): void {
+  const binding = request.binding;
+  for (const field of ["projectId", "runId", "taskId", "stageId", "roleId", "lineageId", "providerId", "modelId",
+    "receiptAdapterId"] as const) {
+    requireAuditId(binding[field], `binding.${field}`);
+  }
+  for (const field of ["toolsetDigest", "promptDigest", "policyDigest", "grantDigest", "bindingHash"] as const) {
+    requireAuditDigest(binding[field], `binding.${field}`);
+  }
+  const fence = request.fence as Partial<Record<string, unknown>> | null | undefined;
+  if (fence && typeof fence === "object") {
+    for (const field of ["workItemId", "leaseOwner", "originTaskId", "runId"]) {
+      const value = fence[field];
+      if (typeof value === "string" && value.length > AUDIT_ID_MAX) requireAuditId(value, `fence.${field}`);
+    }
+  }
+}
+
 /** Structural checks that need no database: binding hash, derived turn key, 1-based dispatch key, role class and phase. */
 function requireCallRequest(request: CccPlanningCallRequest): number {
   const binding = request?.binding;
   if (!binding || binding.kind !== "ccc-planning-route.v1") invalid("binding kind must be ccc-planning-route.v1");
+  requireCallAuditBounds(request);
   if (binding.bindingHash !== cccPlanningBindingHash(binding)) invalid("bindingHash does not match the binding");
   if (binding.transport !== "pi") invalid("transport must be pi");
   let role;
@@ -666,6 +841,18 @@ export async function admitCccPlanningDispatch(layer: AsyncDataLayer, request: C
       };
     }
 
+    requireLineageAdmitted(history, anchor, binding);
+    /*
+    FNXC:CccPlanningLedger 2026-10-14-17:37:
+    Errata E5-L1 item 4 (ADV-9): once a repair chunk has claimed a lineage for this role, every earlier lineage of the
+    role (its fixed lineage, an older repair or review node, and their split children) takes no new turn key; the work
+    continues in the claimed lineage. A turn that started before the claim may still take its next call.
+    */
+    if (turnCalls.length === 0 && newestClaimChunk(history, binding.roleId) > lineageChunk(history, binding.lineageId)) {
+      refuse("CCC_PLANNING_ROUTE_NOT_ADMITTED", `lineage-superseded: ${binding.lineageId} is older than repair chunk `
+        + `${newestClaimChunk(history, binding.roleId)}'s lineage for ${binding.roleId}`, "lineageId");
+    }
+
     const phaseState: CccPlanningRunState = planningPhase ? "running" : "building";
     if (anchor.state !== phaseState) limit("run-not-building", `run ${anchor.run_id} is ${anchor.state}, not ${phaseState}`);
     if (anchor.control_request !== null) limit("control-pending", `run ${anchor.run_id} has a pending ${anchor.control_request}`);
@@ -738,9 +925,18 @@ function observedRoute(raw: unknown): Row | null {
     : null;
 }
 
+/** Errata E5-L1 item 10: the observed route a refusal copies into its terminal event is bounded like any audit id. */
+function requireObservedRouteBounds(raw: unknown): void {
+  if (!raw || typeof raw !== "object") return;
+  const route = raw as { effectiveProvider?: unknown; effectiveModel?: unknown };
+  for (const field of ["effectiveProvider", "effectiveModel"] as const) {
+    if (typeof route[field] === "string") requireAuditId(route[field], `effectiveRoute.${field}`);
+  }
+}
+
 export async function proveCccPlanningCallNotDispatched(layer: AsyncDataLayer, scope: CccPlanningCallScope, evidenceDigest: string):
   Promise<CccPlanningCallScope> {
-  if (typeof evidenceDigest !== "string" || evidenceDigest.length === 0) invalid("evidenceDigest is required");
+  requireAuditDigest(evidenceDigest, "evidenceDigest");
   return inTransaction(layer, async (tx) => {
     const { anchor, call, now } = await loadCallForSettlement(tx, layer, scope);
     await appendEvent(tx, anchor, {
@@ -758,12 +954,18 @@ replays) and settles exactly once otherwise (a different terminal throws RunAudi
 keeps the spend and, in the same transaction, moves the run from its phase state (running, or building for G7/G8) to
 blocked_provider / CCC_PROVIDER_PIN_DRIFT, so no further call can be reserved. A provider error event is a
 failed_known_effect and leaves the run where it is, so a retry inside the caps stays possible.
+FNXC:CccPlanningLedger 2026-10-14-17:37:
+Errata E5-L1 items 6 and 10 (ADV-2). The refusal reason must be one of the four members of the union; an unknown value
+used to fall through to failed_known_effect, so a misspelt route refusal left the run open. It now fails closed with
+INTERNAL_ERROR before the transaction, as do an evidence digest that is not 64 lowercase hex, an observer id or an
+observed route string over 256 characters.
 */
 export async function settleCccPlanningCall(layer: AsyncDataLayer,
   settlement: CccProviderAttemptSettlementInputOf<CccPlanningCallScope>): Promise<CccPlanningCallScope> {
   const binding = settlement.binding;
-  if (typeof settlement.evidenceDigest !== "string" || settlement.evidenceDigest.length === 0) invalid("evidenceDigest is required");
-  if (typeof settlement.observerId !== "string" || settlement.observerId.length === 0) invalid("observerId is required");
+  requireAuditDigest(settlement.evidenceDigest, "evidenceDigest");
+  requireAuditId(settlement.observerId, "observerId");
+  requireObservedRouteBounds(settlement.effectiveRoute);
   let outcome: "committed" | "refused_known_effect" | "failed_known_effect";
   let effectiveRoute: CccProviderAttemptEffectiveRoute | undefined;
   if (settlement.outcome === "committed") {
@@ -773,6 +975,10 @@ export async function settleCccPlanningCall(layer: AsyncDataLayer,
     outcome = "committed";
   } else if (settlement.outcome === "proved_failed") {
     if (settlement.refusalReason === undefined) invalid("a planning proved_failed settlement requires a refusalReason");
+    if (!REFUSAL_REASONS.has(settlement.refusalReason)) {
+      refuse("CCC_PLANNING_INTERNAL_ERROR", `refusalReason ${JSON.stringify(String(settlement.refusalReason).slice(0, 64))} `
+        + "is not receipt-missing, receipt-mismatch, effective-route-drift or provider-error-event", "refusalReason");
+    }
     outcome = ROUTE_REFUSALS.has(settlement.refusalReason) ? "refused_known_effect" : "failed_known_effect";
   } else {
     invalid(`outcome ${String(settlement.outcome)} is not committed or proved_failed`);
@@ -833,15 +1039,44 @@ export async function recordCccPlanningLineageSplit(layer: AsyncDataLayer, i: Re
     const anchor = await lockAnchor(tx, located.project_id, located.run_id);
     const now = await databaseNow(tx);
     const history = await readCallHistory(tx, anchor);
+    const owner = splitParentOwner(history, anchor, parent);
+    for (const child of children) {
+      if (isClaimedLineageForm(child)) {
+        refuse("CCC_PLANNING_ROUTE_NOT_ADMITTED", `lineage-not-admitted: split child ${child} uses a repair or review-node id`,
+          "childLineageIds");
+      }
+    }
     const inherited = dispatchAttempts(history, parent);
     for (const child of children) {
       await appendEvent(tx, anchor, {
         mutationType: "ccc-planning:lineage:created", subject: child, agentId: CONTROLLER_AGENT, timestamp: now,
         metadata: { schema: "ccc-planning-lineage/v1", runId: anchor.run_id, lineageId: child, kind: "split",
-          parentLineageId: parent, inheritedDispatchAttempts: inherited },
+          roleId: owner.roleId, stageId: owner.stageId, parentLineageId: parent, inheritedDispatchAttempts: inherited },
       });
     }
   });
+}
+
+/*
+FNXC:CccPlanningLedger 2026-10-14-17:37:
+Errata E5-L1 item 3 admits a split child only for its parent's role, so the split event now records the role and stage
+it inherits. The parent is a recorded lineage (its record's owner), or a fixed lineage; a fixed id that two roles could
+own (`review:<id>` is also G7's form) is settled by the calls the parent already made. A parent that resolves to no
+single role and stage is ROUTE_NOT_ADMITTED, and nothing is written.
+*/
+function splitParentOwner(history: History, anchor: AnchorRow, parent: string): LineageOwner {
+  const record = history.lineages.get(parent);
+  let owners: LineageOwner[] = record ? [recordedLineageOwner(record)].filter((owner): owner is LineageOwner => owner !== null)
+    : fixedLineageOwners(parent, cccPlanningLeafCap(anchor.planning_allocation));
+  if (owners.length > 1) {
+    const called = [...history.calls.values()].filter((call) => call.lineageId === parent);
+    owners = owners.filter((owner) => called.some((call) => call.reserved.roleId === owner.roleId && call.reserved.stageId === owner.stageId));
+  }
+  if (owners.length !== 1) {
+    refuse("CCC_PLANNING_ROUTE_NOT_ADMITTED", `lineage-not-admitted: split parent ${parent} does not resolve to one admitted role`,
+      "parentLineageId");
+  }
+  return owners[0]!;
 }
 
 type RepairLineage = Readonly<{ roleId: CccPlanningRoleId; lineageId: string; kind: "author-repair" | "review-node";
@@ -926,6 +1161,21 @@ export async function claimCccPlanningRepairChunk(layer: AsyncDataLayer, i: Read
 
     const chunkOrdinal = (anchor.repair_chunks_used + 1) as 1 | 2 | 3 | 4;
     const history = await readCallHistory(tx, anchor);
+    /*
+    FNXC:CccPlanningLedger 2026-10-14-17:37:
+    Errata E5-L1 item 4 (ADV-8): a claim supersedes every earlier lineage of its roles (admission refuses them new turn
+    keys), so it waits until none of them has a reserved or dispatched_unknown call; otherwise that call's effect could
+    land after the repair lineage started. Refused with UNRECONCILED_DISPATCH, naming the role; nothing is written.
+    */
+    for (const [label, roles] of [["repairAuthors", authors], ["reReviewers", reviewers]] as const) {
+      for (const roleId of roles) {
+        const open = [...history.calls.values()].find((call) => call.terminal === null && call.reserved.roleId === roleId);
+        if (open) {
+          refuse("CCC_PLANNING_UNRECONCILED_DISPATCH",
+            `role ${roleId} has unsettled call ${open.attemptKey} in lineage ${open.lineageId}`, label);
+        }
+      }
+    }
     const lineages: RepairLineage[] = [];
     for (const roleId of authors) {
       const parentLineageId = latestAuthorLineage(history, roleId);
@@ -1007,19 +1257,27 @@ export async function recordCccPlanningReviewEpoch(layer: AsyncDataLayer, i: Rea
     const located = await locateRun(tx, layer, i.runId);
     await lockFence(tx, located, i.fence, "either");
     const anchor = await lockAnchor(tx, located.project_id, located.run_id);
-    const previous = anchor.review_epochs === 0 ? undefined : (await rows<{ metadata: Row }>(tx, sql`
+    const epochs = (await rows<{ metadata: Row }>(tx, sql`
       SELECT metadata FROM project.run_audit_events
        WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id} AND mutation_type = 'ccc-planning:review-epoch'
-         AND target = ${`epoch:${anchor.review_epochs}`}
-    `))[0]?.metadata;
+    `)).map((row) => row.metadata);
+    const previous = anchor.review_epochs === 0 ? undefined
+      : epochs.find((metadata) => Number(metadata.epoch) === anchor.review_epochs);
     const result = (reviewEpochs: number, stagnantEpochs: number) =>
       ({ reviewEpochs, stagnantEpochs, stop: stagnantEpochs >= CCC_PLANNING_STAGNATION_EPOCHS });
-    if (previous && previous.epochDigest === i.epochDigest) {
-      if (Number(previous.blockingFindings) !== i.blockingFindings) {
+    /*
+    FNXC:CccPlanningLedger 2026-10-14-17:37:
+    Errata E5-L1 item 9 (ADV-5): a digest equal to ANY earlier epoch of the run is a replay of that epoch, not only the
+    latest one, so a late redelivery returns the stored epoch and records no new epoch or stagnation. The input carries
+    no stage, so the match is per run. The same digest with other findings is a collision.
+    */
+    const replayed = epochs.find((metadata) => metadata.epochDigest === i.epochDigest);
+    if (replayed) {
+      if (Number(replayed.blockingFindings) !== i.blockingFindings) {
         throw new RunAuditEventCollisionError(cccPlanningEventId({ projectId: anchor.project_id, runId: anchor.run_id,
-          mutationType: "ccc-planning:review-epoch", subject: `epoch:${anchor.review_epochs}` }));
+          mutationType: "ccc-planning:review-epoch", subject: `epoch:${Number(replayed.epoch)}` }));
       }
-      return result(anchor.review_epochs, anchor.stagnant_epochs);
+      return result(Number(replayed.epoch), Number(replayed.stagnantEpochs));
     }
     if (anchor.stagnant_epochs >= CCC_PLANNING_STAGNATION_EPOCHS) {
       refuse("CCC_PLANNING_REVIEW_STAGNATED", `run ${anchor.run_id} stopped after ${anchor.stagnant_epochs} stagnant epochs`);
@@ -1152,7 +1410,12 @@ function operatorAgent(actor: string): string {
   return `operator:${actor}`;
 }
 
-/** Held planning work items go back to runnable with a fresh fence attempt, so any stale holder's fence is refused. */
+/*
+FNXC:CccPlanningControl 2026-10-14-17:37:
+Held planning work items go back to runnable with a fresh fence attempt (attempt + 1). Errata E5-L1 item 13 keeps this
+on purpose: the lease fence matches on the attempt, so a stale holder that still carries the old attempt has its fence
+refused (FENCE_STALE) instead of writing into the resumed run.
+*/
 async function requeueHeld(tx: DbTransaction, anchor: AnchorRow, items: readonly PlanningItem[], now: string): Promise<void> {
   for (const item of items) {
     if (item.state !== "held") continue;
@@ -1165,14 +1428,25 @@ async function requeueHeld(tx: DbTransaction, anchor: AnchorRow, items: readonly
   }
 }
 
-/** D45: cancelling with no live lease holder ends the open planning work items and the run in one transaction. */
+type CancellationBlock = Readonly<{ reason: "live-lease" }>
+  | Readonly<{ reason: "descendants-unsettled"; code: "CCC_PLANNING_DESCENDANTS_UNSETTLED" }>;
+
+/*
+FNXC:CccPlanningControl 2026-10-14-17:37:
+D45: cancelling with no live lease holder ends the open planning work items and the run in one transaction. This is
+the only path to `cancelled` (errata E5-L1 item 8, ADV-10). Liveness is the database clock's (`live`, item 7), and the
+run also stays cancelling while any of its calls is reserved or dispatched_unknown, because that call's effect is still
+unknown; the block says why (DESCENDANTS_UNSETTLED for the calls).
+*/
 async function completeCancellationWithin(tx: DbTransaction, anchor: AnchorRow, items: readonly PlanningItem[], now: string,
-  agentId: string): Promise<{ completed: boolean; anchor: AnchorRow }> {
+  agentId: string): Promise<{ completed: boolean; anchor: AnchorRow; blocked?: CancellationBlock }> {
   if (anchor.state === "cancelled") return { completed: true, anchor };
   if (anchor.state !== "cancelling") return { completed: false, anchor };
-  const live = items.some((item) => item.state === "running" && item.lease_expires_at !== null
-    && Date.parse(item.lease_expires_at) > Date.parse(now));
-  if (live) return { completed: false, anchor };
+  if (items.some((item) => item.live)) return { completed: false, anchor, blocked: { reason: "live-lease" } };
+  const unsettled = [...(await readCallHistory(tx, anchor)).calls.values()].some((call) => call.terminal === null);
+  if (unsettled) {
+    return { completed: false, anchor, blocked: { reason: "descendants-unsettled", code: "CCC_PLANNING_DESCENDANTS_UNSETTLED" } };
+  }
   for (const item of items) {
     if (WORK_ITEM_TERMINAL.has(item.state)) continue;   // the import-stage item has already succeeded: left unchanged
     await tx.execute(sql`
@@ -1222,6 +1496,7 @@ function planControl(anchor: AnchorRow, request: "pause" | "cancel" | "resume"):
       if (request !== "cancel") refused("only cancel applies; answer or amend the budget instead");
       return { kind: "cancel" };
     case "cancelling":
+      // Errata E5-L1 item 13 keeps this: a second cancel while one is in progress is CONTROL_PENDING, not a new control.
       if (request === "cancel") refuse("CCC_PLANNING_CONTROL_PENDING", "cancellation is already in progress", "request");
       return refused("the run is cancelling");
     default:
@@ -1254,7 +1529,13 @@ export async function requestCccPlanningControl(layer: AsyncDataLayer, i: Readon
     const now = await databaseNow(tx);
     const agentId = operatorAgent(actor);
     const controlSeq = anchor.control_seq + 1;
-    let outcome: "applied" | "pending" | "deferred-leased";
+    /*
+    FNXC:CccPlanningControl 2026-10-14-17:37:
+    Errata E5-L1 item 12: a cancel is `applied` once the run is cancelling; there is no `deferred-leased` outcome. When
+    completion has to wait, the control event records why under `cancellation` (item 8).
+    */
+    let outcome: "applied" | "pending";
+    let cancellation: Row | undefined;
     let finalState = anchor.state;
     if (plan.kind === "pending") {
       await tx.execute(sql`
@@ -1275,12 +1556,13 @@ export async function requestCccPlanningControl(layer: AsyncDataLayer, i: Readon
       const cancelling = await moveRun(tx, anchor, { to: "cancelling", stateCode: null, now, agentId, bumpControlSeq: true });
       const completion = await completeCancellationWithin(tx, cancelling, items, now, agentId);
       finalState = completion.anchor.state;
-      outcome = completion.completed ? "applied" : "deferred-leased";
+      outcome = "applied";
+      cancellation = completion.completed ? { completed: true } : { completed: false, ...completion.blocked };
     }
     await appendEvent(tx, anchor, {
       mutationType: "ccc-planning:control", subject: `control:${controlSeq}`, agentId, timestamp: now,
       metadata: { schema: "ccc-planning-control/v1", runId: anchor.run_id, controlSeq, request, actor, route: "planning",
-        outcome, fromState: anchor.state, toState: finalState },
+        outcome, fromState: anchor.state, toState: finalState, ...(cancellation ? { cancellation } : {}) },
     });
     return { controlSeq, appliedDirectly: plan.kind !== "pending" };
   });
@@ -1290,9 +1572,12 @@ export async function requestCccPlanningControl(layer: AsyncDataLayer, i: Readon
 FNXC:CccPlanningControl 2026-10-14-14:05:
 D32 and D52: answering the awaited decision is one transaction. control_seq moves first, so the operator_answer artifact
 publishes under the operator fence {runRevision, controlSeq} that trigger 0043 checks against the anchor; the run goes
-back to running and the held planning work item to runnable. The artifact is published locally under the publisher GUC
-(card A1's publisher is a parallel W2 card), and the actor is recorded in the answer content and the audit agentId,
-because the frozen producer type has no actor field.
+back to running and the held planning work item to runnable. The actor is recorded in the answer content and the
+decision:answered audit agentId, because the frozen producer type has no actor field.
+FNXC:CccPlanningControl 2026-10-14-17:37:
+Errata E5-L1 item 11: the operator_answer is published through card A1's publisher inside this transaction, so it gets
+A1's validation, task-row lock, input check, savepoint-scoped publisher flag and A1's artifact-published event, instead
+of a second local INSERT and event of another shape.
 */
 export async function answerCccPlanningDecision(layer: AsyncDataLayer, i: Readonly<{
   runId: string; decisionId: string; answer: string; actor: string }>): Promise<Readonly<{ controlSeq: number; answerArtifactKey: string }>> {
@@ -1315,38 +1600,19 @@ export async function answerCccPlanningDecision(layer: AsyncDataLayer, i: Readon
     const running = await moveRun(tx, anchor, { to: "running", stateCode: null, now, agentId, bumpControlSeq: true });
     const controlSeq = running.control_seq;
 
-    const slot = `answer${controlSeq}`;
-    const key = encodeCccPlanningArtifactKey({ runRevision: anchor.revision, stageId: "operator", slot, version: 1 });
     const contentSchema = "ccc-planning.operator-answer.v1";
-    const encoded = encodeCccPlanningArtifactContent({
-      type: "json", value: { schema: contentSchema, decisionId: i.decisionId, actor, answer: i.answer },
-    });
-    const identity = {
-      schema: CCC_PLANNING_ARTIFACT_ENVELOPE_SCHEMA, artifactKey: key, runId: anchor.run_id, runRevision: anchor.revision,
-      stageId: "operator" as const, slot, version: 1, kind: "operator_answer" as const, contentType: encoded.contentType,
-      contentSchema, inputs: question ? [{ artifactKey: question.key, digest: question.digest }] : [],
-      producer: { kind: "operator" as const, roleId: "operator" as const, instanceId: `operator:${controlSeq}` },
+    const { key } = await publishCccPlanningArtifactWithinTransaction(tx, anchor.project_id, {
+      planningTaskId: anchor.planning_task_id, runId: anchor.run_id,
+      slot: { runRevision: anchor.revision, stageId: "operator", slot: `answer${controlSeq}`, version: 1 },
+      kind: "operator_answer", contentSchema,
+      content: { type: "json", value: { schema: contentSchema, decisionId: i.decisionId, actor, answer: i.answer } },
+      inputs: question ? [{ artifactKey: question.key, digest: question.digest }] : [],
+      producer: { kind: "operator", roleId: "operator", instanceId: `operator:${controlSeq}` },
       policy: { promptVersion: "none", promptDigest: "none", toolPolicyVersion: "none", toolPolicyDigest: "none" },
-      outputDigest: encoded.outputDigest, status: "complete" as const,
-    };
-    const envelope = {
-      ...identity, fence: { kind: "operator", runRevision: anchor.revision, controlSeq },
-      identityDigest: computeCccPlanningEnvelopeIdentityDigest(identity), publishedAt: now,
-    };
-    await tx.execute(sql`SELECT set_config('fusion.ccc_planning_publication', 'on', true)`);
-    await tx.execute(sql`
-      INSERT INTO project.task_documents (project_id, id, task_id, key, content, revision, author, metadata, created_at, updated_at)
-      VALUES (${anchor.project_id}, ${randomUUID()}, ${anchor.planning_task_id}, ${key}, ${encoded.text}, 1,
-              'ccc-planning:operator', ${JSON.stringify(envelope)}::jsonb, ${now}, ${now})
-    `);
-    await tx.execute(sql`SELECT set_config('fusion.ccc_planning_publication', 'off', true)`);
+      status: "complete", fence: { kind: "operator", runRevision: anchor.revision, controlSeq }, now,
+    });
     await requeueHeld(tx, running, items, now);
 
-    await appendEvent(tx, anchor, {
-      mutationType: "ccc-planning:artifact-published", subject: key, agentId, timestamp: now,
-      metadata: { schema: "ccc-planning-artifact/v1", runId: anchor.run_id, artifactKey: key, kind: "operator_answer",
-        stageId: "operator", outputDigest: encoded.outputDigest },
-    });
     await appendEvent(tx, anchor, {
       mutationType: "ccc-planning:decision:answered", subject: i.decisionId, agentId, timestamp: now,
       metadata: { schema: "ccc-planning-decision/v1", runId: anchor.run_id, decisionId: i.decisionId, controlSeq, actor,
@@ -1383,6 +1649,7 @@ export async function recordCccPlanningBuildControl(layer: AsyncDataLayer, i: Re
         refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", `cancel in ${anchor.state} has no ->cancelling transition`, "request");
       }
       if (anchor.control_request === "cancel") {
+        // Errata E5-L1 item 13 keeps this: a second cancel while one is pending is CONTROL_PENDING and writes nothing.
         refuse("CCC_PLANNING_CONTROL_PENDING", `run ${anchor.run_id} already has a pending cancel`, "request");
       }
     }
@@ -1417,6 +1684,7 @@ export async function completeCccPlanningCancellation(layer: AsyncDataLayer, i: 
     if (located.state !== "cancelling") return { completed: false };
     const items = await lockPlanningItems(tx, located);
     const anchor = await lockAnchor(tx, located.project_id, located.run_id);
+    // Errata E5-L1 item 7: the caller's `now` only stamps the writes; lease liveness was judged by the database clock.
     const now = i.now ?? await databaseNow(tx);
     const completion = await completeCancellationWithin(tx, anchor, items, now, CONTROLLER_AGENT);
     return { completed: completion.completed };
@@ -1438,6 +1706,15 @@ export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: Re
   }
   if (i.from === i.to || !cccPlanningTransitionAllowed(i.from, i.to)) {
     refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", `${i.from} -> ${i.to} is not an allowed transition`, "state");
+  }
+  /*
+  FNXC:CccPlanningControl 2026-10-14-17:37:
+  Errata E5-L1 item 8 (ADV-10, D45): cancelled is reached only by completeCccPlanningCancellation, which checks the
+  lease and the unsettled calls first; the generic transition refuses it. Item 5: the move carries the pending-control
+  predicate (moveRun `respectControl`), so a pending control refuses every other target with CONTROL_PENDING.
+  */
+  if (i.to === "cancelled") {
+    refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", "only completeCccPlanningCancellation moves a run to cancelled", "to");
   }
   return inTransaction(layer, async (tx) => {
     const located = await locateRun(tx, layer, i.runId);
@@ -1462,7 +1739,7 @@ export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: Re
     }
     const now = await databaseNow(tx);
     const moved = await moveRun(tx, anchor, {
-      to: i.to, stateCode: i.stateCode, now, agentId: CONTROLLER_AGENT, ...(decisionId ? { decisionId } : {}),
+      to: i.to, stateCode: i.stateCode, now, agentId: CONTROLLER_AGENT, respectControl: true, ...(decisionId ? { decisionId } : {}),
     });
     return custodyOf(moved);
   });

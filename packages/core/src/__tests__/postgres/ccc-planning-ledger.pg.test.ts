@@ -19,7 +19,12 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { cccPlanningRuns, type CccPlanningRunInsert } from "../../postgres/schema/ccc-planning.js";
-import { cccPlanningBindingHash, cccPlanningRole, cccPlanningTurnKey } from "../../ccc-planning/policy.js";
+import {
+  CCC_PLANNING_MAX_REPAIR_CHUNKS,
+  cccPlanningBindingHash,
+  cccPlanningRole,
+  cccPlanningTurnKey,
+} from "../../ccc-planning/policy.js";
 import type {
   CccPlanningCallRequest,
   CccPlanningCallScope,
@@ -189,26 +194,36 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
     };
   }
 
-  function binding(run: Run, lineage: Lineage, nodeAttemptOrdinal: 1 | 2 | 3): CccPlanningRouteBinding {
+  /** The run revision each fixture binds to; `fourthTurn` moves a run forward by one revision (an amendment). */
+  const revisions = new Map<string, number>();
+  function revisionOf(run: Run): number {
+    return revisions.get(run.runId) ?? 1;
+  }
+
+  type BindingOverrides = Partial<Omit<CccPlanningRouteBinding, "bindingHash">>;
+
+  function binding(run: Run, lineage: Lineage, nodeAttemptOrdinal: 1 | 2 | 3, overrides: BindingOverrides = {}):
+    CccPlanningRouteBinding {
     const role = cccPlanningRole(lineage.roleId);
     const base: Omit<CccPlanningRouteBinding, "bindingHash"> = {
-      kind: "ccc-planning-route.v1", projectId: PROJECT, runId: run.runId, runRevision: 1, taskId: run.taskId,
+      kind: "ccc-planning-route.v1", projectId: PROJECT, runId: run.runId, runRevision: revisionOf(run), taskId: run.taskId,
       stageId: lineage.stageId, roleId: lineage.roleId, roleClass: role.roleClass, lineageId: lineage.lineageId,
       nodeAttemptOrdinal, phase: role.phase === "review_proof" ? "review_proof" : "planning",
       providerId: `ccc-${role.family}`, modelId: role.modelId, transport: "pi",
       receiptAdapterId: "terminal-route-sse-comments.v1", toolsetDigest: sha("tools"), promptDigest: sha("prompt"),
       policyDigest: sha("policy"), grantDigest: sha(`grant:${run.runId}`),
+      ...overrides,
     };
     return { ...base, bindingHash: cccPlanningBindingHash(base) };
   }
 
   function request(run: Run, lineage: Lineage, nodeAttemptOrdinal: 1 | 2 | 3, call: number,
-    options: { fence?: CccPlanningWorkItemFence; preflight?: boolean } = {}): CccPlanningCallRequest {
-    const b = binding(run, lineage, nodeAttemptOrdinal);
+    options: { fence?: CccPlanningWorkItemFence; preflight?: boolean; overrides?: BindingOverrides } = {}): CccPlanningCallRequest {
+    const b = binding(run, lineage, nodeAttemptOrdinal, options.overrides);
     return {
       binding: b,
-      turnKey: cccPlanningTurnKey({ projectId: PROJECT, runId: run.runId, revision: 1, stageId: b.stageId, roleId: b.roleId,
-        lineageId: b.lineageId, nodeAttemptOrdinal }),
+      turnKey: cccPlanningTurnKey({ projectId: PROJECT, runId: run.runId, revision: b.runRevision, stageId: b.stageId,
+        roleId: b.roleId, lineageId: b.lineageId, nodeAttemptOrdinal }),
       dispatchKey: `pi-stream:${call}`,
       fence: options.fence ?? run.fence,
       preflight: options.preflight ?? false,
@@ -251,11 +266,51 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
   }
 
   /**
-   * A turn key the node-attempt ordinal (1..3) cannot reach: the same lineage under the repair stage. It is the only way
-   * to present a 4th distinct turn key, which is exactly the case the dispatch cap must refuse.
+   * FNXC:CccPlanningLedger 2026-10-14-17:25:
+   * A 4th distinct turn key for the same lineage, stage and role. The node-attempt ordinal is typed 1..3, so within one
+   * revision a lineage has at most three turn keys; an amendment (revision + 1) gives the same lineage a new turn key at
+   * ordinal 1, which is exactly the case the dispatch cap must refuse. Errata E5-L1 item 3 retired the old helper, which
+   * switched the lineage to a stage it was never claimed for (now refused as a lineage that does not match its stage).
    */
-  function fourthTurn(run: Run, lineage: Lineage): CccPlanningCallRequest {
-    return request(run, { ...lineage, stageId: lineage.stageId === "repair" ? "review" : "repair" }, 1, 1);
+  async function fourthTurn(run: Run, lineage: Lineage): Promise<CccPlanningCallRequest> {
+    await db.execute(sql`
+      UPDATE project.ccc_planning_runs SET revision = revision + 1, updated_at = ${NOW}
+       WHERE project_id = ${PROJECT} AND run_id = ${run.runId}
+    `);
+    revisions.set(run.runId, revisionOf(run) + 1);
+    return request(run, lineage, 1, 1);
+  }
+
+  async function lockWaiters(): Promise<number> {
+    const rows = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND wait_event_type = 'Lock'
+    `)) as unknown as Array<{ n: number }>;
+    return Number(rows[0]!.n);
+  }
+
+  /** Bounded poll (at most 200 x 25 ms) until `count` backends of this database wait on a lock. */
+  async function awaitLockWaiters(count: number): Promise<number> {
+    let waiters = await lockWaiters();
+    for (let poll = 0; poll < 200 && waiters < count; poll += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      waiters = await lockWaiters();
+    }
+    return waiters;
+  }
+
+  async function expectRouteRefusal(promise: Promise<unknown>, detail: RegExp): Promise<void> {
+    await expectRefusal(promise, "CCC_PLANNING_ROUTE_NOT_ADMITTED", detail);
+  }
+
+  async function forgeLineageEvent(run: Run, metadata: Row): Promise<void> {
+    const lineageId = String(metadata.lineageId);
+    await db.execute(sql`
+      INSERT INTO project.run_audit_events (project_id, id, timestamp, task_id, agent_id, run_id, domain, mutation_type, target, metadata)
+      VALUES (${PROJECT}, ${`forged-${run.taskId}-${lineageId}`}, ${NOW}, ${run.taskId}, 'ccc-planning-controller', ${run.runId},
+              'database', 'ccc-planning:lineage:created', ${lineageId},
+              ${JSON.stringify({ schema: "ccc-planning-lineage/v1", runId: run.runId, ...metadata })}::jsonb)
+    `);
   }
 
   async function expectLimit(promise: Promise<unknown>, reason: string): Promise<void> {
@@ -307,27 +362,34 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
   it("admits three turn keys in a fresh lineage and refuses the 4th distinct turn key with dispatch-cap", async () => {
     const run = await seedRun();
     for (const attempt of [1, 2, 3] as const) await oneAttempt(run, SPEC_AUTHOR, attempt);
-    await expectLimit(admitCccPlanningDispatch(layer, fourthTurn(run, SPEC_AUTHOR)), "dispatch-cap");
+    await expectLimit(admitCccPlanningDispatch(layer, await fourthTurn(run, SPEC_AUTHOR)), "dispatch-cap");
     expect(await anchor(run.runId)).toMatchObject({ planning_spent: 3 });
   });
 
-  it("a split child inheriting 2 attempts has its 2nd attempt refused; an unsplit sibling lineage admits it", async () => {
+  it("a split child inheriting 2 attempts has its 2nd attempt refused; a sibling split before any attempt admits it", async () => {
     const run = await seedRun();
+    const split = (childLineageId: string) => recordCccPlanningLineageSplit(layer, {
+      runId: run.runId, parentLineageId: RESEARCHER.lineageId, childLineageIds: [childLineageId], fence: run.fence,
+    });
+    // Errata E5-L1 item 3: only a recorded lineage is admitted, so the control sibling is a split child too; it was
+    // split before the parent's first attempt and inherits 0 (one field differs from the refused child).
+    const sibling: Lineage = { stageId: "research", roleId: "researcher", lineageId: "research:researcher-split-0" };
+    await split(sibling.lineageId);
     await oneAttempt(run, RESEARCHER, 1);
     await oneAttempt(run, RESEARCHER, 2);
     const child: Lineage = { stageId: "research", roleId: "researcher", lineageId: "research:researcher-split-1" };
-    await recordCccPlanningLineageSplit(layer, {
-      runId: run.runId, parentLineageId: RESEARCHER.lineageId, childLineageIds: [child.lineageId], fence: run.fence,
-    });
+    await split(child.lineageId);
     const created = await events(run.runId, "ccc-planning:lineage:created");
-    expect(created.map((row) => row.metadata)).toEqual([expect.objectContaining({
-      kind: "split", lineageId: child.lineageId, parentLineageId: RESEARCHER.lineageId, inheritedDispatchAttempts: 2,
-    })]);
+    expect(created.map((row) => row.metadata)).toEqual([
+      expect.objectContaining({ kind: "split", lineageId: sibling.lineageId, parentLineageId: RESEARCHER.lineageId,
+        roleId: "researcher", stageId: "research", inheritedDispatchAttempts: 0 }),
+      expect.objectContaining({ kind: "split", lineageId: child.lineageId, parentLineageId: RESEARCHER.lineageId,
+        roleId: "researcher", stageId: "research", inheritedDispatchAttempts: 2 }),
+    ]);
     await oneAttempt(run, child, 1);
     await expectLimit(admitCccPlanningDispatch(layer, request(run, child, 2, 1)), "dispatch-cap");
-    const fresh: Lineage = { stageId: "research", roleId: "researcher", lineageId: "research:researcher-fresh" };
-    await oneAttempt(run, fresh, 1);
-    await oneAttempt(run, fresh, 2);
+    await oneAttempt(run, sibling, 1);
+    await oneAttempt(run, sibling, 2);
   });
 
   it("a repair lineage claimed after the author used 2 attempts inherits 2 and its 2nd attempt is refused", async () => {
@@ -371,7 +433,7 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
   it("re-reviews open review nodes with 0 inherited attempts (rv1, rv2) and a 5th chunk is REPAIR_EXHAUSTED", async () => {
     const run = await seedRun();
     for (const attempt of [1, 2, 3] as const) await oneAttempt(run, ADVERSARY, attempt);
-    await expectLimit(admitCccPlanningDispatch(layer, fourthTurn(run, ADVERSARY)), "dispatch-cap");
+    await expectLimit(admitCccPlanningDispatch(layer, await fourthTurn(run, ADVERSARY)), "dispatch-cap");
 
     const claim = (ordinal: number) => claimCccPlanningRepairChunk(layer, {
       runId: run.runId, source: "planning-rejection", candidateDigest: sha(`candidate-${ordinal}`),
@@ -383,7 +445,7 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
       kind: "review-node", parentLineageId: "review:product-adversary", inheritedDispatchAttempts: 0 });
     const rv1: Lineage = { stageId: "review", roleId: "product-adversary", lineageId: "review:product-adversary:rv1" };
     for (const attempt of [1, 2, 3] as const) await oneAttempt(run, rv1, attempt);
-    await expectLimit(admitCccPlanningDispatch(layer, fourthTurn(run, rv1)), "dispatch-cap");
+    await expectLimit(admitCccPlanningDispatch(layer, await fourthTurn(run, rv1)), "dispatch-cap");
 
     const second = await claim(2);
     expect(second.lineages).toContainEqual({ roleId: "product-adversary", lineageId: "review:product-adversary:rv2",
@@ -475,12 +537,29 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
   });
 
   it("two connections racing at spent = allocation - 1 admit exactly one", async () => {
+    /*
+    FNXC:CccPlanningLedger 2026-10-14-17:25:
+    Errata E5-L1 item 1: the two admissions must really overlap. An admin transaction holds the anchor row, both
+    admissions start, a bounded poll of pg_stat_activity sees both backends waiting on a lock, and only then does the
+    admin transaction commit. Without the forced overlap the second admission simply ran after the first one committed,
+    so removing the row locks and the spend compare-and-set went unnoticed.
+    */
     const run = await seedRun({ planningAllocation: 2 });
     await oneAttempt(run, SPEC_AUTHOR, 1);
-    const results = await Promise.allSettled([
-      admitCccPlanningDispatch(layer, request(run, PLANNER, 1, 1)),
-      admitCccPlanningDispatch(layer, request(run, RESEARCHER, 1, 1)),
-    ]);
+    let race: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    let waiters = 0;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`
+        SELECT 1 FROM project.ccc_planning_runs WHERE project_id = ${PROJECT} AND run_id = ${run.runId} FOR UPDATE
+      `);
+      race = Promise.allSettled([
+        admitCccPlanningDispatch(layer, request(run, PLANNER, 1, 1)),
+        admitCccPlanningDispatch(layer, request(run, RESEARCHER, 1, 1)),
+      ]);
+      waiters = await awaitLockWaiters(2);
+    });
+    expect(waiters).toBe(2);
+    const results = await race!;
     const admitted = results.filter((result) => result.status === "fulfilled");
     const refused = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
     expect(admitted).toHaveLength(1);
@@ -541,8 +620,14 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
     expect(await anchor(run.runId)).toMatchObject({ review_proof_spent: 1, planning_spent: 0 });
     await commit(scope);
 
+    // Errata E5-L1 item 2: re-lease the planning work item first, so the planning fence would pass the liveness lock
+    // and only the fence-kind check (D14: review/proof spend only under the campaign fence) can refuse it.
+    await db.execute(sql`
+      UPDATE project.workflow_work_items SET state = 'running', lease_owner = ${run.fence.leaseOwner}, lease_expires_at = ${FAR}
+       WHERE project_id = ${PROJECT} AND id = ${run.workItemId} AND attempt = ${run.fence.attempt}
+    `);
     await expectRefusal(admitCccPlanningDispatch(layer, request(run, reviewer, 1, 2, { fence: run.fence })),
-      "CCC_PLANNING_FENCE_STALE");
+      "CCC_PLANNING_FENCE_STALE", /a campaign fence is required/u);
     const other = await seedLinkedRun();
     await expectRefusal(admitCccPlanningDispatch(layer, request(run, reviewer, 1, 2, { fence: other.campaignFence })),
       "CCC_PLANNING_FENCE_STALE");
@@ -596,5 +681,151 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
     await settleCccPlanningResearchFetch(layer, { grantKey: first.grantKey, rawBytes: 2048, outcome: "fetched" });
     expect(await anchor(run.runId)).toMatchObject({ research_fetch_spent: 1, research_bytes_spent: 2048 });
     expect((await fetch(1)).grantKey).toBe(`${run.runId}:f2`);
+  });
+
+  async function claimChunk(run: Run, i: { authors?: CccPlanningRoleId[]; reviewers?: CccPlanningRoleId[] } = {}) {
+    return claimCccPlanningRepairChunk(layer, {
+      runId: run.runId, source: "planning-rejection", candidateDigest: sha("candidate"),
+      repairAuthors: i.authors ?? ["spec-author"], reReviewers: i.reviewers ?? [], fence: run.fence,
+    });
+  }
+
+  const REPAIR_1: Lineage = { stageId: "repair", roleId: "spec-author", lineageId: "repair:1:spec-author" };
+  const ADVERSARY_RV1: Lineage = { stageId: "review", roleId: "product-adversary", lineageId: "review:product-adversary:rv1" };
+
+  it("refuses an unclaimed repair lineage, an unclaimed review node and a lineage outside its stage; claimed lineages are admitted (ADV-1)", async () => {
+    const run = await seedRun();
+    await oneAttempt(run, SPEC_AUTHOR, 1);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, REPAIR_1, 1, 1)), /lineage-not-admitted/u);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, ADVERSARY_RV1, 1, 1)), /lineage-not-admitted/u);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, { ...SPEC_AUTHOR, stageId: "repair" }, 1, 1)),
+      /lineage-not-admitted/u);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 1, repair_chunks_used: 0 });
+    expect(await events(run.runId, "ccc-planning:call:reserved")).toHaveLength(1);
+
+    await claimChunk(run, { reviewers: ["product-adversary"] });
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, { ...REPAIR_1, stageId: "spec" }, 1, 1)),
+      /lineage-not-admitted/u);
+    await oneAttempt(run, REPAIR_1, 1);
+    await oneAttempt(run, ADVERSARY_RV1, 1);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 3, repair_chunks_used: 1 });
+  });
+
+  it("refuses a repair lineage above CCC_PLANNING_MAX_REPAIR_CHUNKS even with a lineage:created event; the highest allowed ordinal is admitted", async () => {
+    const forged = (ordinal: number) => ({
+      lineageId: `repair:${ordinal}:spec-author`, kind: "author-repair", roleId: "spec-author", parentLineageId: "spec:spec-author",
+      chunkOrdinal: ordinal, inheritedDispatchAttempts: 0,
+    });
+    const beyond = await seedRun();
+    const over = CCC_PLANNING_MAX_REPAIR_CHUNKS + 1;
+    await forgeLineageEvent(beyond, forged(over));
+    await expectRouteRefusal(admitCccPlanningDispatch(layer,
+      request(beyond, { ...REPAIR_1, lineageId: `repair:${over}:spec-author` }, 1, 1)), /lineage-not-admitted/u);
+    expect(await anchor(beyond.runId)).toMatchObject({ planning_spent: 0 });
+
+    const highest = await seedRun();
+    await forgeLineageEvent(highest, forged(CCC_PLANNING_MAX_REPAIR_CHUNKS));
+    await oneAttempt(highest, { ...REPAIR_1, lineageId: `repair:${CCC_PLANNING_MAX_REPAIR_CHUNKS}:spec-author` }, 1);
+  });
+
+  it("after a repair chunk claims lineages for a role, earlier lineages of that role take no new turn key (ADV-9)", async () => {
+    const twin = await seedRun();
+    await oneAttempt(twin, SPEC_AUTHOR, 1);
+    await oneAttempt(twin, SPEC_AUTHOR, 2);
+
+    const run = await seedRun();
+    await oneAttempt(run, SPEC_AUTHOR, 1);
+    await claimChunk(run, { reviewers: ["product-adversary"] });
+    await oneAttempt(run, REPAIR_1, 1);
+    await oneAttempt(run, REPAIR_1, 2);
+    await expectLimit(admitCccPlanningDispatch(layer, request(run, REPAIR_1, 3, 1)), "dispatch-cap");
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 2, 1)), /lineage-superseded/u);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, ADVERSARY, 1, 1)), /lineage-superseded/u);
+    await oneAttempt(run, ADVERSARY_RV1, 1);
+    const authorTurns = new Set((await events(run.runId, "ccc-planning:call:reserved"))
+      .map((row) => row.metadata as Row).filter((meta) => meta.roleId === "spec-author").map((meta) => meta.turnKey));
+    expect(authorTurns.size).toBe(3);
+  });
+
+  it("refuses a repair chunk with UNRECONCILED_DISPATCH while an earlier lineage of the role is dispatched_unknown and writes nothing (ADV-8)", async () => {
+    const run = await seedRun();
+    const pending = await admit(request(run, SPEC_AUTHOR, 1, 1));
+    await expectRefusal(claimChunk(run), "CCC_PLANNING_UNRECONCILED_DISPATCH", /spec-author/u);
+    const critic = await seedRun();
+    const reviewing = await admit(request(critic, ADVERSARY, 1, 1));
+    await expectRefusal(claimChunk(critic, { authors: [], reviewers: ["product-adversary"] }), "CCC_PLANNING_UNRECONCILED_DISPATCH",
+      /product-adversary/u);
+    for (const target of [run, critic]) {
+      expect(await anchor(target.runId)).toMatchObject({ repair_chunks_used: 0, repair_epoch_state: "unopened" });
+      expect(await events(target.runId, "ccc-planning:repair-chunk")).toHaveLength(0);
+      expect(await events(target.runId, "ccc-planning:lineage:created")).toHaveLength(0);
+    }
+
+    await commit(pending);
+    expect((await claimChunk(run)).chunkOrdinal).toBe(1);
+    await oneAttempt(run, REPAIR_1, 1);
+    await commit(reviewing);
+    expect((await claimChunk(critic, { authors: [], reviewers: ["product-adversary"] })).chunkOrdinal).toBe(1);
+  });
+
+  it("refuses a settlement whose refusal reason is outside the union with INTERNAL_ERROR and writes nothing (ADV-2)", async () => {
+    const run = await seedRun();
+    const scope = await admit(request(run, SPEC_AUTHOR, 1, 1));
+    const drifted = { ...route(scope.binding), effectiveModel: "glm/glm-5.3-flash" };
+    await expectRefusal(settleCccPlanningCall(layer, settlement(scope, {
+      outcome: "proved_failed", refusalReason: "receipt_mismatch" as never, effectiveRoute: drifted,
+    })), "CCC_PLANNING_INTERNAL_ERROR", /refusalReason/u);
+    expect(await events(run.runId, "ccc-planning:call:terminal")).toHaveLength(0);
+    expect(await anchor(run.runId)).toMatchObject({ state: "running", state_code: null, planning_spent: 1 });
+    await expectLimit(admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 1, 2)), "unreconciled-dispatch");
+
+    await settleCccPlanningCall(layer, settlement(scope, {
+      outcome: "proved_failed", refusalReason: "receipt-mismatch", effectiveRoute: drifted,
+    }));
+    expect((await events(run.runId, "ccc-planning:call:terminal")).map((row) => (row.metadata as Row).outcome))
+      .toEqual(["refused_known_effect"]);
+    expect(await anchor(run.runId)).toMatchObject({ state: "blocked_provider", state_code: "CCC_PROVIDER_PIN_DRIFT" });
+  });
+
+  it("an earlier epoch's digest redelivered after a later epoch is a replay that records nothing (ADV-5)", async () => {
+    const run = await seedRun();
+    const epoch = (n: number, blockingFindings: number) => recordCccPlanningReviewEpoch(layer, {
+      runId: run.runId, fence: run.fence, epochDigest: sha(`epoch-${n}`), blockingFindings,
+    });
+    expect(await epoch(1, 5)).toEqual({ reviewEpochs: 1, stagnantEpochs: 0, stop: false });
+    expect(await epoch(2, 5)).toEqual({ reviewEpochs: 2, stagnantEpochs: 1, stop: false });
+    expect(await epoch(1, 5)).toEqual({ reviewEpochs: 1, stagnantEpochs: 0, stop: false });
+    expect(await anchor(run.runId)).toMatchObject({ review_epochs: 2, stagnant_epochs: 1 });
+    expect(await events(run.runId, "ccc-planning:review-epoch")).toHaveLength(2);
+    expect(await epoch(3, 5)).toEqual({ reviewEpochs: 3, stagnantEpochs: 2, stop: true });
+  });
+
+  it("refuses an audit id over 256 characters or a malformed digest with INTERNAL_ERROR before any write; bounded values are admitted", async () => {
+    const run = await seedRun();
+    const refused: Array<{ overrides: BindingOverrides; field: RegExp }> = [
+      { overrides: { providerId: "p".repeat(257) }, field: /providerId/u },
+      { overrides: { lineageId: "l".repeat(257) }, field: /lineageId/u },
+      { overrides: { toolsetDigest: sha("tools").toUpperCase() }, field: /toolsetDigest/u },
+      { overrides: { promptDigest: sha("prompt").slice(1) }, field: /promptDigest/u },
+    ];
+    for (const { overrides, field } of refused) {
+      await expectRefusal(admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 1, 1, { overrides })),
+        "CCC_PLANNING_INTERNAL_ERROR", field);
+    }
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 0 });
+    expect(await events(run.runId, "ccc-planning:call:reserved")).toHaveLength(0);
+
+    const scope = await admit(request(run, SPEC_AUTHOR, 1, 1, { overrides: { providerId: "p".repeat(256) } }));
+    await expectRefusal(proveCccPlanningCallNotDispatched(layer, scope, "not-a-digest"), "CCC_PLANNING_INTERNAL_ERROR",
+      /evidenceDigest/u);
+    await expectRefusal(settleCccPlanningCall(layer, settlement(scope, {
+      outcome: "proved_failed", refusalReason: "provider-error-event", evidenceDigest: sha("evidence").toUpperCase(),
+    })), "CCC_PLANNING_INTERNAL_ERROR", /evidenceDigest/u);
+    await expectRefusal(settleCccPlanningCall(layer, settlement(scope, {
+      outcome: "proved_failed", refusalReason: "receipt-mismatch",
+      effectiveRoute: { ...route(scope.binding), effectiveModel: "m".repeat(257) } as never,
+    })), "CCC_PLANNING_INTERNAL_ERROR", /effectiveModel/u);
+    expect(await events(run.runId, "ccc-planning:call:terminal")).toHaveLength(0);
+    expect((await proveCccPlanningCallNotDispatched(layer, scope, sha("not-dispatched"))).state).toBe("proved_failed");
   });
 });
