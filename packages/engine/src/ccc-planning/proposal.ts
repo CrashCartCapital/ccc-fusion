@@ -380,11 +380,23 @@ function invalidEnvelope(detail: string, field: string): never {
   throw new CccPlanningRefusal("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID", detail, field);
 }
 
-/** The producers that can support a truthful label: this run and revision, models only, every authoring kind present. */
+/**
+ * The producers that can support a truthful label: this run and revision, models only, exactly one complete envelope of each
+ * authoring kind and nothing else. FNXC:CccPlanningProposal 2026-10-14-21:01: ADR B Q2 derives the label from the envelopes of the
+ * requirement map, PRD, annex, plan and verifier bundle only. A review envelope, an older version of one kind or an envelope that
+ * is not complete would put a model in the label (and a row in the receipt) that wrote nothing in the packet (errata E9, IB1).
+ */
 function assertAuthoringProducers(producers: readonly CccPlanningArtifactEnvelopeV1[], runId: string, runRevision: number): void {
   assertCccPlanningRunRevision(runId, runRevision);
   if (!Array.isArray(producers) || producers.length === 0) invalidEnvelope("authorship needs the producer envelopes of the authoring artifacts", "producers");
+  const seenKinds = new Set<CccPlanningArtifactKind>();
   for (const envelope of producers) {
+    if (!AUTHORING_KINDS.includes(envelope.kind)) {
+      invalidEnvelope(`envelope ${envelope.artifactKey} is a ${envelope.kind} artifact, which authored nothing in the packet`, "producers");
+    }
+    if (seenKinds.has(envelope.kind)) invalidEnvelope(`more than one producer envelope for the ${envelope.kind} artifact`, "producers");
+    seenKinds.add(envelope.kind);
+    if (envelope.status !== "complete") invalidEnvelope(`envelope ${envelope.artifactKey} has status ${envelope.status}, not complete`, "producers");
     if (envelope.runId !== runId || envelope.runRevision !== runRevision) {
       throw new CccPlanningRefusal(
         "CCC_PLANNING_ARTIFACT_RUN_MISMATCH",

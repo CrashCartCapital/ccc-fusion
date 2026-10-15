@@ -423,11 +423,12 @@ describe("ccc planning packet sources", () => {
   });
 
   it("refuses a requirement id the acceptance grammar cannot carry; the twin with a canonical id renders", () => {
+    // FNXC:CccPlanningProposal 2026-10-14-21:01: the rename must reach every place K1 cross-checks the id (the requirement, the proof that covers it and the control that targets it); otherwise K1 refuses every renamed id, the valid one included, and the grammar check is never reached (mutant K7). The twin renames to a different canonical id so it goes through the same edit path.
     const render = (id: string) => () => renderCccPlanningFinalPrd({
       requirementMap: edit(REQUIREMENT_MAP, (draft) => { draft.requirements[0]!.id = id; }),
-      verifierBundle: edit(VERIFIER_BUNDLE, (draft) => { draft.proofs[0]!.requirementIds = [id]; }),
+      verifierBundle: edit(VERIFIER_BUNDLE, (draft) => { draft.proofs[0]!.requirementIds = [id]; draft.controls[0]!.requirementId = id; }),
     });
-    expect(refusalCode(render("REQ-TOKENIZER"))).toBe("no refusal");
+    expect(refusalCode(render("REQ-TOKENS"))).toBe("no refusal");
     expect(refusalCode(render("REQ TOKENIZER"))).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
     expect(refusalCode(render("AC-TOKENIZER"))).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
   });
@@ -496,6 +497,8 @@ describe("ccc planning truthful authorship", () => {
     const mixed = producers({ technical_annex: { resolvedModel: M3 }, task_plan: { resolvedModel: M3 } });
     expect(adapterFor(proposal, mixed).model).toBe("glm/glm-5.3+minimax/MiniMax-M3");
     expect(adapterFor(proposal, [...mixed].reverse()).model).toBe("glm/glm-5.3+minimax/MiniMax-M3");
+    // FNXC:CccPlanningProposal 2026-10-14-21:01: the first producer in input order resolved to M3 and a GLM producer follows, so only a sort puts glm first (mutant L3). Every other case here had insertion order and sorted order agree.
+    expect(adapterFor(proposal, producers({ requirement_map: { resolvedModel: M3 } })).model).toBe("glm/glm-5.3+minimax/MiniMax-M3");
     const allM3 = producers(Object.fromEntries(PRODUCER_ROWS.map((row) => [row.kind, { resolvedModel: M3 }])));
     expect(adapterFor(proposal, allM3).model).toBe(M3);
   });
@@ -515,6 +518,22 @@ describe("ccc planning truthful authorship", () => {
     expect(refusalCode(create(producers(), RUN_ID, 0))).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
     const controllerPrd: CccPlanningArtifactEnvelopeV1 = edit(envelope(PRODUCER_ROWS[1]!), (draft) => { draft.producer.kind = "controller"; draft.producer.roleId = "controller"; delete draft.producer.resolvedModel; delete draft.producer.requestedModel; });
     expect(refusalCode(create([...producers().filter(({ kind }) => kind !== "final_prd"), controllerPrd]))).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    // FNXC:CccPlanningProposal 2026-10-14-21:01: the label names only the models that wrote the packet (ADR B Q2: the envelopes of the requirement map, PRD, annex, plan and verifier bundle). Another kind, a second envelope of one kind, or an envelope that is not complete would each add a model to the label that wrote nothing in the packet (mutants N1, N2, N3).
+    const review = envelope({ kind: "task_review", stageId: "g7", roleId: "spec-author", slot: "rev" }, { resolvedModel: "openai/gpt-5.6" });
+    expect(refusalCode(create([...producers(), review]))).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    const olderMap = edit(envelope(PRODUCER_ROWS[0]!, { resolvedModel: M3 }), (draft) => {
+      draft.version = 2;
+      draft.artifactKey = encodeCccPlanningArtifactKey({ runRevision: 1, stageId: "spec", slot: "reqmap", version: 2 });
+    });
+    expect(refusalCode(create([...producers(), olderMap]))).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    // control: the version 2 envelope is admissible on its own, so the refusal above comes from the second envelope of one kind
+    expect(refusalCode(create([...producers().filter(({ kind }) => kind !== "requirement_map"), olderMap]))).toBe("no refusal");
+    for (const status of ["refused", "infeasible", "blocked"] as const) {
+      const unfinishedPlan = edit(envelope(PRODUCER_ROWS[3]!), (draft) => { draft.status = status; });
+      expect(refusalCode(create([...producers().filter(({ kind }) => kind !== "task_plan"), unfinishedPlan])), `a ${status} task plan`).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
+    }
+    // the receipt builder shares the check, so a receipt cannot carry a sixth role row either
+    expect(refusalCode(() => buildCccPlanningAuthorshipReceipt({ proposal, producers: [...producers(), review], runId: RUN_ID, runRevision: 1 }))).toBe("CCC_PLANNING_ARTIFACT_ENVELOPE_INVALID");
   });
 
   it("builds a receipt with the proposal hash and one role row per producer in role order", () => {
@@ -710,6 +729,12 @@ describe("ccc planning authoring proposal", () => {
       .toEqual(["task_runner:Taskfile.yml", "harness:test/tokenizer.test.mjs", "fixture:test/fixture.json"]);
     const editedPrd = { ...sourcesFor(BASE_FIXTURE), finalPrd: Buffer.from(sourcesFor(BASE_FIXTURE).finalPrd.toString("utf8").replace("Requirement statement:", "Requirement summary:"), "utf8") };
     expect(refusalCode(build(BASE_FIXTURE, editedPrd))).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    // FNXC:CccPlanningProposal 2026-10-14-21:01: a source with one unreviewed line appended must be refused by the equal-to-the-renderer check, because the quote self-check never sees a line no quote cites (mutants S1, S2, S3). The passing twin is the unedited source set above.
+    for (const key of ["finalPrd", "technicalAnnex", "admissionFacts"] as const) {
+      const base = sourcesFor(BASE_FIXTURE);
+      const appended = { ...base, [key]: Buffer.concat([base[key], Buffer.from("Unreviewed extra line.\n", "utf8")]) };
+      expect(refusalCode(build(BASE_FIXTURE, appended)), `${key} with an unreviewed line`).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    }
     const missingQuote = edit(BASE_FIXTURE, (draft) => { draft.request = draft.request.replace(REQUEST_QUOTE.tokenizer, "It needs a splitter."); });
     expect(refusalCode(build(missingQuote))).toBe("CCC_PLANNING_REQUEST_QUOTE_UNRESOLVED");
     const repeatedQuote = edit(BASE_FIXTURE, (draft) => { draft.request = `${draft.request}${REQUEST_QUOTE.tokenizer}\n`; });

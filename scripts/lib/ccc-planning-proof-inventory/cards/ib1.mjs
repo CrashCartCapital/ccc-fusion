@@ -1,10 +1,10 @@
 /*
-FNXC:CccPlanningProof 2026-10-14-20:27:
+FNXC:CccPlanningProof 2026-10-14-21:07:
 Proof inventory for request-to-code v3 card IB1 (packet and truthful proposal; contract 2.17, ADR B Q2, test T2.5). One module per card keeps the inventory files disjoint (contract 0.18); `index.mjs` (owned by P0) loads `cards/*.mjs` in sorted order and rejects duplicate command ids.
 
 The card owns one engine test file, so the same file appears twice under two ids. TARGETED is file-closed: every test the file holds must pass, so a new test is covered without touching this module. OFFLINE is name-closed: the names below are exactly the file's tests, built the way `assertionName` in `scripts/lib/ccc-closed-vitest-results.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Both are pinned to `engine-default`, whose aliases point @fusion/core at source, so no build runs and nothing needs PostgreSQL (`needsPostgres` false, errata E1-1).
 
-Measured on the M5 Max under a load average near 12 (parallel agents): 3 s wall, 2.6 s vitest duration for 28 tests, including transform and import. The command timeout is a hang bound over that measurement; no test timeout is raised anywhere.
+Measured on the M5 Max under a load average near 10 (parallel agents) after repair 1 (errata E9): 3.0 s wall from the pnpm command to exit, 2.0 s vitest duration for 28 tests, including transform and import. Repair 1 adds assertions inside existing tests and no test, so the 28 names below are unchanged. The command timeout is a hang bound over that measurement; no test timeout is raised anywhere.
 */
 
 const TEST_FILE = "src/__tests__/ccc-planning-proposal.test.ts";
