@@ -53,18 +53,26 @@ function certificateBodyDigest(certificate: CccPlanningQualificationCertificateV
   return createHash("sha256").update(canonicalCccPrdJson(body), "utf8").digest("hex");
 }
 
+/** A scope list: an array whose entries are all strings. Anything else names nothing. */
+function isStringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+/*
+FNXC:CccPlanningQualification 2026-10-14-18:27:
+Errata E7-K item 1. A string scope field made `.includes` a substring search, so a certificate whose scope named no class, mode or profile as a list entry still admitted a real repository (adversary probe F1). Each scope field must be an array of strings before any membership test; a certificate that fails that, or whose digest cannot be computed, qualifies nothing.
+*/
 function certificateApplies(
   certificate: CccPlanningQualificationCertificateV1, targetClass: string, mode: "spec" | "build", profile: string,
 ): boolean {
   try {
     if (certificate.schema !== "ccc-planning.qualification-certificate.v1") return false;
     if (certificate.certificateId !== certificateBodyDigest(certificate)) return false;
-    const { scope } = certificate;
-    return (scope.targetClasses as readonly string[]).includes(targetClass)
-      && scope.modes.includes(mode)
-      && (scope.profiles as readonly string[]).includes(profile);
+    const { targetClasses, modes, profiles } = certificate.scope as Readonly<Record<string, unknown>>;
+    if (!isStringList(targetClasses) || !isStringList(modes) || !isStringList(profiles)) return false;
+    return targetClasses.includes(targetClass) && modes.includes(mode) && profiles.includes(profile);
   } catch {
-    return false; // a malformed certificate qualifies nothing
+    return false; // a certificate whose fields cannot be read or digested qualifies nothing
   }
 }
 

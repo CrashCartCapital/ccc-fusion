@@ -14,6 +14,8 @@ FNXC:CccPlanningQualification 2026-10-14-13:45:
 Card K2 RED for the pre-qualification rule (D24, PRD section 7, critic 11). Until I6 the qualification port finds no certificate, so G0 admits only an owned disposable target named by a receipt. Each refusal has a control on the same fixture that differs in one field and is admitted, so a refuse-everything decision fails too. The receipt fixtures only need the fields the decision reads; an `admitted_repository` receipt cannot be expressed in the I1 receipt type, so it is cast, exactly as a future widened receipt would arrive.
 FNXC:CccPlanningQualification 2026-10-14-17:16:
 Repair 1 (errata E5-K2 item 5): a certificate of another schema, or whose profile scope omits full-v2, qualifies nothing even when its id is the true digest of its body; round-1 mutants that deleted either check left every test green.
+FNXC:CccPlanningQualification 2026-10-14-18:27:
+Repair 2 (errata E7-K item 1): a scope field that is a string, not a list, made `.includes` a substring search, so a certificate whose scope named no class, mode or profile as a list entry still admitted a real repository (adversary probe F1). Each scope field must be an array of strings; the certificate id is recomputed for every malformed body, so only the field's type differs from the admitted twin.
 */
 
 const DIGESTS: CccPlanningQualificationDigestsV1 = {
@@ -39,6 +41,19 @@ function certificate(scope: { targetClasses: ("owned_disposable" | "admitted_rep
   };
   const certificateId = createHash("sha256").update(canonicalCccPrdJson(body), "utf8").digest("hex");
   return { ...body, certificateId };
+}
+
+/** A certificate with any scope value at all, its id the true digest of its body: the shape a future port could hand over. */
+function rawCertificate(scope: Readonly<Record<string, unknown>>): CccPlanningQualificationCertificateV1 {
+  const body = {
+    schema: "ccc-planning.qualification-certificate.v1",
+    issuedAt: "2027-01-01T00:00:00.000Z",
+    scope,
+    digests: DIGESTS,
+    evidence: { reportSha256: "9".repeat(64), heldOutResultsSha256: "a".repeat(64), reviewDispositionsSha256: "b".repeat(64) },
+  };
+  const certificateId = createHash("sha256").update(canonicalCccPrdJson(body), "utf8").digest("hex");
+  return { ...body, certificateId } as unknown as CccPlanningQualificationCertificateV1;
 }
 
 describe("qualification port", () => {
@@ -106,6 +121,24 @@ describe("pre-qualification target admission", () => {
         JSON.stringify(override)).toEqual({ admitted: false, code: "CCC_PLANNING_QUALIFICATION_REQUIRED" });
     }
     expect(decideCccPlanningTargetAdmission({ certificate: certificate(scope, { profiles: ["full-v2"] }), receipt: repository, mode: "build" }))
+      .toEqual({ admitted: true, basis: "qualification_certificate" });
+  });
+
+  it("ignores a certificate whose scope field is a string or holds a non-string entry, each with its id recomputed, and admits the array twin", () => {
+    // E7-K item 1: a string scope field made `.includes` a substring search (adversary probe F1).
+    const repository = receiptWith("admitted_repository");
+    const arrays = { targetClasses: ["admitted_repository"], modes: ["build"], profiles: ["full-v2"] };
+    const rows: readonly [string, Readonly<Record<string, unknown>>][] = [
+      ["targetClasses as a string", { ...arrays, targetClasses: "admitted_repository" }],
+      ["modes as a string", { ...arrays, modes: "build" }],
+      ["profiles as a string", { ...arrays, profiles: "full-v2" }],
+      ["targetClasses with a non-string entry", { ...arrays, targetClasses: ["admitted_repository", 7] }],
+    ];
+    for (const [label, scope] of rows) {
+      expect(decideCccPlanningTargetAdmission({ certificate: rawCertificate(scope), receipt: repository, mode: "build" }), label)
+        .toEqual({ admitted: false, code: "CCC_PLANNING_QUALIFICATION_REQUIRED" });
+    }
+    expect(decideCccPlanningTargetAdmission({ certificate: rawCertificate(arrays), receipt: repository, mode: "build" }))
       .toEqual({ admitted: true, basis: "qualification_certificate" });
   });
 });

@@ -17,6 +17,8 @@ FNXC:CccPlanningAuthority 2026-10-14-13:45:
 Card K2 RED for the live-authority receipt (D23, ADR D Q3, CONTRACT-v3 section 2.18). Every refusal case is the control receipt with exactly one field changed and the confirmation re-derived for the changed body, so the refusal can only come from that field: the positive control on the same fixture is admitted. The confirmation digest is computed here independently (sha256 of the canonical receipt without `operatorConfirmation`), never through the function under test, so a wrong digest implementation cannot certify its own fixtures.
 FNXC:CccPlanningAuthority 2026-10-14-17:16:
 Repair 1 (errata E5-K2). The envelope fixture's run is the run that consumed the control receipt: its id is K1's `cccPlanningRunId` over the receipt's project, request digest and SHA-256, and the import key is derived from that id, so a test that swaps the receipt re-derives the run it belongs to (`aroundReceipt`) and only the field under test differs. The non-vacuity tables pin each guard the round-1 mutation runs showed no test could see; the mutation run that kills each one is reported with the repair.
+FNXC:CccPlanningAuthority 2026-10-14-18:27:
+Repair 2 (errata E7-K items 2, 3, 4 and 6). A campaign deadline is bounded by the receipt's deadline even when the run row carries a later one (the old row set both deadlines equal, so dropping the receipt's bound left it green); the receipt's implementation cap must be a number, since an unparsed receipt with the string "3500" compared as a number; a sealed receipt listing two protected actions, the receipt `schema` literal and invalid UTF-8 inside a JSON string value each have a pinning row (the old [0xff, 0xfe] input failed JSON parse whether or not decoding was fatal); and a changed path with a `.git` segment in any letter case is outside the admitted Fusion paths, as an admitted pattern already is.
 */
 
 type MutableBody = Record<string, unknown> & {
@@ -307,6 +309,27 @@ describe("live-authority receipt parse", () => {
     }
     expect(parse((b) => { b.target.admittedFusionPaths = ["proof/**", ".github/**"]; }).ok).toBe(true);
   });
+
+  it("refuses another receipt schema and invalid UTF-8 inside a JSON string value as INVALID, each against an admitted control", () => {
+    // E7-K item 4(b): the schema literal; the confirmation digest relies on it for domain separation.
+    expect(refusal(parse((b) => { b.schema = "ccc-planning.live-authority-receipt.v2"; })))
+      .toEqual({ code: "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID", field: "schema" });
+    expect(parse((b) => { b.schema = "ccc-planning.live-authority-receipt.v1"; }).ok).toBe(true);
+    // E7-K item 4(c): the receipt's actorName holds U+FFFD and is sealed over it. Its valid UTF-8 bytes (EF BF BD) are
+    // admitted; the same bytes with that character replaced by the invalid byte 0xff decode to the same text unless the
+    // decoder is fatal, so only a fatal decode refuses them.
+    const body = controlBody();
+    (body.operator as Record<string, unknown>).actorName = "Ry�an";
+    const sealed = seal(body);
+    const valid = bytesOf(sealed);
+    const at = valid.findIndex((byte, index) => byte === 0xef && valid[index + 1] === 0xbf && valid[index + 2] === 0xbd);
+    expect(at).toBeGreaterThan(0);
+    const invalid = new Uint8Array([...valid.subarray(0, at), 0xff, ...valid.subarray(at + 3)]);
+    const options = { confirmDigest: sealed.operatorConfirmation, now: NOW, budgetPolicy: CCC_PLANNING_BUDGET_POLICY_V1 };
+    expect(refusal(parseCccPlanningLiveAuthorityReceipt(invalid, options)))
+      .toEqual({ code: "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID", field: "$" });
+    expect(parseCccPlanningLiveAuthorityReceipt(valid, options).ok).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------- envelope check
@@ -527,5 +550,44 @@ describe("receipt envelope check", () => {
       .toEqual({ code: MISMATCH, field: "baseline.changedPaths" });
     expect(envelope((i) => ({ ...i, baseline: { ...i.baseline, changedPaths: ["proof/src/index.mjs"] } })))
       .toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses a campaign deadline after the receipt's when the run's own deadline is later, and the receipt's deadline stays within", () => {
+    // E7-K item 2: the run row's deadline is later than the receipt's, so only the receipt's bound can refuse.
+    const laterRun = (campaignDeadlineAt: string) => (i: EnvelopeInput) => ({
+      ...i, run: { ...i.run, deadlineAt: "2026-10-17T12:00:00.000Z" }, authorization: { ...i.authorization, campaignDeadlineAt } });
+    expect(envelope(laterRun("2026-10-16T12:00:00.001Z"))).toEqual({ code: MISMATCH, field: "authorization.campaignDeadlineAt" });
+    expect(envelope(laterRun(DEADLINE))).toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses a resealed receipt whose implementation cap is the string 3500 or a fraction, and the number 3500 stays within", () => {
+    // E7-K item 3: an unparsed receipt's cap must be a number; "3500" used to compare as 3500 and admit.
+    const capOf = (cap: unknown) => (i: EnvelopeInput) => {
+      const next = aroundReceipt(i, receiptOf((b) => { b.phaseCallCaps.implementation = cap; }));
+      return { ...next, run: { ...next.run, implementationCallsRemaining: 4000 }, authorization: { ...next.authorization, maxRequests: 3500 } };
+    };
+    expect(envelope(capOf("3500"))).toEqual({ code: MISMATCH, field: "authorization.maxRequests" });
+    // A number that is not a safe integer is not a cap either (NaN cannot be sealed: canonical JSON refuses it).
+    expect(envelope(capOf(3500.5))).toEqual({ code: MISMATCH, field: "authorization.maxRequests" });
+    expect(envelope(capOf(3500))).toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses a sealed receipt listing the controller release and then the operator release, and the controller release alone stays within", () => {
+    // E7-K item 4(a): the envelope's own one-action rule, for a receipt object that did not come from parse.
+    const controller = { kind: "live_execution", release: "controller_within_receipt" };
+    const operator = { kind: "live_execution", release: "operator_confirm_after_import" };
+    expect(envelope((i) => aroundReceipt(i, receiptOf((b) => { b.permittedProtectedActions = [controller, operator]; }))))
+      .toEqual({ code: MISMATCH, field: "receipt.permittedProtectedActions" });
+    expect(envelope((i) => aroundReceipt(i, receiptOf((b) => { b.permittedProtectedActions = [controller]; }))))
+      .toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses a changed path with a .git segment in any letter case, and proof/x stays within", () => {
+    // E7-K item 6: the admitted patterns already ban a .git segment case-insensitively; the observed changed paths now do too.
+    for (const path of ["proof/.GIT/config", "proof/.git/config", "proof/sub/.Git/HEAD"]) {
+      expect(envelope((i) => ({ ...i, baseline: { ...i.baseline, changedPaths: [path] } })), path)
+        .toEqual({ code: MISMATCH, field: "baseline.changedPaths" });
+    }
+    expect(envelope((i) => ({ ...i, baseline: { ...i.baseline, changedPaths: ["proof/x"] } }))).toEqual({ code: "within", field: "" });
   });
 });

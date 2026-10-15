@@ -7,6 +7,8 @@ TARGETED is file-closed over the three K2 test files of the card's check command
 Measured on the M5 Max under parallel agent load: about 5 s wall for the three files, 35 tests. The 60 s command timeout is that measurement with headroom for a slower host; no test timeout is raised anywhere.
 FNXC:CccPlanningProofInventory 2026-10-14-17:16:
 Repair 1 (errata E5-K2) adds 11 tests, so OFFLINE now names 46: the run-to-receipt binding, the remaining-calls guard, the literal Flash member and slot, the route-kind allowlist, one provider per model, the case-insensitive .git ban, and the non-vacuity tables for the envelope, parse, route admission and certificate guards. The command still measures well under 5 s wall (the vitest run itself is under 1 s), so the 60 s timeout is unchanged.
+FNXC:CccPlanningProofInventory 2026-10-14-18:27:
+Repair 2 (errata E7-K) adds 7 tests, so OFFLINE now names 53: certificate scope fields must be string lists, the receipt-deadline row with a later run deadline, the integer implementation cap, the two-action, schema and UTF-8 pinning rows, the review identity decided by its exact key set (with the review-of-review row whose reviewed identity the graph calls a writer), and the `.git` ban on changed paths. The vitest run is still under 1 s, so the 60 s timeout is unchanged.
 */
 
 const FILES = Object.freeze([
@@ -63,6 +65,7 @@ export const OFFLINE = Object.freeze([
       `${PARSE} > refuses more than one permitted protected action and any action other than live_execution`,
       `${PARSE} > refuses each field check of a one-field table built from the control as INVALID, and admits the control`,
       `${PARSE} > refuses an admitted Fusion path with a .git segment in any letter case, and admits .github`,
+      `${PARSE} > refuses another receipt schema and invalid UTF-8 inside a JSON string value as INVALID, each against an admitted control`,
       `${ENVELOPE} > accepts the control authorization inside the receipt envelope`,
       `${ENVELOPE} > accepts the import key ccc-plan:<24hex>:r1 and refuses ccc-plan:<24hex>:<digest>`,
       `${ENVELOPE} > refuses a member on glm/glm-5.3, a member on another provider and a non-pi member`,
@@ -73,6 +76,10 @@ export const OFFLINE = Object.freeze([
       `${ENVELOPE} > refuses remaining implementation calls that are not a non-negative safe integer, and the control 3072 stays within`,
       `${ENVELOPE} > refuses members on any model but the literal glm/glm-5.3-flash, even under a resealed receipt naming another Flash slot`,
       `${ENVELOPE} > refuses now before notBefore, zero members, maxRequests 0, a non-hex baseline, an unsealed edit and a dot-dot changed path`,
+      `${ENVELOPE} > refuses a campaign deadline after the receipt's when the run's own deadline is later, and the receipt's deadline stays within`,
+      `${ENVELOPE} > refuses a resealed receipt whose implementation cap is the string 3500 or a fraction, and the number 3500 stays within`,
+      `${ENVELOPE} > refuses a sealed receipt listing the controller release and then the operator release, and the controller release alone stays within`,
+      `${ENVELOPE} > refuses a changed path with a .git segment in any letter case, and proof/x stays within`,
       `${PORT} > the unqualified port finds no certificate for any digest tuple`,
       `${ADMISSION} > refuses an admitted_repository class with the null certificate as QUALIFICATION_REQUIRED; the owned_disposable control is admitted`,
       `${ADMISSION} > refuses a missing receipt as AUTHORITY_RECEIPT_REQUIRED, with or without a certificate`,
@@ -80,6 +87,7 @@ export const OFFLINE = Object.freeze([
       `${ADMISSION} > admits an admitted_repository through a certificate whose scope covers its class and mode`,
       `${ADMISSION} > ignores a certificate whose scope omits the class or mode, or whose id is not the digest of its body`,
       `${ADMISSION} > ignores a certificate of another schema or whose profile scope omits full-v2, each with its id recomputed`,
+      `${ADMISSION} > ignores a certificate whose scope field is a string or holds a non-string entry, each with its id recomputed, and admits the array twin`,
       `${ROUTES} > admits the control: Flash writers, M3 task reviews and an M3 final judge on their pinned providers`,
       `${ROUTES} > refuses combo/x as combo-route, and admits the control glm/glm-5.3-flash`,
       `${ROUTES} > refuses a Flash writer reviewed by glm/glm-5.3 as same-family-review, and admits the M3 control`,
@@ -93,6 +101,7 @@ export const OFFLINE = Object.freeze([
       `${ROUTES} > refuses pins that give two models the same provider as provider-not-pinned`,
       `${ROUTES} > refuses a G7 identity on a writer task, a G7 review of a review or of a non-writer, and a G8 judge with a reviewed task`,
       `${ROUTES} > refuses duplicate task ids, and a pin with the wrong family or a malformed settings digest`,
+      `${ROUTES} > decides a review identity by its exact key set, and refuses a review of a review identity the graph calls a writer`,
     ]),
     platform: "any",
     needsPostgres: false,

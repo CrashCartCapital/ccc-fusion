@@ -12,6 +12,8 @@ FNXC:CccRouteAdmission 2026-10-14-13:45:
 Card K2 RED for request-to-code route admission (critic 11, ADR C Q2 as amended by CONTRACT-v3 section 2.7). Admission is by allowlist: a writer is GLM 5.3 Flash, every review identity is MiniMax M3, each on its pinned loopback provider through the receipt adapter and Pi, and a reviewer never shares the reviewed writer's model family. Every refusal case is the admitted control set with one field changed, so a refuse-everything implementation fails the control.
 FNXC:CccRouteAdmission 2026-10-14-17:16:
 Repair 1 (errata E5-K2 items 3, 5 and 6). An unknown route kind is refused rather than judged as G8, a provider that serves two pinned models pins neither, and each graph-role, duplicate-id and pin-shape guard the round-1 mutants showed unprotected has a refusal with an admitted control. A role override changes one task's graph role and nothing else, so the control and the refusal differ in that one field.
+FNXC:CccRouteAdmission 2026-10-14-18:27:
+Repair 2 (errata E7-K item 5). A route is a review identity only when its key set is exactly the frozen review-identity shape, so a product route for a writer task that also carries `routeKind` is no longer judged as a G8 judge, which skipped the writer's role and model rule (adversary probe F4). The review-of-review row whose reviewed identity the graph calls a writer pins the `isReviewIdentity(reviewed)` guard on its own: without it that row is refused for family, not role.
 */
 
 const PINS: readonly CccQualifiedPin[] = [
@@ -207,5 +209,36 @@ describe("request-to-code route admission", () => {
         .toEqual(["T1:provider-not-pinned:glm/glm-5.3-flash", "T2:provider-not-pinned:glm/glm-5.3-flash"]);
     }
     expect(reasons(controlRoutes(), flashPin({ family: "glm", settingsEntrySha256: "2".repeat(64) }))).toEqual([]);
+  });
+
+  it("decides a review identity by its exact key set, and refuses a review of a review identity the graph calls a writer", () => {
+    // E7-K item 5, probe F4: a product route for writer T1 on M3 that also carries a G8 route kind is a writer route.
+    const withKind = (route: CccCampaignProductExecutionRoute) =>
+      ({ ...route, routeKind: "g8-judge", reviewOfTaskId: null }) as unknown as CccCampaignProductExecutionRoute;
+    const m3Writer = writer("T1", { modelId: "minimax/MiniMax-M3", providerId: "ccc-minimax-m3" });
+    expect(reasons([withKind(m3Writer)])).toEqual(["T1:role-model-mismatch:minimax/MiniMax-M3"]);
+    // Control: the plain product route is checked by the writer rule as before.
+    expect(reasons([m3Writer])).toEqual(["T1:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons([withKind(writer("T1"))])).toEqual(["T1:role-model-mismatch:glm/glm-5.3-flash"]);
+    expect(reasons([writer("T1")])).toEqual([]);
+    // A review identity with a key the shape does not name is not a review identity either.
+    const extraKey = { ...review("review:T1", "T1"), executor: "model" } as unknown as CccPlanningReviewIdentity;
+    expect(reasons(replaceAt(2, extraKey))).toEqual(["review:T1:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons(replaceAt(2, review("review:T1", "T1")))).toEqual([]);
+    // Exactly the shape: a judge identity without its taskId key, or with taskId swapped for another key, is refused.
+    // The G8 rule never reads taskId, so only the shape refuses these; the harness's graph answers for the missing id.
+    const withoutTaskId = { ...judge() };
+    delete (withoutTaskId as { taskId?: string }).taskId;
+    const swapped = { ...withoutTaskId, executor: "model" };
+    const graphAnswers: Readonly<Record<string, CccRouteRole>> = { undefined: "g7-review" };
+    for (const route of [withoutTaskId, swapped]) {
+      expect(reasons([...controlRoutes(), route as unknown as CccPlanningReviewIdentity], PINS, graphAnswers), JSON.stringify(Object.keys(route)))
+        .toEqual(["undefined:role-model-mismatch:minimax/MiniMax-M3"]);
+    }
+    // A G7 review of review:T1, which the graph calls a writer: refused for its role, not judged for family.
+    const reviewOfReview = [...controlRoutes(), review("review:review:T1", "review:T1")];
+    expect(reasons(reviewOfReview, PINS, { "review:review:T1": "g7-review", "review:T1": "writer" })).toEqual([
+      "review:T1:role-model-mismatch:minimax/MiniMax-M3", "review:review:T1:role-model-mismatch:minimax/MiniMax-M3",
+    ]);
   });
 });

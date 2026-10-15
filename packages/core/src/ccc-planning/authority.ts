@@ -132,6 +132,11 @@ function isRelativeNormalPath(value: unknown): value is string {
 FNXC:CccPlanningAuthority 2026-10-14-17:16:
 Errata E5-K2 item 7: the `.git` ban compares each segment through K1's `cccPlanningPathComparisonKey`, the one path identity of the I2 host's case-folding volume, so `.GIT/**` or `proof/.Git/config` is refused like `.git/**`. The envelope still matches changed paths against the admitted patterns exactly and case-sensitively, which can only refuse more.
 */
+/** A `.git` segment in any letter case, compared through K1's one path identity. */
+function hasGitSegment(path: string): boolean {
+  return path.split("/").some((segment) => cccPlanningPathComparisonKey(segment) === ".git");
+}
+
 /**
  * An admitted Fusion path is an exact relative path or `<dir>/**`, nothing else: no other wildcard, no `.git`
  * segment in any letter case. The grammar is closed so the envelope check can match it exactly, case-sensitively.
@@ -140,7 +145,7 @@ function isAdmittedFusionPathPattern(value: unknown): value is string {
   if (typeof value !== "string" || value.length > TEXT_MAX) return false;
   const base = value.endsWith("/**") ? value.slice(0, -3) : value;
   if (!isRelativeNormalPath(base) || /[*?[\]{}]/u.test(base)) return false;
-  return !base.split("/").some((segment) => cccPlanningPathComparisonKey(segment) === ".git");
+  return !hasGitSegment(base);
 }
 
 function matchesAdmittedFusionPath(path: string, pattern: string): boolean {
@@ -502,6 +507,8 @@ FNXC:CccPlanningAuthority 2026-10-14-13:52:
 The envelope check decides whether code may release live execution for the campaign this run imported, with no operator step (D36, leader ruling `controller_within_receipt`). It never widens: every field of the issued authorization must sit inside the receipt and the run, and any mismatch returns the field so AU2 falls back to `awaiting_execution_authority`. The import key is `cccPlanningImportKey(runId, runRevision)` (`ccc-plan:<24hex>:r<n>`, decision 0.5), not v1's digest-keyed form, so a retry with a changed digest can never point the release at a second campaign. The bundle hash is checked against the intent elsewhere (section 2.18). Two checks beyond ADR D's list are fail-closed bindings: the receipt is the one the run consumed (its SHA-256 and confirmation), and the authorization's project is the receipt's project.
 FNXC:CccPlanningAuthority 2026-10-14-17:16:
 Repair 1 (errata E5-K2 items 1, 2 and 4). The SHA-256 check alone was self-referential, because the caller supplies both the receipt and its hash, so a sealed receipt that allowed controller release could be presented for a run whose own receipt asked for the operator. The run is now bound to the receipt: `run.runId` must be K1's `cccPlanningRunId` over the receipt's project, its request digest (equal to the request bytes' digest after G0 step 4) and the receipt SHA-256, which is how AD1 derives it. Only a Build receipt releases, `maxRequests` is bounded by the receipt's own implementation cap as well as the run's remaining calls, and the remaining count must be a non-negative safe integer, since NaN or undefined made the upper bound silently pass. Every member, and the receipt's Flash slot, must be the literal `glm/glm-5.3-flash` (section 2.18), so a receipt object that did not come from parse cannot widen the member model through its own slot.
+FNXC:CccPlanningAuthority 2026-10-14-18:27:
+Repair 2 (errata E7-K items 3 and 6). The receipt's implementation cap must be a safe integer before `maxRequests` is compared with it, because an unparsed receipt carrying the string "3500" was coerced and admitted. Observed changed paths get the same case-insensitive `.git`-segment ban as the admitted patterns, so `proof/.GIT/config` no longer matches `proof/**`.
 */
 const FLASH_MODEL_ID = "glm/glm-5.3-flash";
 
@@ -545,8 +552,10 @@ function checkEnvelope(input: Parameters<typeof assertCccPlanningExecutionAuthor
     mismatch("authorization.targetBase", "not the observed Build baseline B1");
   }
   if (baseline.firstParent !== receipt.target.baseCommit) mismatch("baseline.firstParent", "B1's first parent is not the receipt's base commit");
+  // E7-K item 6: a changed path with a `.git` segment in any letter case is refused, as an admitted pattern already is.
   for (const path of baseline.changedPaths) {
-    if (!isRelativeNormalPath(path) || !receipt.target.admittedFusionPaths.some((pattern) => matchesAdmittedFusionPath(path, pattern))) {
+    if (!isRelativeNormalPath(path) || hasGitSegment(path)
+      || !receipt.target.admittedFusionPaths.some((pattern) => matchesAdmittedFusionPath(path, pattern))) {
       mismatch("baseline.changedPaths", `${JSON.stringify(path)} is outside the receipt's admitted Fusion paths`);
     }
   }
@@ -579,9 +588,14 @@ function checkEnvelope(input: Parameters<typeof assertCccPlanningExecutionAuthor
     || authorization.maxRequests > remaining) {
     mismatch("authorization.maxRequests", `must be at most the ${remaining} implementation calls remaining`);
   }
-  // Written as "not within" so a cap that is not a number (an unparsed receipt) refuses instead of comparing false.
-  if (!(authorization.maxRequests <= receipt.phaseCallCaps.implementation)) {
-    mismatch("authorization.maxRequests", `must be at most the receipt's ${receipt.phaseCallCaps.implementation} implementation calls`);
+  // E7-K item 3: the cap must itself be a safe integer. Parse already requires that, but a receipt object that did not
+  // come from parse could carry the string "3500", which `<=` coerces to a number and would have admitted.
+  const cap: unknown = receipt.phaseCallCaps.implementation;
+  if (typeof cap !== "number" || !Number.isSafeInteger(cap)) {
+    mismatch("authorization.maxRequests", "the receipt's implementation cap is not an integer");
+  }
+  if (authorization.maxRequests > cap) {
+    mismatch("authorization.maxRequests", `must be at most the receipt's ${cap} implementation calls`);
   }
   const deadline = Math.min(envelopeTime(receipt.deadlineAt, "receipt.deadlineAt"), envelopeTime(run.deadlineAt, "run.deadlineAt"));
   if (envelopeTime(authorization.campaignDeadlineAt, "authorization.campaignDeadlineAt") > deadline) {

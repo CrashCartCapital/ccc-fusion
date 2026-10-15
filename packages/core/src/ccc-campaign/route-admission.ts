@@ -49,8 +49,22 @@ const REVIEW_MODEL: CccPlanningExactModelId = "minimax/MiniMax-M3";
 const RECEIPT_ADAPTER = "terminal-route-sse-comments.v1";
 const SHA256_HEX = /^[a-f0-9]{64}$/u;
 
+/*
+FNXC:CccRouteAdmission 2026-10-14-18:27:
+Errata E7-K item 5. A route is a review identity only when its own keys are exactly the seven keys of the frozen `CccPlanningReviewIdentity` shape (CONTRACT-v3 section 2.7). Deciding it from the presence of `routeKind` let a product route for a writer task that also carried `routeKind: "g8-judge"` be judged as a G8 judge, skipping the writer's role and model rule (adversary probe F4). A route that carries `routeKind` without that exact shape is neither a product route nor a review identity, so it is refused `role-model-mismatch` at the role check.
+*/
+const REVIEW_IDENTITY_KEYS: ReadonlySet<string> = new Set([
+  "taskId", "routeKind", "reviewOfTaskId", "providerId", "modelId", "transport", "receiptAdapterId",
+]);
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function isReviewIdentity(route: AdmissionRoute): route is CccPlanningReviewIdentity {
-  return Object.prototype.hasOwnProperty.call(route, "routeKind");
+  const keys = Reflect.ownKeys(route);
+  return keys.length === REVIEW_IDENTITY_KEYS.size
+    && keys.every((key) => typeof key === "string" && REVIEW_IDENTITY_KEYS.has(key));
 }
 
 /** The admitted family of a route's model, or null when its id is not an exact pin. */
@@ -100,6 +114,7 @@ export function admitCccRequestToCodeRoutes(input: Readonly<{
 
     let expectedModel: CccPlanningExactModelId;
     if (!isReviewIdentity(route)) {
+      if (hasOwn(route, "routeKind")) return "role-model-mismatch";   // a route kind without the review-identity shape
       if (input.roleOf(route.taskId) !== "writer") return "role-model-mismatch";
       expectedModel = WRITER_MODEL;
     } else if (route.routeKind === "g7-review") {
