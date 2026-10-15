@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_PLANNING_PREFLIGHT_LINEAGES,
   CCC_PLANNING_ROLE_POLICY_FULL_V2,
+  parseCccCampaignProductExecutionPolicy,
   type CccPlanningAcceptanceCasesV1,
   type CccPlanningRequirementMapV1,
   type CccPlanningTaskPlanV1,
@@ -15,6 +17,7 @@ import { CCC_PLANNING_G4_SOURCE_PATHS, runCccPlanningG4, type CccPlanningG4Input
 import {
   CCC_PLANNING_FIXED_LINEAGE_IDS,
   cccPlanningGraphAdmissionInput,
+  diagnoseCccPlanningImportShape,
   diagnoseCccPlanningTaskPlanGraph,
 } from "../ccc-planning/graph-gate.js";
 
@@ -40,6 +43,8 @@ const ADMISSION_FACTS = [
   `Target repository: ${TARGET}`,
   `Baseline commit: ${BASE}`,
   `Admitted write root: ${TARGET}/.fusion`,
+  `Admitted write root: ${TARGET}/src`,
+  `Admitted write root: ${TARGET}/bin`,
   "",
 ].join("\n");
 
@@ -188,7 +193,11 @@ function proposal(deps: Deps): CccPrdAuthoringProposalV2 {
     })),
     edges: [], workflows: [], documents: [], artifacts: [], importIntents: [], protectedActions: [],
     bounds: { maxRequests: 3072, maxDurationMs: 86_400_000, maxConcurrency: 1 },
-    admittedWriteRoots: [{ path: `${TARGET}/.fusion`, purpose: "Fusion task and artifact state" }],
+    admittedWriteRoots: [
+      { path: `${TARGET}/.fusion`, purpose: "Fusion task and artifact state" },
+      { path: `${TARGET}/src`, purpose: "writer source modules" },
+      { path: `${TARGET}/bin`, purpose: "writer command line entry point" },
+    ],
     targetRepository: { path: TARGET, baseCommit: BASE },
     nonGoals: [], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
   };
@@ -248,6 +257,52 @@ function withExtraT1Path(extraPath: string): MutableInput {
   return input;
 }
 
+/*
+FNXC:CccPlanningGraphGate 2026-10-14-22:24:
+Errata E11 GG item 2. G4 promises that a plan it admits is not refused after review (section 2.17), so its verdict on each task's write roots is checked against the importer's own execution-policy parse, `parseCccCampaignProductExecutionPolicy` from @fusion/core, over routes built the way `createCccPrdProductExecutionPlan` copies each task's custody. The provider and model are placeholders the parse admits; only the custody fields matter here.
+*/
+type ParsedPolicyBundle = Parameters<typeof parseCccCampaignProductExecutionPolicy>[1];
+
+/** "admitted", or the importer's refusal message, for the proposal's routes. */
+function importerVerdict(value: CccPrdAuthoringProposalV2): string {
+  const routes = value.tasks.map((task) => ({
+    taskId: task.id, providerId: "glm", modelId: "glm-5.3-flash", transport: "pi", executor: "model",
+    toolMode: "coding", worktreeMode: "isolated", commitPolicy: "required",
+    ownedPaths: [...(task.ownedPaths ?? [])], allowedWriteRoots: [...(task.allowedWriteRoots ?? [])],
+  }));
+  try {
+    parseCccCampaignProductExecutionPolicy({ schema: CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION, routes }, {
+      tasks: value.tasks.map(({ id, dependencyTaskIds }) => ({ id, dependencyTaskIds })) as unknown as ParsedPolicyBundle["tasks"],
+      admittedWriteRoots: value.admittedWriteRoots,
+      targetRepository: value.targetRepository,
+    });
+    return "admitted";
+  } catch (error) {
+    return `refused: ${(error as Error).message}`;
+  }
+}
+
+function setAdmittedRoots(input: MutableInput, paths: readonly string[]): void {
+  (input.proposal as unknown as { admittedWriteRoots: unknown[] }).admittedWriteRoots = paths.map((path) => ({ path, purpose: "admitted" }));
+}
+
+/** The diamond with T1's custody replaced in the plan and the proposal alike, plus an annex custody quote naming the new paths. */
+function withT1Custody(ownedPaths: readonly string[], allowedWriteRoots: readonly string[], line: string): MutableInput {
+  const input = g4Input(DIAMOND, [line]);
+  const planned = input.taskPlan.tasks[0] as unknown as { ownedPaths: string[]; allowedWriteRoots: string[] };
+  planned.ownedPaths = [...ownedPaths];
+  planned.allowedWriteRoots = [...allowedWriteRoots];
+  const proposed = mutableTasks(input)[0]!;
+  proposed.ownedPaths = [...ownedPaths];
+  proposed.allowedWriteRoots = [...allowedWriteRoots];
+  (proposed.sourceRefs as unknown[]).push({ path: P.technicalAnnex, exactQuote: line });
+  return input;
+}
+
+function byRouteRule(diagnostics: readonly CccPrdDiagnostic[], rule: string): CccPrdDiagnostic[] {
+  return diagnostics.filter(({ message }) => message.includes(`rule ${rule}:`));
+}
+
 /** The diamond with task `from` renamed everywhere the plan and the proposal name it. */
 function renamedTask(from: string, to: string): MutableInput {
   const input = g4Input();
@@ -272,7 +327,10 @@ function renamedTask(from: string, to: string): MutableInput {
 
 describe("runCccPlanningG4", () => {
   it("positive control: the section 4.1 diamond with its sources yields zero diagnostics", () => {
-    expect(run(g4Input())).toEqual([]);
+    const input = g4Input();
+    expect(run(input)).toEqual([]);
+    // Admissible means the importer's execution-policy parse accepts the same routes (errata E11 GG item 2).
+    expect(importerVerdict(input.proposal)).toBe("admitted");
   });
 
   it("a cyclic plan fails G4 with the compiler's graph diagnostic, and G4 stays pure", () => {
@@ -389,10 +447,87 @@ describe("runCccPlanningG4", () => {
 
   it("admitted write roots without the target's .fusion fail G4", () => {
     const input = g4Input();
-    (input.proposal as unknown as { admittedWriteRoots: unknown[] }).admittedWriteRoots = [{ path: `${TARGET}/src`, purpose: "source" }];
+    // The fixture's admitted roots without .fusion (errata E11 GG item 2 added src and bin to the fixture).
+    setAdmittedRoots(input, [`${TARGET}/src`, `${TARGET}/bin`]);
     const diagnostics = run(input);
     expect(codes(diagnostics)).toEqual(["CCC_PLANNING_GRAPH_INADMISSIBLE"]);
     expect(diagnostics[0]!.message).toContain(".fusion");
+  });
+
+  /*
+  FNXC:CccPlanningGraphGate 2026-10-14-22:24:
+  Errata E11 GG item 2 (adversary P2 and P3b). The importer's execution policy refuses a task write root that is not, as an exact string, one of the task's owned paths or inside one (rule write-root-within-owned), and one that, resolved against the target, lies inside no PRD-admitted write root (rule write-root-admitted; canonical.ts parseProductRoute). Before E11, G4 checked neither, so each plan below passed G4 and was refused after review.
+  */
+  it("a task write root outside every PRD-admitted write root fails G4, as the importer's execution policy refuses it", () => {
+    const input = g4Input();
+    setAdmittedRoots(input, [`${TARGET}/.fusion`, `${TARGET}/src`]);
+    expect(importerVerdict(input.proposal)).toMatch(/route 3 allowedWriteRoots path "bin\/text-stats\.mjs" is outside PRD-admitted write roots/u);
+    const diagnostics = run(input);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(diagnostics[0]!.message).toContain("rule write-root-admitted:");
+    expect(diagnostics[0]!.message).toContain("task T4");
+    expect(diagnostics[0]!.message).toContain("path bin/text-stats.mjs:");
+    // Control: with bin/ admitted too, G4 and the importer both admit the plan.
+    const control = g4Input();
+    setAdmittedRoots(control, [`${TARGET}/.fusion`, `${TARGET}/src`, `${TARGET}/bin`]);
+    expect(run(control)).toEqual([]);
+    expect(importerVerdict(control.proposal)).toBe("admitted");
+  });
+
+  it("a write root that matches an owned path only in another letter case fails G4, as the importer refuses it as outside task ownership", () => {
+    const input = withT1Custody(["src/tokenizer.mjs"], ["src/tokenizer.mjs", "SRC/tokenizer.mjs"], "Task T1 may also write SRC/tokenizer.mjs here.");
+    expect(importerVerdict(input.proposal)).toMatch(/route 0 allowedWriteRoots path "SRC\/tokenizer\.mjs" is outside task ownership/u);
+    const diagnostics = run(input);
+    for (const entry of diagnostics) expect(entry.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    const within = byRouteRule(diagnostics, "write-root-within-owned");
+    expect(within).toHaveLength(1);
+    expect(within[0]!.message).toContain("task T1");
+    expect(within[0]!.message).toContain("path SRC/tokenizer.mjs:");
+    // With the whole target admitted, so the path lies inside an admitted root, the ownership rule alone refuses it.
+    setAdmittedRoots(input, [`${TARGET}/.fusion`, TARGET]);
+    expect(importerVerdict(input.proposal)).toMatch(/"SRC\/tokenizer\.mjs" is outside task ownership/u);
+    const alone = run(input);
+    expect(alone).toHaveLength(1);
+    expect(byRouteRule(alone, "write-root-within-owned")).toHaveLength(1);
+    // Control: an exactly spelled write root inside an owned directory is admitted by G4 and by the importer.
+    const control = withT1Custody(["src/tokenizer.mjs", "src/lib"], ["src/tokenizer.mjs", "src/lib/x.mjs"],
+      "Task T1 also owns src/lib and may write src/lib/x.mjs here.");
+    expect(run(control)).toEqual([]);
+    expect(importerVerdict(control.proposal)).toBe("admitted");
+  });
+
+  /*
+  FNXC:CccPlanningGraphGate 2026-10-14-22:24:
+  Errata E11 GG item 2(b). Core does not export the importer's `filesystemPathContains`, so G4 mirrors it; this table pins the mirror, and the exact-string ownership rule, to the real parse case by case, including a prefix without a separator, normalized admitted spellings and a root above its owned path.
+  */
+  it("G4's write-root rules agree with the importer's execution-policy parse case by case", () => {
+    const fusion = `${TARGET}/.fusion`;
+    const cases: ReadonlyArray<Readonly<{ name: string; owned?: string[]; roots?: string[]; admitted: string[]; admits: boolean }>> = [
+      { name: "fixture", admitted: [fusion, `${TARGET}/src`, `${TARGET}/bin`], admits: true },
+      { name: "bin not admitted", admitted: [fusion, `${TARGET}/src`], admits: false },
+      { name: "whole target admitted", admitted: [fusion, TARGET], admits: true },
+      { name: "admitted roots with a trailing slash", admitted: [fusion, `${TARGET}/src/`, `${TARGET}/bin/`], admits: true },
+      { name: "admitted root with a dot-dot segment", admitted: [fusion, `${TARGET}/bin/../src`, `${TARGET}/bin`], admits: true },
+      { name: "admitted root that is a name prefix only", admitted: [fusion, `${TARGET}/sr`, `${TARGET}/bin`], admits: false },
+      { name: "write root inside an owned directory", owned: ["src"], roots: ["src/tokenizer.mjs"], admitted: [fusion, TARGET], admits: true },
+      { name: "write root that extends an owned name without a separator", owned: ["src/tokenizer.mjs"], roots: ["src/tokenizer.mjs.bak"], admitted: [fusion, TARGET], admits: false },
+      { name: "write root above its owned path", owned: ["src/lib/x.mjs"], roots: ["src/lib"], admitted: [fusion, TARGET], admits: false },
+      { name: "write root in another letter case", owned: ["src/tokenizer.mjs"], roots: ["SRC/tokenizer.mjs"], admitted: [fusion, TARGET], admits: false },
+    ];
+    for (const entry of cases) {
+      const input = g4Input();
+      setAdmittedRoots(input, entry.admitted);
+      const task = mutableTasks(input)[0]!;
+      if (entry.owned) task.ownedPaths = [...entry.owned];
+      if (entry.roots) task.allowedWriteRoots = [...entry.roots];
+      const verdict = importerVerdict(input.proposal);
+      expect(`${entry.name}: ${verdict === "admitted"}`).toBe(`${entry.name}: ${entry.admits}`);
+      const shape = diagnoseCccPlanningImportShape(input.proposal);
+      const refused = [...byRouteRule(shape, "write-root-within-owned"), ...byRouteRule(shape, "write-root-admitted")];
+      expect(`${entry.name}: ${refused.length === 0}`).toBe(`${entry.name}: ${entry.admits}`);
+      expect(shape).toEqual(refused);
+    }
   });
 
   it("G4 runs source fidelity: a changed request byte gives the anchor mismatch", () => {

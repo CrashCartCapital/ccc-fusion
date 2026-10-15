@@ -7,6 +7,8 @@ All four check files are engine tests the card owns, run under the `engine-defau
 Measured on the M5 Max under a load average near 10 to 12 (parallel agents running heavy suites): the four files take about 2.5 to 3.1 s of vitest duration for 46 tests, including transform and import (the tests themselves take under 0.1 s). The 120 s command timeout is a hang bound over that measurement; no test timeout is raised anywhere.
 FNXC:CccPlanningProof 2026-10-14-21:13:
 Repair 1 (errata E9 GG items 1 to 3) adds seven names: the write-root-canonical rule (non-canonical spelling, surrounding whitespace, a duplicate write root, and the same refusal through G4), the two-merges-on-the-terminal case, the G7 lineage collision through G4, and the derivation of the planning fixed lineage set from K1. Re-measured on the M5 Max at a load average near 13: 53 tests in 1.96 s of vitest duration (about 2 s wall; the tests themselves take 50 ms), so the 120 s command timeout keeps its wide margin as a hang bound.
+FNXC:CccPlanningProof 2026-10-14-22:28:
+Repair 2 (errata E11 GG items 1 to 3) adds seven names: the importer's two route rules through G4 (a write root outside the PRD-admitted write roots, a write root that matches its owned path only in another letter case, and the case-by-case agreement with the real execution-policy parse), write-root-canonical with the odd spelling in one field only, and the three exact-spelling pins (harness token, closure path in the bundle, candidate inside its write root). Re-measured on the M5 Max at a load average near 6 to 8: 60 tests in 2.00 s of vitest duration (the tests themselves take about 70 ms); the 120 s command timeout is unchanged.
 */
 
 const SOURCE_FIDELITY_FILE = "src/__tests__/ccc-planning-source-fidelity.test.ts";
@@ -61,6 +63,9 @@ export const OFFLINE = Object.freeze([
       `runCccPlanningG4 > a non-canonical task path fails G4 before review: the custody check would refuse it as a model write root`,
       `runCccPlanningG4 > a semantic task id whose G7 lineage review:<id> is a planning fixed lineage fails G4`,
       `runCccPlanningG4 > admitted write roots without the target's .fusion fail G4`,
+      `runCccPlanningG4 > a task write root outside every PRD-admitted write root fails G4, as the importer's execution policy refuses it`,
+      `runCccPlanningG4 > a write root that matches an owned path only in another letter case fails G4, as the importer refuses it as outside task ownership`,
+      `runCccPlanningG4 > G4's write-root rules agree with the importer's execution-policy parse case by case`,
       `runCccPlanningG4 > G4 runs source fidelity: a changed request byte gives the anchor mismatch`,
       `runCccPlanningG4 > G4 runs the proof-command policy on the proposal's proofs`,
       `runCccPlanningG4 > a task plan that fails its schema stops G4 at the schema diagnostics`,
@@ -93,6 +98,10 @@ export const OFFLINE = Object.freeze([
       `checkCccPlanningProofCommands > refuses a task path that is not a canonical target-relative path, which the custody check refuses as a model write root`,
       `checkCccPlanningProofCommands > refuses a task path with leading or trailing whitespace, as the importer's execution policy does`,
       `checkCccPlanningProofCommands > refuses a write root listed twice in one task, as the importer's execution policy does`,
+      `checkCccPlanningProofCommands > refuses a non-canonical or padded path in one field only, naming that field`,
+      `checkCccPlanningProofCommands > refuses a Taskfile target that names the declared harness in another letter case`,
+      `checkCccPlanningProofCommands > refuses a closure harness that names the bundle file in another letter case`,
+      `checkCccPlanningProofCommands > refuses a candidate that lies inside the task's write root only on the comparison key`,
     ]),
   }),
 ]);

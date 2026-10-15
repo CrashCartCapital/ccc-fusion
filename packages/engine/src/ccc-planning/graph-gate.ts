@@ -16,6 +16,8 @@ FNXC:CccPlanningGraphGate 2026-10-14-18:53:
 The compiler leaves two importer rules unchecked, so G4 adds them, both as CCC_PLANNING_GRAPH_INADMISSIBLE. The importer lands a merge only through the single terminal task (`mergeLandingFor`, importer.ts:1056): a merge action named by any other task would never run, and two merges on the terminal are refused at import. And the importer refuses a bundle whose admitted write roots do not contain the target's `.fusion/tasks` and `.fusion/artifacts`, or whose bounds exceed 10,000 requests, 86,400,000 ms or concurrency 256 (`assertCccPrdImportBundle`, import-admission.ts:89-111); G4 applies the same containment and ceilings to the proposal so a plan it admits is not refused after review.
 FNXC:CccPlanningGraphGate 2026-10-14-21:10:
 Errata E9 GG item 3 (E8 N-3). A campaign task's G7 review runs on lineage `review:${semanticTaskId}` (section 2.1), and dispatch counters are keyed by lineage id alone (E7-L 8(b)), so a task whose id makes that lineage equal to a planning fixed lineage would share that lineage's attempt counters. G4 refuses such a plan with CCC_PLANNING_GRAPH_INADMISSIBLE naming the task and the colliding lineage. The fixed set is derived from K1's exports, never listed by hand: `${stageId}:${roleId}` for every `fixed` or `once-if-leaves` role of K1's role policy (K1 exports one, full-v2), every `CCC_PLANNING_PREFLIGHT_LINEAGES` id, and the G8 lineage `judge:final`, which section 2.1 fixes and no K1 role spells. Today the colliding ids are `review:product-adversary` and `review:technical-critic`.
+FNXC:CccPlanningGraphGate 2026-10-14-22:26:
+Errata E11 GG item 2. The importer's execution-policy parse (`parseCccCampaignProductExecutionPolicy`, core canonical.ts `parseProductRoute`) refuses a task write root on two more rules, so G4 applies both to every task of the proposal, as CCC_PLANNING_GRAPH_INADMISSIBLE diagnostics naming the task, the path and the rule: `write-root-within-owned`, each write root must equal one of the same task's owned paths or lie inside one, compared as exact strings (`r === o || r.startsWith(o + "/")`, canonical.ts `pathContains`), so `SRC/tokenizer.mjs` next to the owned `src/tokenizer.mjs` is refused even though K1's comparison key calls them one file; and `write-root-admitted`, each write root resolved against the target must lie inside some PRD-admitted write root. Core does not export the importer's `filesystemPathContains`, so `isContainedPath` below mirrors it (path.relative is "", or neither "..", nor starts with "../", nor absolute), pinned case by case against the real parse in the graph-gate test. The admitted roots are resolved against the target here as in the .fusion check above; the importer calls `resolve(path)`, which agrees for the absolute roots the planning admission facts carry, and a relative admitted root would resolve against the importer's working directory, which a pure gate cannot see.
 */
 
 export const CCC_PLANNING_WORKFLOW_ID = "ccc-planning-workflow";
@@ -141,15 +143,51 @@ export function diagnoseCccPlanningTaskPlanGraph(taskPlan: CccPlanningTaskPlanV1
   ];
 }
 
+/** The importer's `filesystemPathContains` (canonical.ts), also its import-admission `isContainedPath`. */
 function isContainedPath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-/** The importer's write-root and bounds admission, applied to the proposal before review. Pure. */
+function stringEntries(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+/** The importer's two execution-policy route rules for each task's write roots (canonical.ts parseProductRoute). */
+function writeRootRouteDiagnostics(
+  proposal: CccPrdAuthoringProposalV2,
+  target: Readonly<{ root: string; admitted: readonly string[] }> | null,
+): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  const refuse = (rule: "write-root-within-owned" | "write-root-admitted", taskId: string, path: string, text: string) => diagnostics.push({
+    code: "CCC_PLANNING_GRAPH_INADMISSIBLE",
+    message: `import shape: rule ${rule}: task ${taskId}: path ${path}: ${text}`,
+  });
+  for (const task of Array.isArray(proposal.tasks) ? proposal.tasks : []) {
+    const owned = stringEntries(task.ownedPaths);
+    for (const writeRoot of new Set(stringEntries(task.allowedWriteRoots))) {
+      if (!owned.some((ownedPath) => writeRoot === ownedPath || writeRoot.startsWith(`${ownedPath}/`))) {
+        refuse("write-root-within-owned", task.id, writeRoot,
+          `is not, as an exact string, one of the task's owned paths (${owned.join(", ") || "none"}) or inside one;`
+          + " the importer's execution policy refuses it as outside task ownership (canonical.ts parseProductRoute)");
+      }
+      if (target === null) continue;
+      const absolute = resolve(target.root, writeRoot);
+      if (!target.admitted.some((admittedRoot) => isContainedPath(admittedRoot, absolute))) {
+        refuse("write-root-admitted", task.id, writeRoot,
+          `resolves to ${absolute}, outside the PRD-admitted write roots (${target.admitted.join(", ") || "none"});`
+          + " the importer's execution policy refuses it (canonical.ts parseProductRoute, filesystemPathContains)");
+      }
+    }
+  }
+  return diagnostics;
+}
+
+/** The importer's write-root, route-custody and bounds admission, applied to the proposal before review. Pure. */
 export function diagnoseCccPlanningImportShape(proposal: CccPrdAuthoringProposalV2): CccPrdDiagnostic[] {
   const diagnostics: CccPrdDiagnostic[] = [];
   const root = typeof proposal.targetRepository?.path === "string" ? proposal.targetRepository.path : "";
+  let target: Readonly<{ root: string; admitted: readonly string[] }> | null = null;
   if (!isAbsolute(root)) {
     diagnostics.push({
       code: "CCC_PLANNING_GRAPH_INADMISSIBLE",
@@ -158,6 +196,7 @@ export function diagnoseCccPlanningImportShape(proposal: CccPrdAuthoringProposal
   } else {
     const resolvedRoot = resolve(root);
     const admitted = (proposal.admittedWriteRoots ?? []).map(({ path }) => resolve(resolvedRoot, path));
+    target = { root: resolvedRoot, admitted };
     for (const output of [join(resolvedRoot, ".fusion", "tasks"), join(resolvedRoot, ".fusion", "artifacts")]) {
       if (!admitted.some((candidate) => isContainedPath(candidate, output))) {
         diagnostics.push({
@@ -167,6 +206,7 @@ export function diagnoseCccPlanningImportShape(proposal: CccPrdAuthoringProposal
       }
     }
   }
+  diagnostics.push(...writeRootRouteDiagnostics(proposal, target));
   for (const [name, ceiling] of Object.entries(IMPORT_BOUND_CEILINGS) as Array<[keyof typeof IMPORT_BOUND_CEILINGS, number]>) {
     const value = proposal.bounds?.[name];
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > ceiling) {

@@ -284,4 +284,74 @@ describe("checkCccPlanningProofCommands", () => {
     expect(refused[0]!.message).toContain("path src/word-frequency.mjs:");
     expect(refused[0]!.message).toContain("more than once in allowedWriteRoots");
   });
+
+  /*
+  FNXC:CccPlanningScheduleAndCommands 2026-10-14-22:25:
+  Errata E11 GG item 1. The custody check and the importer check each field on its own, so write-root-canonical must too: each case below puts the odd spelling (non-canonical or padded) in exactly one of ownedPaths and allowedWriteRoots, and the diagnostic must name that field. A rule that checked one field only (mutants R7 to R10 and W1) passes every case that puts the spelling in both.
+  */
+  it("refuses a non-canonical or padded path in one field only, naming that field", () => {
+    const cases: Array<[string[], string[], string, string]> = [
+      [["src/tokenizer.mjs", "src/lib/"], ["src/tokenizer.mjs", "src/lib/x.mjs"], "ownedPaths", "src/lib/"],
+      [["src/tokenizer.mjs", "src/lib"], ["src/tokenizer.mjs", "src/lib/"], "allowedWriteRoots", "src/lib/"],
+      [["src/tokenizer.mjs", "src/extra.mjs "], ["src/tokenizer.mjs"], "ownedPaths", "src/extra.mjs "],
+      [["src/tokenizer.mjs", "src/lib"], ["src/tokenizer.mjs", "src/lib/x.mjs "], "allowedWriteRoots", "src/lib/x.mjs "],
+      [["src/tokenizer.mjs"], ["src/tokenizer.mjs", "./src/tokenizer.mjs"], "allowedWriteRoots", "./src/tokenizer.mjs"],
+      [["src/tokenizer.mjs"], ["src/tokenizer.mjs", "src/tokenizer.mjs/"], "allowedWriteRoots", "src/tokenizer.mjs/"],
+    ];
+    for (const [owned, roots, field, path] of cases) {
+      const odd = plan(DIAMOND, (tasks) => { tasks[0]!.ownedPaths = owned; tasks[0]!.allowedWriteRoots = roots; });
+      expect(validateCccPlanningTaskPlanV1(odd)).toEqual([]);
+      const diagnostics = checkCccPlanningProofCommands(odd, bundle());
+      expect(diagnostics).toHaveLength(1);
+      expect(byRule(diagnostics, "write-root-canonical")).toHaveLength(1);
+      expect(diagnostics[0]!.message).toContain(`task T1 ${field}: path ${path}:`);
+    }
+  });
+
+  /*
+  FNXC:CccPlanningScheduleAndCommands 2026-10-14-22:25:
+  Errata E11 GG item 3. Where the custody check admits only an exact spelling, the policy compares exact strings, not K1's comparison key: the custody check's verifyTaskfile needs the target to invoke the one declared harness as spelled, it reads each closure path at B1 by its exact path, and it needs each candidate inside a write root as spelled. E2-13's comparison key governs overlap and identity, not custody spelling, so moving any of these three comparisons onto the key (mutants K4, K2 and K1) would fail open. Each case has its exact-case twin as the control.
+  */
+  it("refuses a Taskfile target that names the declared harness in another letter case", () => {
+    const declared = cccPlanningProofDefinitionsFromBundle(bundle());
+    const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node TEST/tokenizer.test.mjs src/tokenizer.mjs" };
+    const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets), declared);
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "target-invokes-declared-harness");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.message).toContain("proof tokenizer");
+    expect(refused[0]!.message).toContain("path TEST/tokenizer.test.mjs:");
+    // Control: the exact-case twin.
+    const twin = { ...DIAMOND_TARGETS, "verify:tokenizer": "node test/tokenizer.test.mjs src/tokenizer.mjs" };
+    expect(checkCccPlanningProofCommands(plan(), bundle(twin), declared)).toEqual([]);
+  });
+
+  it("refuses a closure harness that names the bundle file in another letter case", () => {
+    // The target follows the closure's spelling, so only the closure's own lookup in the bundle can refuse it.
+    const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node TEST/tokenizer.test.mjs src/tokenizer.mjs" };
+    const proofs = cccPlanningProofDefinitionsFromBundle(bundle()).map((proof) => (proof.id === "tokenizer"
+      ? { ...proof, verifierClosure: [{ role: "task_runner" as const, path: "Taskfile.yml" }, { role: "harness" as const, path: "TEST/tokenizer.test.mjs" }] }
+      : proof));
+    const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets), proofs);
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "closure-in-verifier-bundle");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.message).toContain("proof tokenizer");
+    expect(refused[0]!.message).toContain("path TEST/tokenizer.test.mjs:");
+    // Control: the exact-case twin, whose closure harness is the bundle file test/tokenizer.test.mjs.
+    expect(checkCccPlanningProofCommands(plan(), bundle(), cccPlanningProofDefinitionsFromBundle(bundle()))).toEqual([]);
+  });
+
+  it("refuses a candidate that lies inside the task's write root only on the comparison key", () => {
+    const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node test/tokenizer.test.mjs SRC/tokenizer.mjs" };
+    const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets));
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "candidate-in-own-write-roots");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.message).toContain("proof tokenizer");
+    expect(refused[0]!.message).toContain("path SRC/tokenizer.mjs:");
+    expect(refused[0]!.message).toContain("only on the comparison key");
+    // Control: the exact-case twin.
+    expect(checkCccPlanningProofCommands(plan(), bundle())).toEqual([]);
+  });
 });
