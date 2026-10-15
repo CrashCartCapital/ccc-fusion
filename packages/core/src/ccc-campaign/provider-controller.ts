@@ -10,6 +10,7 @@ import { and, eq, sql } from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
 import { beginCccProviderAttemptDispatch, listCccProviderAttemptsForCampaign, reserveCccProviderAttempt } from "./provider-attempt.js";
 import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
+import { CccPlanningLinkedWriterLimitError, recordCccPlanningWriterRefusal } from "../task-store/ccc-planning-campaign-link-ops.js";
 import type { CccPrdProtectedActionIntent } from "../ccc-prd/types.js";
 import type {
   CccCampaignTransport,
@@ -309,6 +310,14 @@ export async function atomicReserveCccCampaignProviderDispatch(
       },
     });
     return controllerDecision(begun);
+  }).catch(async (error: unknown) => {
+    // FNXC:CccPlanningCampaignLink 2026-10-15-00:45: card BF (verify-v2 item 48). A linked writer refusal is recorded
+    // only after the reservation transaction above has rolled back, in a fresh transaction, then the same error rethrows.
+    if (error instanceof CccPlanningLinkedWriterLimitError) {
+      // Audit is evidence after rollback; its own failure cannot replace the original typed refusal.
+      await recordCccPlanningWriterRefusal(input.layer, error.refusal).catch(() => undefined);
+    }
+    throw error;
   });
 }
 
