@@ -15,3 +15,6 @@ export * from "./schemas.js";
 export * from "./marker.js";
 export * from "./workflow-ir.js";
 export * from "./runtime-identity.js";
+/** FNXC:CccPlanning 2026-10-15-05:10: Engine and CLI consumers use the public core seam for K2 authority and qualification. */
+export * from "./authority.js";
+export * from "./qualification.js";
