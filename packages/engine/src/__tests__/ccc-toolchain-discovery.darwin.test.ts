@@ -90,6 +90,25 @@ tool no Homebrew installs, so they do not depend on what this host has:
   ~/.cargo/bin under a fixture HOME, asserts toolchain-missing by default, and
   finds it in each directory passed explicitly (kills m4, PATH appended, and
   m5, the home directories and /usr/local/bin appended).
+
+FNXC:CccToolchainDiscovery 2026-10-15-00:08:
+X1z repair 2 (errata E14, test-only; E6-0: no user-writable directory is ever
+on the default search path). Repair 1's home test caught a home-directory
+default only when it was spelled with `process.env.HOME`: engine-default runs
+on worker threads, where setting HOME does not move `os.homedir()` or
+`os.userInfo().homedir`, and an appended `/usr/local/bin` holds no fixture
+tool. So td-mh-homedir (os.homedir()), td-mu-userinfo (os.userInfo()),
+td-usrlocal (/usr/local/bin only) and the reviews' m5e, m5f and m5g passed it.
+The test now pins the default by observation, not by HOME: this file partially
+mocks `node:fs` so `realpathSync`, discovery's first probe of every candidate,
+passes each call through to the real function and records the path it was
+given. With `searchPath` absent, a randomly named tool (never found, so
+probed in every directory) must be probed in exactly the directories of
+`cccToolchainDefaultSearchPath()`, in that order, and nowhere else, however
+an extra directory is computed. The explicit-directory positive controls stay,
+and each also shows the recorder seeing that one extra directory after the
+defaults. The planted PATH and fixture-HOME copies of the tool stay, so an
+env-reading default also finds the tool.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readFileSync, realpathSync } from "node:fs";
@@ -98,7 +117,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { CccPlanningRefusal } from "@fusion/core";
 import {
   CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256,
@@ -114,6 +133,33 @@ import {
   cccToolchainDefaultSearchPath,
   discoverCccToolchain,
 } from "../ccc-confinement/toolchain-discovery.js";
+
+/**
+ * FNXC:CccToolchainDiscovery 2026-10-15-00:08: X1z repair 2 (E14): the paths discovery hands to `realpathSync`
+ * while `recording` is on. The mock is a pass-through, so every other test sees the real `node:fs`.
+ */
+const realpathProbe = vi.hoisted(() => ({ recording: false, paths: [] as string[] }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const realpathSync = Object.assign((...args: Parameters<typeof actual.realpathSync>) => {
+    if (realpathProbe.recording) realpathProbe.paths.push(String(args[0]));
+    return actual.realpathSync(...args);
+  }, { native: actual.realpathSync.native }) as unknown as typeof actual.realpathSync;
+  return { ...actual, realpathSync, default: { ...actual, realpathSync } };
+});
+
+/** Runs `run` with the probe recorder on; returns its settled result and the directories in which `tool` was probed, in order. */
+async function probedDirectories<T>(tool: string, run: () => Promise<T>): Promise<{ value: T | null; error: unknown; dirs: string[] }> {
+  realpathProbe.paths = [];
+  realpathProbe.recording = true;
+  try {
+    const { value, error } = await settle(run());
+    return { value, error, dirs: realpathProbe.paths.filter((path) => basename(path) === tool).map((path) => dirname(path)) };
+  } finally {
+    realpathProbe.recording = false;
+    realpathProbe.paths = [];
+  }
+}
 
 const MACH_O_64 = Buffer.from([0xcf, 0xfa, 0xed, 0xfe]);
 /** E6-0: GNU grep, sed, findutils (find, xargs), gawk (awk) and diffutils (diff, cmp) are optional. */
@@ -605,10 +651,12 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       }
     });
 
-    it("never searches PATH or the user-writable home directories when searchPath is absent: a tool planted only last on PATH and in ~/.local/bin, ~/go/bin and ~/.cargo/bin under the fixture HOME refuses toolchain-missing, while each of those directories passed explicitly finds it", async () => {
-      // FNXC:CccToolchainDiscovery 2026-10-14-21:15: X1z repair 1 (E6-0: no PATH or user-writable directory is ever on
-      // the default search path). The tool is one no Homebrew installs, so the result does not depend on this host:
-      // a default that appends PATH (mutant m4) or the home directories (m5) finds it, and the Homebrew-only default does not.
+    it("probes exactly the directories of cccToolchainDefaultSearchPath(), in order, when searchPath is absent: a randomly named tool planted only last on PATH and in ~/.local/bin, ~/go/bin and ~/.cargo/bin under the fixture HOME is probed nowhere else and refuses toolchain-missing, while each of those directories passed explicitly after the defaults is probed last and finds it", async () => {
+      // FNXC:CccToolchainDiscovery 2026-10-15-00:08: X1z repair 2 (E14; E6-0: no PATH or user-writable directory is ever
+      // on the default search path). Setting HOME does not move os.homedir() or os.userInfo() on engine-default's worker
+      // threads, so the pin is the probe record, not HOME: the tool is never found, so discovery probes it in every
+      // directory of its search path, and those must be exactly the default's, however an extra one is computed
+      // (td-mh-homedir, td-mu-userinfo, td-usrlocal, m4, m5). The planted copies make an env-reading default find it too.
       const root = await fixtureRoot();
       const tool = `ccc-x1z-home-only-${randomBytes(4).toString("hex")}`;
       const home = join(root, "home");
@@ -619,27 +667,35 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
         await mkdir(dir, { recursive: true });
         await stub(dir, tool);
       }
+      const defaults = [...cccToolchainDefaultSearchPath()];
 
       const saved = { PATH: process.env.PATH, HOME: process.env.HOME };
       process.env.PATH = `${saved.PATH ?? ""}:${pathDir}`;
       process.env.HOME = home;
-      let absent: { value: CccSealedToolchain | null; error: unknown };
+      let absent: { value: CccSealedToolchain | null; error: unknown; dirs: string[] };
       try {
-        absent = await settle(discoverCccToolchain({ required: [tool], optional: [] }));
+        absent = await probedDirectories(tool, () => discoverCccToolchain({ required: [tool], optional: [] }));
       } finally {
         for (const [key, value] of Object.entries(saved)) {
           if (value === undefined) delete process.env[key];
           else process.env[key] = value;
         }
       }
-      // Positive control: each planted stub is a tool discovery accepts once its directory is on the search path.
-      const explicit = await Promise.all(planted.map((dir) =>
-        settle(discoverCccToolchain({ searchPath: [...cccToolchainDefaultSearchPath(), dir], required: [tool], optional: [] }))));
+      // Positive control: each planted stub is a tool discovery accepts once its directory is on the search path, and
+      // the recorder sees that one extra directory, probed after the defaults. A found tool is realpathed once more by
+      // sealCccToolchain, so the control compares the directories in first-probe order; the refused run above never
+      // reaches the seal, so its record is compared exactly.
+      const explicit: { value: CccSealedToolchain | null; error: unknown; dirs: string[] }[] = [];
+      for (const dir of planted) {
+        explicit.push(await probedDirectories(tool, () =>
+          discoverCccToolchain({ searchPath: [...defaults, dir], required: [tool], optional: [] })));
+      }
 
+      expect(absent.dirs).toEqual(defaults);
       expect(absent.value).toBeNull();
       expect(refusalOf(absent.error)).toEqual({ code: REFUSAL_CODE, detail: `toolchain-missing:${tool}` });
-      expect(explicit.map(({ value, error }) => ({ error, path: value === null ? null : utilityByName(value).get(tool)?.path })))
-        .toEqual(planted.map((dir) => ({ error: null, path: join(dir, tool) })));
+      expect(explicit.map(({ value, error, dirs }) => ({ error, dirs: [...new Set(dirs)], path: value === null ? null : utilityByName(value).get(tool)?.path })))
+        .toEqual(planted.map((dir) => ({ error: null, dirs: [...defaults, dir], path: join(dir, tool) })));
     });
   });
 
