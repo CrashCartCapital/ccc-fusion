@@ -36,6 +36,7 @@ import type {
   WorkflowWorkItemUpsertInput,
 } from "../types.js";
 import type { WorkflowWorkItemRow } from "./row-types.js";
+import { applyCccPlanningCampaignOutcomeWithinTransaction } from "./ccc-planning-campaign-link-ops.js";
 
 /**
  * FNXC:TaskStoreWorkflowWorkItems 2026-06-24-08:35:
@@ -384,6 +385,13 @@ export async function transitionWorkflowWorkItem(
         attempt: updated.attempt,
       },
     }, projectId);
+
+    // FNXC:CccPlanningCampaignLink 2026-10-15-00:45: card BF (D43). A planning-linked campaign's outcome reaches its
+    // run in this transaction; the mapping never throws (its own savepoint), and a run id outside ccc-prd: costs no SQL.
+    await applyCccPlanningCampaignOutcomeWithinTransaction(tx, {
+      projectId: projectId || updatedRows[0]!.projectId, before: rowToWorkflowWorkItem(existing),
+      workItem: rowToWorkflowWorkItem(updated), fromState, toState: state,
+    });
 
     return rowToWorkflowWorkItem(updated);
   };
