@@ -17,6 +17,7 @@ import {
   type CccPlanningLiveAuthorityReceiptV1,
   type CccPlanningRunState,
   type CccPlanningWorkItemFence,
+  type DbTransaction,
   type TaskStore,
 } from "@fusion/core";
 import {
@@ -47,6 +48,51 @@ type Anchor = {
 };
 
 const NO_POLICY = { promptVersion: "none", promptDigest: "none", toolPolicyVersion: "none", toolPolicyDigest: "none" } as const;
+const LIVE_APPROVAL_HOLD = "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+
+type CampaignItem = {
+  id: string; state: string; attempt: number; blocked_reason: string | null; last_error: string | null;
+  lease_owner: string | null; lease_expires_at: string | null; user_paused: number;
+};
+type CampaignPark = { workItemId: string; importId: string; attempt: number; marker: string };
+
+async function lockCampaignItem(tx: DbTransaction, projectId: string, workItemId: string, importId: string): Promise<CampaignItem> {
+  const rows = await tx.execute(sql`
+    SELECT w.id, w.state, w.attempt, w.blocked_reason, w.last_error, w.lease_owner, w.lease_expires_at,
+      COALESCE(t.user_paused, 0) AS user_paused
+      FROM project.workflow_work_items w JOIN project.tasks t ON t.project_id = w.project_id AND t.id = w.task_id
+      WHERE w.project_id = ${projectId} AND w.id = ${workItemId} AND w.run_id = ${`ccc-prd:${importId}`}
+      FOR UPDATE OF w
+  `) as unknown as CampaignItem[];
+  const item = rows[0];
+  if (rows.length !== 1 || !item || item.user_paused !== 0 || item.lease_owner !== null || item.lease_expires_at !== null) {
+    throw new CccPlanningRefusal("CCC_PLANNING_STATE_TRANSITION_REFUSED", "campaign item is paused, leased or outside the import");
+  }
+  return item;
+}
+
+/** Repair 1: claim only after a durable park; never adopt an unrelated manual hold or a later attempt. */
+async function parkCampaignItem(layer: AsyncDataLayer, i: ReleaseInput, projectId: string,
+  workItemId: string, importId: string): Promise<CampaignPark> {
+  return layer.transactionImmediate(async (tx) => {
+    const item = await lockCampaignItem(tx, projectId, workItemId, importId);
+    const marker = `${LIVE_APPROVAL_HOLD}: ccc-planning:${i.run.runId}:r${i.run.runRevision}:a${item.attempt}`;
+    if (item.state === "manual-required" && item.blocked_reason === LIVE_APPROVAL_HOLD && item.last_error === marker) {
+      return { workItemId, importId, attempt: item.attempt, marker };
+    }
+    const nativeHold = item.state === "manual-required"
+      && item.blocked_reason === LIVE_APPROVAL_HOLD && item.last_error === LIVE_APPROVAL_HOLD;
+    const fresh = item.state === "runnable" && item.blocked_reason === null && item.last_error === null;
+    if (!fresh && !nativeHold) {
+      throw new CccPlanningRefusal("CCC_PLANNING_STATE_TRANSITION_REFUSED", "campaign item is not a fresh import or native live-approval hold");
+    }
+    await i.store.transitionWorkflowWorkItem(workItemId, "manual-required", {
+      expectedState: fresh ? "runnable" : "manual-required", expectedAttempt: item.attempt, expectedLeaseOwner: null,
+      attempt: item.attempt, leaseOwner: null, leaseExpiresAt: null, lastError: marker, blockedReason: LIVE_APPROVAL_HOLD,
+    }, tx);
+    return { workItemId, importId, attempt: item.attempt, marker };
+  });
+}
 
 async function readAnchor(layer: AsyncDataLayer, i: ReleaseInput): Promise<Anchor> {
   const rows = await layer.db.execute(sql`
@@ -91,6 +137,10 @@ async function planningFence(layer: AsyncDataLayer, anchor: Anchor, runId: strin
  * pending rows; a refusal claims none (E18), and supplies the existing operator confirmation instead. Replay reads
  * the native authorization and immutable artifact first. Publication, the bounded audit, the planning state and the
  * guarded campaign wake share one transaction, so a crash never exposes runnable work without its release receipt.
+ * FNXC:CccPlanningLiveRelease 2026-10-15-06:00 (repair 1): native imports begin runnable. Park the exact imported item
+ * durably before claiming approval, then wake only that park's same attempt under a row lock in the publication
+ * transaction. Operator holds, foreign leases, running/terminal states and changed attempts fail closed. Keep the
+ * native blocked reason; the ownership marker is its permitted lastError suffix, so operator approval stays usable.
  */
 export async function releaseCccPlanningLiveExecution(i: ReleaseInput): Promise<CccPlanningLiveExecutionReleaseResult> {
   const layer = i.store.getAsyncLayer();
@@ -121,14 +171,16 @@ export async function releaseCccPlanningLiveExecution(i: ReleaseInput): Promise<
   }
   const fence = await planningFence(layer, anchor, i.run.runId);
   const nativeInput = { store: i.store, rootDir: i.rootDir, taskId: i.entryTaskId, runId: i.run.runId };
+  const issuedNow = authorization === null;
   if (authorization === null) {
     await (i.deps?.issue ?? issueCccCampaignLiveExecutionApproval)(nativeInput);
     authorization = await getCccCampaignExecutionAuthorizationForImport(layer.db, link.receipt.importId);
-    await i.hooks?.afterStep?.("issued");
   }
   if (authorization === null || !authorization.members.some((member) => member.nativeTaskId === i.entryTaskId)) {
     throw new CccPlanningRefusal("CCC_PLANNING_IMPORT_IDENTITY_DRIFT", "release requires the sealed authorization's entry task");
   }
+  const park = await parkCampaignItem(layer, i, anchor.project_id, authorization.workItemId, link.receipt.importId);
+  if (issuedNow) await i.hooks?.afterStep?.("issued");
   const confirmation = (i.deps?.compute ?? computeCccCampaignLiveExecutionApprovalConfirmation)(authorization);
   const permitsController = i.receipt.permittedProtectedActions.length === 1
     && i.receipt.permittedProtectedActions[0]!.kind === "live_execution"
@@ -170,15 +222,14 @@ export async function releaseCccPlanningLiveExecution(i: ReleaseInput): Promise<
     if (published.replayed) return;
     await transitionCccPlanningRunStateWithin(tx, { projectId: anchor.project_id, runId: i.run.runId,
       from: anchor.state, to: "building", stateCode: null, fence });
-    const workItem = await i.store.getWorkflowWorkItem(authorization.workItemId);
-    if (!workItem || (workItem.state !== "manual-required" && workItem.state !== "runnable")) {
-      throw new CccPlanningRefusal("CCC_PLANNING_STATE_TRANSITION_REFUSED", "campaign work item is not awaiting release");
+    const workItem = await lockCampaignItem(tx, anchor.project_id, park.workItemId, park.importId);
+    if (workItem.state !== "manual-required" || workItem.attempt !== park.attempt
+      || workItem.blocked_reason !== LIVE_APPROVAL_HOLD || workItem.last_error !== park.marker) {
+      throw new CccPlanningRefusal("CCC_PLANNING_STATE_TRANSITION_REFUSED", "campaign work item no longer holds this release's park");
     }
-    if (workItem.state === "manual-required") {
-      await i.store.transitionWorkflowWorkItem(workItem.id, "runnable", { expectedState: "manual-required",
-        expectedAttempt: workItem.attempt, attempt: workItem.attempt, leaseOwner: null, leaseExpiresAt: null,
-        lastError: null, blockedReason: null }, tx);
-    }
+    await i.store.transitionWorkflowWorkItem(workItem.id, "runnable", { expectedState: "manual-required",
+      expectedAttempt: park.attempt, expectedLeaseOwner: null, attempt: park.attempt, leaseOwner: null, leaseExpiresAt: null,
+      lastError: null, blockedReason: null }, tx);
     await recordRunAuditEventWithinTransaction(tx, {
       taskId: anchor.planning_task_id, agentId: "ccc-planning-controller", runId: i.run.runId, domain: "database",
       mutationType: "ccc-planning:live-execution-released", target: authorization.authorizationId,

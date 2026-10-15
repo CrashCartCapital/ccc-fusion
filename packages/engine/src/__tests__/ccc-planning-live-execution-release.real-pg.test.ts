@@ -13,6 +13,7 @@ import {
   canonicalCccPrdJson,
   cccPlanningImportKey,
   cccPlanningRunId,
+  cccPermanentWorkItemHasReason,
   computeCccPlanningAuthorityReceiptDigest,
   drizzleSql as sql,
   importCccPrdBundle,
@@ -148,10 +149,6 @@ pgDescribe(SUITE, () => {
     if (!status) throw new Error("import status missing");
     const entryTaskId = status.tasks[0]!.nativeTaskId;
     const workItemId = `${imported.importId}--WORK-AU2`;
-    await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET state = 'manual-required',
-      last_error = 'ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED',
-      blocked_reason = 'ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED'
-      WHERE project_id = ${projectId} AND id = ${workItemId}`);
     const input = { store: h.store(), rootDir, entryTaskId, receipt, receiptSha256,
       run: { runId, runRevision: 1, deadlineAt, implementationCallsRemaining: 3072,
         compiledProviderTaskCount: bundle.tasks.length, writerProviderId: "receipt-flash" },
@@ -173,13 +170,22 @@ pgDescribe(SUITE, () => {
       (SELECT count(*)::int FROM project.run_audit_events WHERE run_id = ${f.input.run.runId}
         AND mutation_type = 'ccc-planning:state' AND metadata->>'to' = 'building') AS transitions,
       (SELECT state FROM project.ccc_planning_runs WHERE run_id = ${f.input.run.runId}) AS state,
-      (SELECT state FROM project.workflow_work_items WHERE id = ${f.workItemId}) AS work_state
+      (SELECT state FROM project.workflow_work_items WHERE id = ${f.workItemId}) AS work_state,
+      (SELECT blocked_reason FROM project.workflow_work_items WHERE id = ${f.workItemId}) AS blocked_reason,
+      (SELECT attempt FROM project.workflow_work_items WHERE id = ${f.workItemId}) AS attempt
     `))[0];
     return row;
   }
 
+  async function expectNativeApprovalHold(f: Awaited<ReturnType<typeof fixture>>) {
+    const item = await h.store().getWorkflowWorkItem(f.workItemId);
+    expect(item).not.toBeNull();
+    expect(cccPermanentWorkItemHasReason(item!, "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED")).toBe(true);
+  }
+
   it("releases an exact controller envelope with a system actor and one durable release, then replays unchanged", async () => {
     const f = await fixture();
+    expect(await facts(f)).toMatchObject({ work_state: "runnable", claimed: 0, releases: 0 });
     const result = await releaseCccPlanningLiveExecution(f.input);
     expect(result).toMatchObject({ kind: "released", authorizationId: expect.any(String), authorizationDigest: expect.any(String) });
     expect(await facts(f)).toMatchObject({ parents: 1, claimed: 2, releases: 1, audits: 1, transitions: 1,
@@ -195,6 +201,56 @@ pgDescribe(SUITE, () => {
     expect(await facts(f)).toMatchObject({ parents: 1, claimed: 2, releases: 1, audits: 1, transitions: 1 });
   });
 
+  it("releases an already-held native live-approval item but preserves an operator hold without claiming it", async () => {
+    const held = await fixture();
+    const reason = "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+    await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET state = 'manual-required',
+      last_error = ${reason}, blocked_reason = ${reason} WHERE id = ${held.workItemId}`);
+    expect((await releaseCccPlanningLiveExecution(held.input)).kind).toBe("released");
+    expect(await facts(held)).toMatchObject({ claimed: 2, releases: 1, state: "building", work_state: "runnable" });
+    await h.beforeEach();
+    const operator = await fixture();
+    await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET state = 'manual-required',
+      last_error = 'operator-paused', blocked_reason = 'operator-paused' WHERE id = ${operator.workItemId}`);
+    await expect(releaseCccPlanningLiveExecution(operator.input)).rejects.toThrow();
+    expect(await facts(operator)).toMatchObject({ claimed: 0, authorized: 0, leases: {}, releases: 0,
+      state: "importing", work_state: "manual-required", blocked_reason: "operator-paused" });
+  });
+
+  it("leaves running, terminal and foreign-leased campaign items untouched without claiming execution", async () => {
+    for (const state of ["running", "cancelled", "runnable"] as const) {
+      const f = await fixture();
+      await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET state = ${state},
+        lease_owner = 'foreign-worker', lease_expires_at = ${f.input.run.deadlineAt} WHERE id = ${f.workItemId}`);
+      await expect(releaseCccPlanningLiveExecution(f.input)).rejects.toThrow();
+      expect(await facts(f)).toMatchObject({ claimed: 0, releases: 0, state: "importing", work_state: state });
+      const item = await h.store().getWorkflowWorkItem(f.workItemId);
+      expect(item).toMatchObject({ state, leaseOwner: "foreign-worker", leaseExpiresAt: f.input.run.deadlineAt });
+      await h.beforeEach();
+    }
+  });
+
+  it("refuses to wake its park if the operator hold or attempt changes after native approval", async () => {
+    for (const change of ["hold", "attempt"] as const) {
+      const f = await fixture();
+      const before = await h.store().getWorkflowWorkItem(f.workItemId);
+      await expect(releaseCccPlanningLiveExecution({ ...f.input, hooks: { afterStep: async (step) => {
+        if (step !== "approved") return;
+        if (change === "hold") {
+          await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET blocked_reason = 'operator-paused'
+            WHERE id = ${f.workItemId}`);
+        } else {
+          await h.layer().db.execute(sql`UPDATE project.workflow_work_items SET attempt = attempt + 1
+            WHERE id = ${f.workItemId}`);
+        }
+      } } })).rejects.toThrow();
+      expect(await facts(f)).toMatchObject({ claimed: 2, releases: 0, audits: 0, transitions: 0,
+        state: "importing", work_state: "manual-required",
+        ...(change === "hold" ? { blocked_reason: "operator-paused" } : { attempt: before!.attempt + 1 }) });
+      await h.beforeEach();
+    }
+  });
+
   it("refuses a MiniMax member without a claimed approval or release; an exact Flash member releases", async () => {
     const f = await fixture({ modelId: "minimax/MiniMax-M3" });
     expect(await releaseCccPlanningLiveExecution(f.input)).toMatchObject({ kind: "awaiting_operator", reason: "envelope_mismatch",
@@ -202,6 +258,7 @@ pgDescribe(SUITE, () => {
       mismatch: { field: "authorization.members[0].modelId" } });
     expect(await facts(f)).toMatchObject({ claimed: 0, authorized: 0, leases: {}, releases: 0, audits: 0, transitions: 0,
       state: "awaiting_execution_authority", work_state: "manual-required" });
+    await expectNativeApprovalHold(f);
     await h.beforeEach();
     expect((await releaseCccPlanningLiveExecution((await fixture()).input)).kind).toBe("released");
   });
@@ -214,6 +271,7 @@ pgDescribe(SUITE, () => {
         confirmation: expect.stringMatching(/^[a-f0-9]{64}$/u) });
       expect(await facts(f)).toMatchObject({ claimed: 0, authorized: 0, leases: {}, releases: 0, audits: 0, transitions: 0,
         state: "awaiting_execution_authority", work_state: "manual-required" });
+      await expectNativeApprovalHold(f);
       await h.beforeEach();
       expect((await releaseCccPlanningLiveExecution((await fixture()).input)).kind).toBe("released");
     });
@@ -228,6 +286,11 @@ pgDescribe(SUITE, () => {
       };
       await expect(releaseCccPlanningLiveExecution({ ...f.input, hooks: { afterStep } }))
         .rejects.toThrow(`AU2 crash after ${crash}`);
+      if (crash === "approved") {
+        expect(await facts(f)).toMatchObject({ claimed: 2, releases: 0, audits: 0, transitions: 0,
+          state: "importing", work_state: "manual-required" });
+        await expectNativeApprovalHold(f);
+      }
       const result = await releaseCccPlanningLiveExecution({ ...f.input, hooks: { afterStep } });
       expect(result.kind).toBe("released");
       expect(await facts(f)).toMatchObject({ parents: 1, claimed: 2, releases: 1, audits: 1, transitions: 1,
