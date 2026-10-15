@@ -1,5 +1,5 @@
 import { constants as fsConstants, lstatSync, realpathSync, type Dirent } from "node:fs";
-import { access, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, stat, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, matchesGlob, resolve, sep } from "node:path";
 import { compareCccPrdCodeUnits } from "@fusion/core";
 import type { CccConfinedFsOperations } from "../agent-runtime.js";
@@ -8,6 +8,11 @@ import { cccConfinedEffectiveDeniedNames, cccConfinedWriteRefusal, type CccConfi
 /*
 FNXC:CccConfinedFsTools 2026-10-14-21:10:
 Card C2 (CONTRACT-v3 section 2.13, D11, errata E2-7 and E4-10). A planning session's read, write, edit, ls and find run Pi 0.81.1's own tools over these operations, so every path Pi hands over is checked here first. A path must be absolute with no ".." segment, and X1's shared predicate cccConfinedWriteRefusal decides the rest from its real landing path: reads pass the read roots as the predicate's roots, writes and edits pass the write roots, and both pass the effective denied names, so a .git segment and every denied name are refused exactly as the confined shell refuses them. The operation then runs on the real path the predicate checked. Directory listings and find results hide every entry a read would refuse, and find's glob walks in TypeScript, so Pi never needs fd. Denied names are validated against [A-Za-z0-9._*-] with a TypeError before any predicate call, because the predicate throws a plain Error on an invalid name.
+*/
+
+/*
+FNXC:CccConfinedFsTools 2026-10-14-22:56:
+Card C2 repair 1 (time-of-check to time-of-use). A file operation checks a real path and then opens it by name, so a process that swaps an in-root directory for a symlink between the two can steer the engine, which runs unsandboxed, outside the roots, past the .git refusal included. The main fix is in session-tool-policy.ts: under a tool policy the confined bash, write and edit run sequentially, so no in-session process runs during a file operation. This file adds defense in depth for reads and writes: the checked real path is opened with O_NOFOLLOW, and the open file's device and inode must equal an lstat of that path whose real path is still itself, else the operation is refused before any byte is read or written. A write opens with O_CREAT before that check, so a swap in that window can still leave an empty file outside; it never receives content.
 */
 
 /** Carried by every Fusion confined tool definition, so a session check can tell it from Pi's tool of the same name (D11). */
@@ -100,6 +105,37 @@ function hasParentSegment(path: string): boolean {
   return path.split(/[\\/]+/u).includes("..");
 }
 
+/**
+ * Opens `landing`, the real path a check approved, and proves the open file is still that path: O_NOFOLLOW refuses a
+ * final symlink, and the file's device and inode must equal an lstat of `landing`, whose real path must still be itself.
+ */
+async function openCheckedLanding(landing: string, flags: number, reason: CccConfinedPathRefusalReason, spelled: string): Promise<FileHandle> {
+  let handle: FileHandle;
+  try {
+    handle = await open(landing, flags | fsConstants.O_NOFOLLOW, 0o666);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "ELOOP") throw new CccConfinedPathRefusedError(reason, spelled);
+    throw error;
+  }
+  try {
+    const opened = await handle.stat();
+    const current = await lstat(landing).catch(() => null);
+    let real: string | null;
+    try {
+      real = realpathSync.native(landing);
+    } catch {
+      real = null;
+    }
+    if (current === null || real !== landing || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new CccConfinedPathRefusedError(reason, spelled);
+    }
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
 export function createCccConfinedFsOperations(i: Readonly<{ readRoots: readonly string[]; writeRoots: readonly string[];
   deniedNames: readonly string[] }>): CccConfinedFsOperations {
   const deniedNames = cccConfinedValidatedDeniedNames(i.deniedNames);
@@ -122,6 +158,24 @@ export function createCccConfinedFsOperations(i: Readonly<{ readRoots: readonly 
   };
   const readable = (path: string): string => gate(path, readRoots);
   const writable = (path: string): string => gate(path, writeRoots);
+  const readChecked = async (path: string, roots: readonly string[]): Promise<Buffer> => {
+    const reason = roots === readRoots ? "outside-read-roots" : "outside-write-roots";
+    const handle = await openCheckedLanding(gate(path, roots), fsConstants.O_RDONLY, reason, String(path));
+    try {
+      return await handle.readFile();
+    } finally {
+      await handle.close();
+    }
+  };
+  const writeChecked = async (path: string, content: string): Promise<void> => {
+    const handle = await openCheckedLanding(writable(path), fsConstants.O_WRONLY | fsConstants.O_CREAT, "outside-write-roots", String(path));
+    try {
+      await handle.truncate(0);
+      await handle.writeFile(content);
+    } finally {
+      await handle.close();
+    }
+  };
   const visible = (path: string): boolean => refusal(path, readRoots) === null;
 
   const glob = async (pattern: string, searchPath: string, options: Readonly<{ ignore: string[]; limit: number }>): Promise<string[]> => {
@@ -163,18 +217,18 @@ export function createCccConfinedFsOperations(i: Readonly<{ readRoots: readonly 
 
   return Object.freeze({
     read: Object.freeze({
-      readFile: async (path: string) => readFile(readable(path)),
+      readFile: async (path: string) => readChecked(path, readRoots),
       access: async (path: string) => access(readable(path), fsConstants.R_OK),
     }),
     write: Object.freeze({
-      writeFile: async (path: string, content: string) => writeFile(writable(path), content),
+      writeFile: async (path: string, content: string) => writeChecked(path, content),
       mkdir: async (directory: string) => {
         await mkdir(writable(directory), { recursive: true });
       },
     }),
     edit: Object.freeze({
-      readFile: async (path: string) => readFile(writable(path)),
-      writeFile: async (path: string, content: string) => writeFile(writable(path), content),
+      readFile: async (path: string) => readChecked(path, writeRoots),
+      writeFile: async (path: string, content: string) => writeChecked(path, content),
       access: async (path: string) => access(writable(path), fsConstants.R_OK | fsConstants.W_OK),
     }),
     ls: Object.freeze({

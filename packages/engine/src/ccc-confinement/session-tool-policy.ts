@@ -29,7 +29,11 @@ Card C2 (D11, CONTRACT-v3 sections 2.12 and 2.13, verify-v2 item 37). A planning
 */
 /*
 FNXC:CccSessionToolPolicy 2026-10-14-21:10:
-Narrowest reading (reported as a deviation): createFnAgent runs the full check (names, digest, marks) only for a policy this module issued, which it records in a WeakSet. Card P1's regression suites build planning sessions from hand-written policies with placeholder digests and no Fusion tools; for such a policy createFnAgent still refuses every final tool outside the policy, duplicates, and a missing or unmarked confined tool, but cannot check the digest or require the Fusion tools. Once the planning callers build their policies here, the WeakSet check can be dropped.
+Narrowest reading (reported as a deviation): createFnAgent runs the full check (names, digest, marks) only for a policy this module issued. Card P1's regression suites build planning sessions from hand-written policies with placeholder digests and no Fusion tools; for such a policy createFnAgent still refuses every final tool outside the policy, duplicates, and a missing or unmarked confined tool, but cannot check the digest or require the Fusion tools. Once the planning callers build their policies here, the issued-only condition can be dropped.
+*/
+/*
+FNXC:CccSessionToolPolicy 2026-10-14-22:58:
+Card C2 repair 1. An issued policy is recognised by its content, not its object identity: buildCccSessionToolPolicy records sha256 of the canonical JSON of all six policy fields, and createFnAgent's final check runs assertCccSessionToolSet for any policy with a recorded key, so a caller that spreads, rebuilds or deserializes its issued policy keeps D11's names-and-digest equality (verify-v2 item 37). A policy never issued in this process still gets only the names check; card SF, WR and C6 callers must build their policies here. Under a tool policy the confined bash, write and edit are sequential tools, so Pi runs any message that contains one of them one call at a time: no shell command runs while a file operation is between its path check and its open.
 */
 
 export class CccSessionToolPolicyRefusedError extends Error {
@@ -45,7 +49,8 @@ export class CccSessionToolPolicyRefusedError extends Error {
 
 /** Tool names a planning session may only fill with a Fusion confined tool. */
 const CCC_CONFINED_TOOL_NAMES: ReadonlySet<string> = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-const issuedPolicies = new WeakSet<object>();
+/** sha256 content keys of every policy buildCccSessionToolPolicy issued in this process. */
+const issuedPolicyKeys = new Set<string>();
 
 /** Byte-for-byte the per-tool schema canonicalization pi.ts uses for the receipt binder's authorities. */
 function canonicalToolSchemaJson(value: unknown, seen = new Set<object>()): string {
@@ -74,6 +79,27 @@ function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+/** The content key of a policy: sha256 of the canonical JSON of its six fields, or null when they do not serialize. */
+function policyContentKey(policy: CccSessionToolPolicy): string | null {
+  try {
+    return sha256(canonicalCccPrdJson({
+      policyId: policy.policyId,
+      allowedTools: [...policy.allowedTools],
+      toolsetDigest: policy.toolsetDigest,
+      readRoots: [...policy.readRoots],
+      writeRoots: [...policy.writeRoots],
+      deniedNames: [...policy.deniedNames],
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/** A sequential copy of a confined tool, so Pi never runs it beside another call of the same message. */
+function sequential(tool: ToolDefinition): ToolDefinition {
+  return { ...tool, executionMode: "sequential" };
+}
+
 /** The sorted name and parameter-schema authorities of a tool set. */
 export function cccSessionToolAuthorities(tools: readonly ToolDefinition[]): CccExecutionToolAuthority[] {
   return tools
@@ -97,15 +123,15 @@ export function createCccConfinedSessionTools(i: Readonly<{ names: readonly stri
   return i.names.map((name): ToolDefinition => {
     switch (name) {
       case "read": return markCccConfinedTool(createReadTool(i.cwd, { operations: fs.read }) as unknown as ToolDefinition);
-      case "write": return markCccConfinedTool(createWriteTool(i.cwd, { operations: fs.write }) as unknown as ToolDefinition);
-      case "edit": return markCccConfinedTool(createEditTool(i.cwd, { operations: fs.edit }) as unknown as ToolDefinition);
+      case "write": return markCccConfinedTool(sequential(createWriteTool(i.cwd, { operations: fs.write }) as unknown as ToolDefinition));
+      case "edit": return markCccConfinedTool(sequential(createEditTool(i.cwd, { operations: fs.edit }) as unknown as ToolDefinition));
       case "ls": return markCccConfinedTool(createLsTool(i.cwd, { operations: fs.ls }) as unknown as ToolDefinition);
       case "find": return markCccConfinedTool(createFindTool(i.cwd, { operations: fs.find }) as unknown as ToolDefinition);
       case "grep":
         return createCccConfinedGrepTool({ fs, readRoots: i.readRoots, deniedNames: i.deniedNames, limits: CCC_CONFINED_GREP_DEFAULT_LIMITS });
       case "bash":
         if (!bash) throw new CccSessionToolPolicyRefusedError(["bash needs a confined shell (cccConfinement.bash)"]);
-        return markCccConfinedTool(createBashTool(i.cwd, { operations: bash }) as unknown as ToolDefinition);
+        return markCccConfinedTool(sequential(createBashTool(i.cwd, { operations: bash }) as unknown as ToolDefinition));
       default:
         throw new TypeError(`${name} is not a confined tool name`);
     }
@@ -186,7 +212,8 @@ export function buildCccSessionToolPolicy(i: Readonly<{ roleClass: CccPlanningRo
     writeRoots: Object.freeze(writeRoots),
     deniedNames: Object.freeze([...CCC_PLANNING_DENIED_NAMES]),
   });
-  issuedPolicies.add(policy);
+  const key = policyContentKey(policy);
+  if (key !== null) issuedPolicyKeys.add(key);
   return policy;
 }
 
@@ -247,11 +274,13 @@ export function resolveCccPolicySessionTools(i: Readonly<{
 }
 
 /**
- * createFnAgent's final check after the wrapper chain. A policy this module issued gets assertCccSessionToolSet;
- * a hand-built one is held to its names: nothing outside it, no duplicates, every confined policy tool present and marked.
+ * createFnAgent's final check after the wrapper chain. A policy whose content this module issued gets
+ * assertCccSessionToolSet; a hand-built one is held to its names: nothing outside it, no duplicates, every confined
+ * policy tool present and marked.
  */
 export function assertCccPolicySessionFinalTools(policy: CccSessionToolPolicy, finalTools: readonly ToolDefinition[]): void {
-  if (issuedPolicies.has(policy)) {
+  const key = policyContentKey(policy);
+  if (key !== null && issuedPolicyKeys.has(key)) {
     assertCccSessionToolSet(policy, finalTools);
     return;
   }
