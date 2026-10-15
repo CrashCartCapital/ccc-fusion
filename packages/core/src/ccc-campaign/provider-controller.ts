@@ -313,7 +313,10 @@ export async function atomicReserveCccCampaignProviderDispatch(
   }).catch(async (error: unknown) => {
     // FNXC:CccPlanningCampaignLink 2026-10-15-00:45: card BF (verify-v2 item 48). A linked writer refusal is recorded
     // only after the reservation transaction above has rolled back, in a fresh transaction, then the same error rethrows.
-    if (error instanceof CccPlanningLinkedWriterLimitError) await recordCccPlanningWriterRefusal(input.layer, error.refusal);
+    if (error instanceof CccPlanningLinkedWriterLimitError) {
+      // Audit is evidence after rollback; its own failure cannot replace the original typed refusal.
+      await recordCccPlanningWriterRefusal(input.layer, error.refusal).catch(() => undefined);
+    }
     throw error;
   });
 }

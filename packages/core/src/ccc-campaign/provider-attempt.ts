@@ -9,12 +9,21 @@ import {
   type RunAuditEvent,
 } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
+import { cccPlanningRuns } from "../postgres/schema/ccc-planning.js";
 import {
   assertCccCampaignAuthorityBinding,
   createCccCampaignAuthorityBinding,
 } from "./canonical.js";
 import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
 import { readConsumedCccCampaignApprovalCustodyWithinTransaction } from "../async-approval-request-store.js";
+import { CccPlanningLinkedWriterLimitError, findCccPlanningRunForImport,
+  recordCccPlanningWriterRefusalWithin } from "../task-store/ccc-planning-campaign-link-ops.js";
+import { transitionCccPlanningRunStateWithin } from "../task-store/ccc-planning-ops.js";
+import type { CccPlanningRunCustody } from "../ccc-planning/types.js";
+import { CccPlanningRefusal } from "../ccc-planning/errors.js";
+import { readCccRunningRuntimeDistManifest } from "../ccc-planning/runtime-identity.js";
+import { CCC_PLANNING_LAUNCH_HEADROOM_MS, CCC_PLANNING_MAX_CALLS_PER_ATTEMPT,
+  CCC_PLANNING_MAX_DISPATCH_ATTEMPTS_PER_LINEAGE } from "../ccc-planning/policy.js";
 import {
   CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION,
   CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION,
@@ -1416,6 +1425,27 @@ async function withinWriteTransaction<T>(
   return input.layer.transactionImmediate(operation);
 }
 
+/** FNXC:CccPlanningLinkedWriterCaps 2026-10-15-11:00: a reserved replay or reserve-to-begin gap cannot bypass changed run authority. */
+async function assertLinkedWriterRunPermitsCall(tx: DbTransaction, run: CccPlanningRunCustody,
+  request: Readonly<{ turnKey: string; dispatchKey: string }>, now: string): Promise<void> {
+  const refuse = (reason: CccProviderAttemptLimitError["reason"], message: string): never => {
+    throw new CccPlanningLinkedWriterLimitError({ runId: run.runId, importId: run.importId!,
+      turnKey: request.turnKey, dispatchKey: request.dispatchKey, reason, refusedAt: now }, message);
+  };
+  if (readCccRunningRuntimeDistManifest() !== run.runtimeDistManifestSha256) {
+    refuse("runtime-not-permitted", "CCC_PLANNING_RUNTIME_NOT_PERMITTED: linked writer runtime differs from admission");
+  }
+  if (run.state !== "building" && run.state !== "awaiting_execution_authority") {
+    refuse("run-not-building", `${run.state === "paused" ? "CCC_PLANNING_CONTROL_PENDING" : "CCC_PLANNING_RUN_ENDED"}: run is ${run.state}`);
+  }
+  const [control] = await tx.select({ request: cccPlanningRuns.controlRequest }).from(cccPlanningRuns)
+    .where(and(eq(cccPlanningRuns.projectId, run.projectId), eq(cccPlanningRuns.runId, run.runId))).limit(1);
+  if (control?.request === "cancel") refuse("control-pending", "CCC_PLANNING_CONTROL_PENDING: linked writer cancel is pending");
+  if (Date.parse(now) + CCC_PLANNING_LAUNCH_HEADROOM_MS >= Date.parse(run.deadlineAt)) {
+    refuse("deadline", "CCC_PLANNING_DEADLINE: linked writer has no launch headroom");
+  }
+}
+
 export async function reserveCccProviderAttempt(input: ReserveInput): Promise<CccProviderAttemptScope> {
   requireCanonicalText(input.request.taskId, "task ID");
   return withinWriteTransaction(input, async (tx) => {
@@ -1429,7 +1459,12 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
           `CCC provider attempt ${requested.attemptKey} collides with changed campaign route`,
         );
       }
-      return assertReservationReplay(existing, requested, context);
+      const replay = assertReservationReplay(existing, requested, context);
+      if (replay.state === "reserved") {
+        const linked = await findCccPlanningRunForImport(tx, context.projectId, context.importId);
+        if (linked) await assertLinkedWriterRunPermitsCall(tx, linked, requested, await databaseNow(tx));
+      }
+      return replay;
     }
     const logicalExisting = [...history.attempts.values()].find(({ scope }) =>
       scope.taskId === context.taskId
@@ -1443,20 +1478,55 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
     }
     if (!requested.routeMatches) assertRequestRoute(context, input.request);
 
+    const linked = await findCccPlanningRunForImport(tx, context.projectId, context.importId);
+    const linkedNow = linked ? await databaseNow(tx) : null;
+    const refuse = (reason: CccProviderAttemptLimitError["reason"], message: string): never => {
+      if (linked && linkedNow) throw new CccPlanningLinkedWriterLimitError({ runId: linked.runId,
+        importId: context.importId, turnKey: requested.turnKey, dispatchKey: requested.dispatchKey,
+        reason, refusedAt: linkedNow }, message);
+      throw new CccProviderAttemptLimitError(reason, message);
+    };
+    // FNXC:CccPlanningLinkedWriterCaps 2026-10-15: only linked imports receive the ordered run gates and per-attempt buckets (D15).
+    if (linked) {
+      await assertLinkedWriterRunPermitsCall(tx, linked, requested, linkedNow!);
+      const taskAttempts = [...history.attempts.values()].filter(({ scope }) => scope.semanticTaskId === context.semanticTaskId);
+      if (taskAttempts.some(({ scope }) => scope.state === "reserved" || scope.state === "dispatched_unknown")) {
+        refuse("unreconciled-dispatch", "CCC_PLANNING_UNRECONCILED_DISPATCH: a linked writer call is unsettled");
+      }
+      const turns = new Set(taskAttempts.map(({ scope }) => scope.turnKey));
+      if (!turns.has(requested.turnKey) && turns.size >= CCC_PLANNING_MAX_DISPATCH_ATTEMPTS_PER_LINEAGE) {
+        refuse("dispatch-cap", "CCC_PLANNING_DISPATCH_CAP: linked writer has three attempts");
+      }
+      const turnCalls = taskAttempts.filter(({ scope }) => scope.turnKey === requested.turnKey).length;
+      const slot = /^pi-stream:([1-9][0-9]*)$/u.exec(requested.dispatchKey);
+      if (!slot || Number(slot[1]) > CCC_PLANNING_MAX_CALLS_PER_ATTEMPT || turnCalls >= CCC_PLANNING_MAX_CALLS_PER_ATTEMPT) {
+        refuse("iteration-cap", "CCC_PLANNING_ITERATION_CAP: linked writer attempt has at most eleven calls");
+      }
+    }
     const { maxRequests, maxConcurrency } = admittedBounds(context);
-    if (history.activeCount >= maxConcurrency) {
+    if (!linked && history.activeCount >= maxConcurrency) {
       throw new CccProviderAttemptLimitError(
         "max-concurrency",
         `CCC provider attempt for ${context.taskId} exceeds its admitted concurrency bound`,
       );
     }
-    const now = await databaseNow(tx);
+    const now = linkedNow ?? await databaseNow(tx);
+    if (linked && Date.parse(now) >= Date.parse(context.campaignDeadlineAt)) {
+      refuse("deadline", "CCC_PLANNING_DEADLINE: campaign deadline reached");
+    }
     assertBeforeDeadline(context, now);
     if (context.requestCount >= maxRequests) {
-      throw new CccProviderAttemptLimitError(
+      refuse(
         "max-requests",
         `CCC provider attempt for ${context.taskId} exceeds its admitted request bound`,
       );
+    }
+    if (linked && history.activeCount >= maxConcurrency) {
+      refuse("max-concurrency", `CCC provider attempt for ${context.taskId} exceeds its admitted concurrency bound`);
+    }
+    if (linked?.state === "awaiting_execution_authority") {
+      await transitionCccPlanningRunStateWithin(tx, { projectId: linked.projectId, runId: linked.runId,
+        from: linked.state, to: "building", stateCode: null, fence: null });
     }
     const scope = createScope({
       attemptKey: requested.attemptKey,
@@ -1495,7 +1565,9 @@ export async function beginCccProviderAttemptDispatch(
     const attempt = transitionAttempt(await loadHistory(tx, context), input.transition, context.taskId);
     if (attempt.scope.state === "dispatched_unknown") return Object.freeze({ kind: "dispatched-unknown", scope: attempt.scope });
     if (attempt.scope.state !== "reserved") return Object.freeze({ kind: "terminal", scope: attempt.scope });
+    const linked = await findCccPlanningRunForImport(tx, context.projectId, context.importId);
     const now = await databaseNow(tx);
+    if (linked) await assertLinkedWriterRunPermitsCall(tx, linked, attempt.scope, now);
     assertBeforeDeadline(context, now);
     const dispatched = scopeWithState(attempt.scope, "dispatched_unknown");
     await appendAttemptEvent(tx, now, dispatched, "dispatched");
@@ -1586,6 +1658,28 @@ export async function reconcileCccProviderAttempt(
       "terminal",
       terminalReceipt,
     );
+    const refusalReason = (input.reconciliation as CccProviderAttemptReconciliation & {
+      refusalReason?: string;
+    }).refusalReason;
+    if (outcome === "proved_failed" && ["receipt-missing", "receipt-mismatch", "effective-route-drift"].includes(refusalReason ?? "")) {
+      const linked = await findCccPlanningRunForImport(tx, context.projectId, context.importId);
+      if (linked) {
+        await recordCccPlanningWriterRefusalWithin(tx, linked, { runId: linked.runId, importId: context.importId,
+          turnKey: terminal.turnKey, dispatchKey: terminal.dispatchKey,
+          reason: refusalReason as CccProviderAttemptLimitError["reason"], refusedAt: await databaseNow(tx) });
+        if (linked.state !== "blocked_provider") {
+          try {
+            await transitionCccPlanningRunStateWithin(tx, { projectId: linked.projectId, runId: linked.runId,
+              from: linked.state, to: "blocked_provider", stateCode: "CCC_PROVIDER_PIN_DRIFT", fence: null });
+          } catch (error) {
+            // FNXC:CccPlanningLinkedWriterSettlement 2026-10-15-11:00: a raced cancel preserves the known terminal and moves toward cancellation in this transaction.
+            if (!(error instanceof CccPlanningRefusal) || error.code !== "CCC_PLANNING_CONTROL_PENDING") throw error;
+            await transitionCccPlanningRunStateWithin(tx, { projectId: linked.projectId, runId: linked.runId,
+              from: linked.state, to: "cancelling", stateCode: null, fence: null });
+          }
+        }
+      }
+    }
     return terminal;
   });
 }

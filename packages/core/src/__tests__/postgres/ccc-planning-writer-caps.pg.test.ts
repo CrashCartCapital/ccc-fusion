@@ -21,7 +21,7 @@ import {
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import { importCccPrdBundle } from "../../ccc-prd/importer.js";
 import { claimCccCampaignApproval, issueCccCampaignApproval } from "../../async-approval-request-store.js";
-import { proveCccProviderAttemptNotDispatched, reserveCccProviderAttempt } from "../../ccc-campaign/provider-attempt.js";
+import { beginCccProviderAttemptDispatch, proveCccProviderAttemptNotDispatched, reserveCccProviderAttempt } from "../../ccc-campaign/provider-attempt.js";
 import { atomicReserveCccCampaignProviderDispatch } from "../../ccc-campaign/provider-controller.js";
 import { CccProviderAttemptLimitError, type CccCampaignWorkItemFence, type CccProviderAttemptScope } from "../../ccc-campaign/types.js";
 import { registerCccRunningRuntimeDistManifest } from "../../ccc-planning/runtime-identity.js";
@@ -46,6 +46,7 @@ function sha(label: string): string {
 }
 
 const RUNTIME = sha("bf-caps-runtime");
+const TOOLSET = sha("bf-caps-issued-tool-policy");
 
 type Row = Record<string, unknown>;
 type LinkState = "building" | "awaiting_execution_authority";
@@ -210,7 +211,7 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
 
   async function open(f: Fixture, baseTurnKey: string, nodeAttemptOrdinal: number) {
     return openCccPlanningLinkedWriterAttempt(h.layer(), { importId: f.importId, semanticTaskId: f.semanticTaskId, baseTurnKey,
-      nodeAttemptOrdinal, fence: f.workItemFence });
+      nodeAttemptOrdinal, fence: f.workItemFence, toolsetDigest: TOOLSET });
   }
 
   async function attemptRows(f: Fixture): Promise<Array<{ mutation_type: string; turn_key: string; dispatch_key: string }>> {
@@ -277,11 +278,55 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
       expect(opened.route).toMatchObject({ providerId: f.campaign.route.providerId, modelId: f.campaign.route.modelId,
         transport: f.campaign.route.transport, roleClass: "writer" });
       expect(opened.route.toolsetDigest).toMatch(/^[0-9a-f]{64}$/u);
+      expect(opened.route.toolsetDigest).toBe(TOOLSET);
       expect((await open(f, "base-turn-route", 2)).route).toEqual(opened.route);
+    });
+
+    it("refuses a missing or invalid toolset digest before opening a transaction", async () => {
+      const f = await fixture("digest", { link: "building" });
+      const base = h.layer();
+      let transactions = 0;
+      const observed = new Proxy(base, { get(target, property) {
+        if (property !== "transactionImmediate") return Reflect.get(target, property, target);
+        return () => { transactions += 1; throw new Error("must-not-open"); };
+      } }) as AsyncDataLayer;
+      for (const toolsetDigest of [undefined, "", "A".repeat(64), "x".repeat(64), "1".repeat(63)]) {
+        await expect(openCccPlanningLinkedWriterAttempt(observed, { importId: f.importId, semanticTaskId: f.semanticTaskId,
+          baseTurnKey: "digest", nodeAttemptOrdinal: 1, fence: f.workItemFence, toolsetDigest } as
+          Parameters<typeof openCccPlanningLinkedWriterAttempt>[1])).rejects.toMatchObject({ code: "CCC_PLANNING_INTERNAL_ERROR" });
+      }
+      expect(transactions).toBe(0);
+      expect(await attemptRows(f)).toEqual([]);
     });
   });
 
   describe("run state, control, deadline and runtime", () => {
+    it("checks runtime, state and control before deadline, and unsettled calls before caps", async () => {
+      const drift = await fixture("ordered-runtime", { link: "building", runtime: sha("unpermitted"),
+        deadlineAt: await databaseNowPlus(20) });
+      await recordCccPlanningBuildControl(h.layer(), { runId: drift.runId!, request: "cancel", actor: "bf" });
+      await linkedRefusal(call(drift, "ordered", "pi-stream:12"), "runtime-not-permitted");
+
+      const paused = await fixture("ordered-state", { link: "building", deadlineAt: await databaseNowPlus(20) });
+      await move(paused.projectId, paused.runId!, "paused");
+      await recordCccPlanningBuildControl(h.layer(), { runId: paused.runId!, request: "cancel", actor: "bf" });
+      await linkedRefusal(call(paused, "ordered", "pi-stream:12"), "run-not-building");
+
+      const controlled = await fixture("ordered-control", { link: "building", deadlineAt: await databaseNowPlus(20) });
+      await recordCccPlanningBuildControl(h.layer(), { runId: controlled.runId!, request: "cancel", actor: "bf" });
+      await linkedRefusal(call(controlled, "ordered", "pi-stream:12"), "control-pending");
+
+      const active = await fixture("ordered-active", { link: "building" });
+      for (const turn of ["one", "two"]) await call(active, turn, "pi-stream:1");
+      const reserved = await reserveCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(),
+        request: request(active, "three", "pi-stream:1") });
+      await linkedRefusal(call(active, "four", "pi-stream:12"), "unreconciled-dispatch");
+      await proveCccProviderAttemptNotDispatched({ layer: h.layer(), rootDir: h.rootDir(),
+        transition: { taskId: active.taskId, attemptKey: reserved.attemptKey, controllerToken: reserved.controllerToken } });
+      await linkedRefusal(call(active, "four", "pi-stream:12"), "dispatch-cap");
+      expect(await requestCount(active)).toBe(3);
+    });
+
     it("refuses control-pending while the run has a pending cancel", async () => {
       const f = await fixture("control", { link: "building" });
       const opened = await open(f, "base-turn-control", 1);
@@ -289,6 +334,19 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
       await recordCccPlanningBuildControl(h.layer(), { runId: f.runId!, request: "cancel", actor: "bf-operator" });
       expect(await anchor(f)).toMatchObject({ state: "building", control_request: "cancel" });
       await linkedRefusal(call(f, opened.turnKey, "pi-stream:2"), "control-pending");
+      expect(await requestCount(f)).toBe(1);
+    });
+
+    it("rechecks linked control before a reserved replay or direct dispatch can issue a provider permit", async () => {
+      const f = await fixture("reserved-cancel", { link: "building", approval: true });
+      const reserved = await reserveCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(),
+        request: request(f, "reserved-cancel", "pi-stream:1") });
+      await recordCccPlanningBuildControl(h.layer(), { runId: f.runId!, request: "cancel", actor: "bf" });
+      await linkedRefusal(atomicReserveCccCampaignProviderDispatch(atomicInput(f, "reserved-cancel", "pi-stream:1")), "control-pending");
+      await linkedRefusal(beginCccProviderAttemptDispatch({ layer: h.layer(), rootDir: h.rootDir(), transition: {
+        taskId: f.taskId, attemptKey: reserved.attemptKey, controllerToken: reserved.controllerToken,
+      } }), "control-pending");
+      expect((await attemptRows(f)).map(row => row.mutation_type)).toEqual(["ccc-campaign:provider-attempt:reserved"]);
       expect(await requestCount(f)).toBe(1);
     });
 
@@ -350,6 +408,28 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
   });
 
   describe("refusal recording (item 48)", () => {
+    it("preserves the original linked refusal when its post-rollback audit transaction fails", async () => {
+      const f = await fixture("audit-down", { link: "building", approval: true });
+      await recordCccPlanningBuildControl(h.layer(), { runId: f.runId!, request: "cancel", actor: "bf" });
+      const base = h.layer();
+      let transactions = 0;
+      const brokenAudit = new Proxy(base, { get(target, property) {
+        if (property !== "transactionImmediate") return Reflect.get(target, property, target);
+        return async (work: (tx: DbTransaction) => Promise<unknown>) => {
+          transactions += 1;
+          if (transactions === 2) throw new Error("bf-audit-unavailable");
+          return target.transactionImmediate(work);
+        };
+      } }) as AsyncDataLayer;
+      const caught = await linkedRefusal(atomicReserveCccCampaignProviderDispatch(atomicInput(f, "audit-down", "pi-stream:1", brokenAudit)),
+        "control-pending");
+      expect(caught.message).toContain("CCC_PLANNING_CONTROL_PENDING");
+      expect(transactions).toBe(2);
+      expect(await attemptRows(f)).toEqual([]);
+      expect(await requestCount(f)).toBe(0);
+      expect(await planningEvents(f, "ccc-planning:writer-refused")).toEqual([]);
+    });
+
     it("records exactly one writer-refused event after the reservation transaction rolls back, on a fresh transaction", async () => {
       const f = await fixture("record", { link: "building", approval: true });
       const opened = await open(f, "base-turn-record", 1);

@@ -397,6 +397,23 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
       expect(await anchor(f)).toMatchObject({ state: "blocked_provider", state_code: "CCC_PROVIDER_PIN_DRIFT" });
     });
 
+    it("maps every remaining budget and provider refusal code with the same terminal-state rules", async () => {
+      for (const [reason, state, code] of [
+        ["phase-allocation", "budget_exhausted", "CCC_PLANNING_PHASE_ALLOCATION_EXHAUSTED"],
+        ["max-requests", "budget_exhausted", "CCC_PLANNING_PHASE_ALLOCATION_EXHAUSTED"],
+        ["deadline", "budget_exhausted", "CCC_PLANNING_DEADLINE"],
+        ["receipt-missing", "blocked_provider", "CCC_PROVIDER_PIN_DRIFT"],
+        ["effective-route-drift", "blocked_provider", "CCC_PROVIDER_PIN_DRIFT"],
+        ["degenerate-output", "blocked_provider", "CCC_MODEL_DEGENERATE_OUTPUT"],
+      ]) {
+        const f = await fixture(`reason-${reason}`);
+        await lease(f);
+        await refusal(f, reason!);
+        await transition(f, "manual-required", { leaseOwner: null, leaseExpiresAt: null });
+        expect(await anchor(f)).toMatchObject({ state, state_code: code });
+      }
+    });
+
     it("a dispatched_unknown linked attempt then item manual-required moves building to unknown_effect", async () => {
       const f = await fixture("unknown-effect");
       await lease(f);
@@ -416,7 +433,7 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
       const f = await fixture("cancel-race", { approval: true });
       await lease(f);
       const opened = await openCccPlanningLinkedWriterAttempt(h.layer(), { importId: f.importId, semanticTaskId: f.semanticTaskId,
-        baseTurnKey: "base-turn-race", nodeAttemptOrdinal: 1,
+        baseTurnKey: "base-turn-race", nodeAttemptOrdinal: 1, toolsetDigest: sha("bf-outcome-issued-tool-policy"),
         fence: { workItemId: f.workItemId, runId: `ccc-prd:${f.importId}`, attempt: 1 } });
       await recordCccPlanningBuildControl(h.layer(), { runId: f.runId, request: "cancel", actor: "bf-operator" });
       const refused = await atomicReserveCccCampaignProviderDispatch({
@@ -468,6 +485,25 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
   });
 
   describe("savepoint, rollback and L1-only writes", () => {
+    it("leaves cancellation pending while a linked provider effect is unsettled and completes it after settlement", async () => {
+      const f = await fixture("cancel-unsettled");
+      await lease(f);
+      const scope = await dispatched(f, "cancel-unsettled");
+      await recordCccPlanningBuildControl(h.layer(), { runId: f.runId, request: "cancel", actor: "bf" });
+      await transition(f, "cancelled", { expectedLeaseOwner: f.leaseOwner, leaseOwner: null, leaseExpiresAt: null,
+        lastError: "workflow-user-cancelled" });
+      expect(await anchor(f)).toMatchObject({ state: "cancelling" });
+      await reconcileCccPlanningCampaignOutcome(h.layer(), f.runId);
+      expect(await anchor(f)).toMatchObject({ state: "cancelling" });
+      await reconcileCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(), reconciliation: {
+        taskId: f.taskId, attemptKey: scope.attemptKey, controllerToken: scope.controllerToken,
+        outcome: "proved_failed", evidenceDigest: sha("cancel-proved"), observerId: "bf",
+      } });
+      await reconcileCccPlanningCampaignOutcome(h.layer(), f.runId);
+      expect(await anchor(f)).toMatchObject({ state: "cancelled", control_request: null });
+      expect(await stateMoves(f)).toEqual(["building->cancelling", "cancelling->cancelled"]);
+    });
+
     it("a transition the anchor does not allow leaves it unchanged, writes campaign-unmapped and commits the item", async () => {
       const f = await fixture("disallowed");
       await lease(f);
@@ -494,11 +530,13 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
       expect(JSON.stringify(await anchor(f))).toBe(before);
       expect(await events(f, "ccc-planning:campaign-unmapped")).toHaveLength(1);
 
+      let secondQueryCode: string | undefined;
       const aborted = await h.layer().transactionImmediate(async (tx) => {
         await tx.execute(sql`SELECT 1/0`).catch(() => undefined);
-        return tx.execute(sql`SELECT 1`).then(() => "continued", (error: unknown) => errorCode(error));
+        secondQueryCode = await tx.execute(sql`SELECT 1`).then(() => "continued", (error: unknown) => errorCode(error));
       }).catch((error: unknown) => errorCode(error));
-      expect(aborted).toBe("25P02");
+      expect(secondQueryCode).toBe("25P02");
+      expect(aborted).toBe("22012");
     });
 
     it("an outer rollback after the mapping leaves no anchor change and no state event", async () => {
@@ -565,6 +603,26 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
   });
 
   describe("reconcile", () => {
+    it("keeps a known route-refusal settlement when cancellation races its run-state mapping", async () => {
+      const f = await fixture("settlement-cancel");
+      await lease(f);
+      const scope = await dispatched(f, "settlement-cancel");
+      await recordCccPlanningBuildControl(h.layer(), { runId: f.runId, request: "cancel", actor: "bf" });
+      await expect(reconcileCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(), reconciliation: {
+        taskId: f.taskId, attemptKey: scope.attemptKey, controllerToken: scope.controllerToken,
+        outcome: "proved_failed", evidenceDigest: sha("settlement-cancel"), observerId: "pi",
+        refusalReason: "effective-route-drift",
+      } as CccProviderAttemptReconciliation })).resolves.toMatchObject({ state: "proved_failed" });
+      expect(await anchor(f)).toMatchObject({ state: "cancelling" });
+      const terminal = await rows<{ xmin: string }>(sql`SELECT xmin::text AS xmin FROM project.run_audit_events
+        WHERE campaign_import_id = ${f.importId} AND mutation_type = 'ccc-campaign:provider-attempt:terminal'`);
+      expect(terminal).toHaveLength(1);
+      expect((await events(f, "ccc-planning:state")).map(event => event.xmin)).toEqual([terminal[0]!.xmin]);
+      await transition(f, "cancelled", { expectedLeaseOwner: f.leaseOwner, leaseOwner: null, leaseExpiresAt: null,
+        lastError: "workflow-user-cancelled" });
+      expect(await anchor(f)).toMatchObject({ state: "cancelled", control_request: null });
+    });
+
     it("moves the run to blocked_provider in the reconcile transaction for an effective-route-drift refusal", async () => {
       const f = await fixture("reconcile-drift");
       await lease(f);
