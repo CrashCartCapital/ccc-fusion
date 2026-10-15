@@ -13,6 +13,11 @@ FNXC:CccProbeEchoTool 2026-10-14-22:44:
 Card C2 repair 1 (verify-v2 item 39: any tool call ends the probe and no tool result triggers a follow-up call). Pi 0.81.1 checks a call's arguments after the tool's prepareArguments hook and before execute, and answers a call that fails the check, or that it prepares while the turn signal is already aborted, with an immediate result that is never terminal; Pi then enters the stream function again, and in planning scope that second entry reserves a provider dispatch. So a probe tool records a refused call in prepareArguments but does not abort there: it hands Pi schema-valid placeholder arguments (for ccc_probe_echo, the expected values) and execute, which never runs the real tool for such a call, aborts the turn once and returns a terminal result. wrapCccProbedTool checks the arguments the way Pi does (the inner tool's prepareArguments, then pi-ai's validateToolArguments); its observation is latched, the first call claims it, and every later call in the batch returns a terminal result without running the tool. If no placeholder passes the tool's schema, the refusal aborts the turn at once, which ends the turn but not the batch.
 */
 
+/*
+FNXC:CccProbeEchoTool 2026-10-15-00:30:
+Card C2 repair 2 (errata E14 item C2-2). Card C6 wraps every tool of a probe session, ccc_probe_echo included, and the echo hands Pi the expected values for an inexact call so that Pi reaches execute and the batch ends. Before this repair the wrapper then recorded those substituted values as the call's params, with result ok, so a model that failed strict-echo was logged as having echoed exactly. The echo now reports its verdict in its result (details.exact, and isError when inexact), latched to its first observation, and the wrapper records the arguments the model sent, captured in its prepareArguments before any substitution, and result error whenever the inner tool reports the call failed or inexact. Pi prepares and runs a message's calls in the same order, so each execute takes the oldest prepared call whose checked arguments equal its own; a call run without prepareArguments records the params it was given.
+*/
+
 const DETAIL_LIMIT = 600;
 
 function bounded(text: string): string {
@@ -33,11 +38,12 @@ export function createCccProbeEchoTool(i: Readonly<{ expected: Readonly<Record<s
     if (typeof i.expected[key] !== "string") throw new TypeError(`ccc_probe_echo expected value ${key} must be a string`);
   }
   const expected = Object.freeze({ ...i.expected });
-  let observed = false;
+  /** The first observation's verdict, which every result of this tool reports. */
+  let observedExact: boolean | null = null;
   let aborted = false;
   const observe = (exact: boolean, received: unknown) => {
-    if (observed) return;
-    observed = true;
+    if (observedExact !== null) return;
+    observedExact = exact;
     i.onObservation(Object.freeze({ exact, received }));
   };
   const abort = () => {
@@ -64,13 +70,42 @@ export function createCccProbeEchoTool(i: Readonly<{ expected: Readonly<Record<s
     execute: async (_toolCallId, params) => {
       observe(isExact(params), params);
       abort();
+      // Repair 2: the result carries the latched verdict, so a wrapper never reads an inexact echo as a passing call.
+      const exact = observedExact === true;
       return {
-        content: [{ type: "text" as const, text: "Probe echo recorded." }],
-        details: undefined,
+        content: [{ type: "text" as const, text: exact ? "Probe echo recorded." : "Probe echo recorded; it was not exact." }],
+        details: Object.freeze({ exact }),
+        ...(exact ? {} : { isError: true }),
         terminate: true,
-      };
+      } as Awaited<ReturnType<ToolDefinition["execute"]>>;
     },
   };
+}
+
+/** True when a tool result reports its call as failed or inexact: isError, or details.exact false. */
+function reportsFailure(result: unknown): boolean {
+  if (typeof result !== "object" || result === null) return false;
+  const { isError, details } = result as { isError?: unknown; details?: unknown };
+  if (isError === true) return true;
+  return typeof details === "object" && details !== null && (details as { exact?: unknown }).exact === false;
+}
+
+/** A copy of the arguments as the model sent them, safe from a later in-place change; the value itself if it cannot be cloned. */
+function snapshotArguments(args: unknown): unknown {
+  try {
+    return structuredClone(args);
+  } catch {
+    return args;
+  }
+}
+
+/** A stable comparison key for checked arguments, or null when they do not serialize. */
+function argumentsKey(args: unknown): string | null {
+  try {
+    return JSON.stringify(args) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function resultText(result: unknown): string {
@@ -82,14 +117,14 @@ function resultText(result: unknown): string {
 }
 
 /** Pi's own argument check: the tool's prepareArguments (called once), then pi-ai's validateToolArguments. */
-function checkArguments(tool: ToolDefinition, args: unknown): Readonly<{ prepared: unknown; problem: string | null }> {
+function checkArguments(tool: ToolDefinition, args: unknown): Readonly<{ prepared: unknown; checked: unknown; problem: string | null }> {
   let prepared: unknown = args;
   try {
     prepared = tool.prepareArguments ? tool.prepareArguments(args) : args;
-    validateToolArguments(tool as never, { type: "toolCall", id: "ccc-probe", name: tool.name, arguments: prepared as never });
-    return { prepared, problem: null };
+    const checked: unknown = validateToolArguments(tool as never, { type: "toolCall", id: "ccc-probe", name: tool.name, arguments: prepared as never });
+    return { prepared, checked, problem: null };
   } catch (error) {
-    return { prepared, problem: error instanceof Error ? error.message : String(error) };
+    return { prepared, checked: undefined, problem: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -119,23 +154,40 @@ export function wrapCccProbedTool(tool: ToolDefinition, i: Readonly<{ probe: str
   const placeholder = placeholderArguments(tool);
   let claimed = false;
   let refusal: string | null = null;
+  /** Calls prepared and not yet run, oldest first: what the model sent, and the key of the arguments Pi will run them with. */
+  const preparedCalls: Array<{ sent: unknown; key: string | null }> = [];
+  /** The arguments the model sent for the call Pi runs with `params`; `params` itself for a call never prepared here. */
+  const takeSent = (params: unknown): unknown => {
+    const key = argumentsKey(params);
+    const index = key === null ? -1 : preparedCalls.findIndex((entry) => entry.key === key);
+    if (index < 0) return params;
+    // Older entries were prepared but never run (Pi answered them at once), so they are dropped with this one.
+    return preparedCalls.splice(0, index + 1)[index]!.sent;
+  };
   return {
     ...tool,
     prepareArguments: (args: unknown) => {
-      const { prepared, problem } = checkArguments(tool, args);
-      if (problem === null) return prepared as never;
+      // Repair 2: captured before the inner tool's prepareArguments can substitute or change anything.
+      const sent = snapshotArguments(args);
+      const { prepared, checked, problem } = checkArguments(tool, args);
+      if (problem === null) {
+        preparedCalls.push({ sent, key: argumentsKey(checked) });
+        return prepared as never;
+      }
       if (!claimed) {
         claimed = true;
         refusal = bounded(problem);
-        i.onObservation(Object.freeze({ probe: i.probe, toolName: tool.name, params: args, result: "error" as const, detail: refusal }));
+        i.onObservation(Object.freeze({ probe: i.probe, toolName: tool.name, params: sent, result: "error" as const, detail: refusal }));
       }
       if (placeholder === null) {
         abort();
         return args as never;
       }
+      preparedCalls.push({ sent, key: argumentsKey(placeholder) });
       return structuredClone(placeholder) as never;
     },
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+      const sent = takeSent(params);
       if (claimed) {
         // A refused call (placeholder arguments) or a later call in the same batch: never run the tool, end the batch.
         abort();
@@ -151,7 +203,8 @@ export function wrapCccProbedTool(tool: ToolDefinition, i: Readonly<{ probe: str
       let outcome: "ok" | "error";
       try {
         result = await tool.execute(toolCallId, params, signal, onUpdate, ctx);
-        outcome = (result as { isError?: unknown }).isError === true ? "error" : "ok";
+        // Repair 2: an inner tool that reports the call failed or inexact (ccc_probe_echo's details.exact) is an error.
+        outcome = reportsFailure(result) ? "error" : "ok";
       } catch (error) {
         outcome = "error";
         result = {
@@ -160,7 +213,7 @@ export function wrapCccProbedTool(tool: ToolDefinition, i: Readonly<{ probe: str
           isError: true,
         } as Awaited<ReturnType<ToolDefinition["execute"]>>;
       }
-      i.onObservation(Object.freeze({ probe: i.probe, toolName: tool.name, params, result: outcome, detail: resultText(result) }));
+      i.onObservation(Object.freeze({ probe: i.probe, toolName: tool.name, params: sent, result: outcome, detail: resultText(result) }));
       abort();
       return { ...result, terminate: true };
     },

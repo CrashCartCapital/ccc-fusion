@@ -6,6 +6,7 @@ import { Type } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   createGrepTool,
+  createReadTool,
   DefaultResourceLoader,
   ModelRegistry,
   ModelRuntime,
@@ -26,8 +27,10 @@ import { createCccCampaignReadyTool } from "../ccc-campaign-ready.js";
 import { connectMcpSessionTools } from "../mcp-session-tools.js";
 import { CCC_CONFINED_TOOL_MARK, createCccConfinedFsOperations } from "../ccc-confinement/confined-fs-tools.js";
 import {
+  assertCccPolicySessionFinalTools,
   assertCccSessionToolSet,
   buildCccSessionToolPolicy,
+  cccSessionToolsetDigest,
   createCccConfinedSessionTools,
 } from "../ccc-confinement/session-tool-policy.js";
 import { createCccVerdictTool } from "../ccc-confinement/verdict-tool.js";
@@ -412,6 +415,89 @@ describe("closed session tool policy (card C2, D11)", () => {
     expect(finalNames()).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
     prepareSession();
     await createFnAgent(linkedOptions([readyTool()]) as never);
+    expect(finalNames()).toEqual([...CCC_PLANNING_LINKED_WRITER_TOOLSET]);
+  });
+
+  it("createFnAgent refuses a policy not built by buildCccSessionToolPolicy: a hand-built critic policy without ccc_submit_verdict, with a foreign one or even with its own, and a hand-built linked-writer policy without fn_complete_phase are refused before any MCP connection or session; positive control: the same roles built through buildCccSessionToolPolicy create their sessions", async () => {
+    /*
+    FNXC:CccSessionToolPolicy 2026-10-15-00:24:
+    Card C2 repair 2 (errata E14 item C2-3; D11, verify-v2 item 37). The final tool set is checked in full for every policy, and a policy this process never built is refused: before this repair a hand-built policy got only a names check, so a critic session without its verdict tool, a critic with a foreign ccc_submit_verdict and a linked writer without fn_complete_phase were all created, under a toolset digest that pinned nothing.
+    */
+    const handCritic: CccSessionToolPolicy = Object.freeze({
+      policyId: "ccc-critic-tools.v1",
+      allowedTools: Object.freeze([...CCC_PLANNING_TOOLSETS.critic]),
+      toolsetDigest: "1".repeat(64),
+      readRoots: Object.freeze([root]),
+      writeRoots: Object.freeze([]),
+      deniedNames: Object.freeze([...DENIED]),
+    });
+    const handLinked: CccSessionToolPolicy = Object.freeze({
+      policyId: "ccc-linked-writer-tools.v1",
+      allowedTools: Object.freeze([...CCC_PLANNING_LINKED_WRITER_TOOLSET]),
+      toolsetDigest: "7".repeat(64),
+      readRoots: Object.freeze([root]),
+      writeRoots: Object.freeze([join(root, "src")]),
+      deniedNames: Object.freeze([...DENIED]),
+    });
+    const foreignVerdict = { ...verdictTool, parameters: Type.Object({ anything: Type.String() }) } as ToolDefinition;
+    const notBuilt = /not built by buildCccSessionToolPolicy/;
+
+    for (const customTools of [[], [foreignVerdict], [verdictTool]]) {
+      prepareSession();
+      vi.mocked(createReadTool).mockClear();
+      const refused = createFnAgent(sessionOptions({ cccProviderAttemptBinding: criticBinding(handCritic), customTools }) as never);
+      await expect(refused).rejects.toMatchObject({ code: "CCC_SESSION_TOOL_POLICY_REFUSED" });
+      await expect(refused).rejects.toThrow(notBuilt);
+      // Refused while the session tools are resolved: no confined tool is ever built for a policy this process did not build.
+      expect(createReadTool).not.toHaveBeenCalled();
+      expect(connectMcpSessionTools).not.toHaveBeenCalled();
+      expect(createAgentSession).not.toHaveBeenCalled();
+    }
+    prepareSession();
+    const linkedRefused = createFnAgent(sessionOptions({
+      cccProviderAttemptBinding: linkedWriterBinding(handLinked),
+      cccConfinement: writerConfinement,
+      customTools: [],
+    }) as never);
+    await expect(linkedRefused).rejects.toMatchObject({ code: "CCC_SESSION_TOOL_POLICY_REFUSED" });
+    await expect(linkedRefused).rejects.toThrow(notBuilt);
+    expect(createAgentSession).not.toHaveBeenCalled();
+
+    // The final check itself holds a hand-built policy to the full set: missing tools are named beside the provenance refusal.
+    expect(() => assertCccPolicySessionFinalTools(handCritic, criticTools().filter((tool) => tool.name !== "ccc_submit_verdict")))
+      .toThrow(/ccc_submit_verdict is missing/);
+    expect(() => assertCccPolicySessionFinalTools(handLinked, writerTools())).toThrow(/fn_complete_phase is missing/);
+    expect(() => assertCccPolicySessionFinalTools(handCritic, criticTools())).toThrow(notBuilt);
+    // A hand-built policy whose names and digest do match its tools is still refused, on provenance alone. Its read root
+    // differs from CRITIC_POLICY's, so its content is not that of the issued policy.
+    const handExact: CccSessionToolPolicy = Object.freeze({
+      ...handCritic,
+      toolsetDigest: cccSessionToolsetDigest(criticTools()),
+      readRoots: Object.freeze([parent]),
+    });
+    expect(() => assertCccSessionToolSet(handExact, criticTools())).not.toThrow();
+    expect(() => assertCccPolicySessionFinalTools(handExact, criticTools())).toThrow(notBuilt);
+
+    // Positive control: the same roles built through buildCccSessionToolPolicy create their sessions.
+    expect(() => assertCccPolicySessionFinalTools(CRITIC_POLICY, criticTools())).not.toThrow();
+    prepareSession();
+    vi.mocked(createReadTool).mockClear();
+    await createFnAgent(sessionOptions() as never);
+    expect(finalNames()).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
+    expect(createReadTool).toHaveBeenCalledTimes(1);
+    const linked = buildCccSessionToolPolicy({
+      roleClass: "writer",
+      linkedWriter: true,
+      readRoots: [root],
+      writeRoots: [join(root, "src")],
+      tools: [...writerTools(), readyTool()],
+    });
+    prepareSession();
+    await createFnAgent(sessionOptions({
+      cccProviderAttemptBinding: linkedWriterBinding(linked),
+      cccConfinement: writerConfinement,
+      customTools: [readyTool()],
+    }) as never);
     expect(finalNames()).toEqual([...CCC_PLANNING_LINKED_WRITER_TOOLSET]);
   });
 

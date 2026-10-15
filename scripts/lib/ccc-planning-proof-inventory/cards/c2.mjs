@@ -10,6 +10,10 @@ Measured on the M5 Max at load average 12.2 (1 min) with parallel agents: 5.3 s 
 FNXC:CccPlanningProof 2026-10-14-22:41:
 Repair 1 of card C2 adds eight tests (grep matching in a worker with a deadline and abort, a walk that enters each directory once, the file-cap notice on an empty result, probe calls that fail Pi's argument check and an inexact echo through Pi's real agent loop, a structural copy of an issued policy, sequential confined bash, write and edit, and the checked open) and renames the grep limits test. Measured at load average 9.3 (1 min) with parallel agents: 5 s wall for the five files (40 tests). The 120 s hang bound is unchanged.
 */
+/*
+FNXC:CccPlanningProof 2026-10-15-00:52:
+Repair 2 of card C2 (errata E14) adds four tests: a FIFO inside a root that a confined read, edit, write or grep never blocks on, a wrapped ccc_probe_echo that records what the model sent and never ok for an inexact echo, and the refusal of a tool policy buildCccSessionToolPolicy did not build. The fs and grep files now make a FIFO with /usr/bin/mkfifo, present on macOS and on the Linux runners. Measured with parallel agents running: 4.9 s vitest duration for the five files (44 tests). The 120 s hang bound is unchanged.
+*/
 
 const FILES = Object.freeze([
   "src/__tests__/ccc-session-tool-policy.test.ts",
@@ -54,6 +58,7 @@ export const OFFLINE = Object.freeze([
       `${FS} > refuses every write when the session has no write roots, and a write through an escaping symlink`,
       `${FS} > under a tool policy the confined bash, write and edit run one at a time, so a write or read sent with a shell that swaps an in-root directory for an outside symlink lands inside the root and nothing lands outside`,
       `${FS} > a read or write whose checked directory is swapped for an outside symlink before the open is refused, and no outside bytes are returned or written`,
+      `${FS} > a FIFO inside a root never blocks a confined read, edit or write: each settles at once with a not-a-regular-file refusal, four reads leave the thread pool free for an unrelated read, and a write with a reader present refuses before any byte reaches it; positive control: a regular file beside it still reads and writes`,
       `${FS} > validates denied names against [A-Za-z0-9._*-] with a TypeError before any predicate call`,
       `${GREP} > with an empty PATH and PI_OFFLINE=1 the confined grep and find return their matches while Pi's own grep and find reject`,
       `${GREP} > finds a match in an allowed file, refuses a path outside the roots, and never returns lines from .env inside a root`,
@@ -64,12 +69,14 @@ export const OFFLINE = Object.freeze([
       `${GREP} > an abort ends a call whose pattern is still backtracking`,
       `${GREP} > enters each directory once: two symlinks to their own directory end in No matches found without an abort; positive control: a real subdirectory beside them is searched once`,
       `${GREP} > a search stopped by limits.maxFiles says so even when nothing matched; positive control: the narrowed path finds the symbol`,
+      `${GREP} > skips a FIFO inside a root without opening it: a whole-root search and a search of the FIFO itself settle at once, and the FIFO is never read; positive control: the regular file beside it is read and matched`,
       `${PROBE} > ccc_probe_echo with one extra key records exact: false and aborts the turn`,
       `${PROBE} > positive control: the exact echo records exact: true once, aborts the turn once and ends the turn`,
       `${PROBE} > records a wrong value as exact: false and never records a second observation`,
       `${PROBE} > wrapCccProbedTool(edit) keeps the name, parameters and CCC_CONFINED_TOOL_MARK, runs the real confined edit, records exact-edit ok and aborts the turn exactly once`,
       `${PROBE} > wrapCccProbedTool records a failing tool as error, still aborts the turn once and ends the turn`,
       `${PROBE} > a wrapped ccc_submit_verdict or edit called with schema-invalid arguments through Pi's agent loop records one error observation, aborts the turn once, never runs the tool and makes no follow-up model call; positive control: a schema-valid call records ok in one model call`,
+      `${PROBE} > a wrapped ccc_probe_echo given an inexact echo through Pi's agent loop records error with exactly the arguments the model sent, never ok, in one model call with one abort from the wrapper and one from the echo; positive control: an exact echo records ok with the sent arguments`,
       `${PROBE} > a wrapped ccc_submit_verdict records verdict-shape ok and aborts the turn exactly once`,
       `${POLICY} > refuses a critic session given tools readonly, builtinToolsAllowlist WebFetch and one MCP server with CCC_SESSION_TOOL_POLICY_REFUSED before any MCP connection or session`,
       `${POLICY} > positive control: the same options with no binding policy yield a session containing WebFetch`,
@@ -79,6 +86,7 @@ export const OFFLINE = Object.freeze([
       `${POLICY} > linkedWriter true with any other role class throws, a critic with write roots throws, and a fn_complete_phase that is not the campaign ready tool is refused`,
       `${POLICY} > assertCccSessionToolSet refuses changed parameters and Pi's own grep under the grep name; positive control: the built tools pass`,
       `${POLICY} > a frozen structural copy of an issued policy gets the full final check: a critic copy without its verdict tool or with a foreign ccc_submit_verdict, and a linked writer copy without fn_complete_phase, are refused; positive control: the copies with their tools create sessions`,
+      `${POLICY} > createFnAgent refuses a policy not built by buildCccSessionToolPolicy: a hand-built critic policy without ccc_submit_verdict, with a foreign one or even with its own, and a hand-built linked-writer policy without fn_complete_phase are refused before any MCP connection or session; positive control: the same roles built through buildCccSessionToolPolicy create their sessions`,
       `${POLICY} > a linked writer session through createFnAgent keeps fn_complete_phase through the wrapper chain and is refused without it`,
       `${VERDICT} > refuses accept with a blocking finding; positive control: reject with the same finding is recorded`,
       `${VERDICT} > refuses a requirement ref when requirementIds is null or the id is unknown; positive control: a known requirement id is recorded`,

@@ -202,6 +202,73 @@ describe("ccc_probe_echo and wrapCccProbedTool (card C2)", () => {
     expect(valid.observations).toEqual([expect.objectContaining({ probe: "verdict-shape", result: "ok" })]);
   });
 
+  it("a wrapped ccc_probe_echo given an inexact echo through Pi's agent loop records error with exactly the arguments the model sent, never ok, in one model call with one abort from the wrapper and one from the echo; positive control: an exact echo records ok with the sent arguments", async () => {
+    /*
+    FNXC:CccProbeEchoTool 2026-10-15-00:22:
+    Card C2 repair 2 (errata E14 item C2-2). Card C6 wraps every tool of a probe session, ccc_probe_echo included (section 2.7). The echo hands Pi the expected values for an inexact call so that Pi reaches execute and the batch ends, and before this repair the wrapper then recorded those substituted values as the call's params with result ok: a model that failed strict-echo was logged as having echoed exactly. The wrapper's observation must carry what the model sent and must say error whenever the echo reports the call inexact.
+    */
+    const run = async (sent: Record<string, unknown>) => {
+      const controller = new AbortController();
+      const echoObservations: unknown[] = [];
+      const wrapperObservations: Array<{ params: unknown; result: string }> = [];
+      const echoAbort = vi.fn(() => controller.abort());
+      const wrapperAbort = vi.fn(() => controller.abort());
+      const echo = createCccProbeEchoTool({ expected: EXPECTED, onObservation: (o) => echoObservations.push(o), abortTurn: echoAbort });
+      const wrapped = wrapCccProbedTool(echo, {
+        probe: "strict-echo",
+        onObservation: (o) => wrapperObservations.push(o),
+        abortTurn: wrapperAbort,
+      });
+      const entries = await runPiLoop([wrapped], [{ name: "ccc_probe_echo", arguments: sent }], controller.signal);
+      return {
+        entries: entries.length,
+        echoAborts: echoAbort.mock.calls.length,
+        wrapperAborts: wrapperAbort.mock.calls.length,
+        echoObservations,
+        wrapperObservations,
+      };
+    };
+
+    const inexact: ReadonlyArray<Record<string, unknown>> = [
+      { nonce: "WRONG", lineage: "preflight:critic", extra: "x" },
+      { ...EXPECTED, extra: "x" },
+      { ...EXPECTED, nonce: "n-999" },
+      { nonce: "n-123" },
+    ];
+    for (const sent of inexact) {
+      const observed = await run(sent);
+      expect(observed).toMatchObject({ entries: 1, echoAborts: 1, wrapperAborts: 1 });
+      expect(observed.echoObservations).toEqual([{ exact: false, received: sent }]);
+      expect(observed.wrapperObservations).toEqual([expect.objectContaining({
+        probe: "strict-echo", toolName: "ccc_probe_echo", params: sent, result: "error",
+      })]);
+      expect(observed.wrapperObservations.map((o) => o.result)).not.toContain("ok");
+      expect(observed.wrapperObservations.map((o) => o.params)).not.toContainEqual({ ...EXPECTED });
+    }
+
+    // Pi's edit rewrites a JSON-string edits field in place in its prepareArguments; the wrapper still records what was sent.
+    const sentEdit = { path: "b.txt", edits: JSON.stringify([{ oldText: "absent-text", newText: "x" }]) };
+    const sentEditCopy = structuredClone(sentEdit);
+    const editController = new AbortController();
+    const editObservations: Array<{ params: unknown; result: string }> = [];
+    const wrappedEdit = wrapCccProbedTool(confinedEdit(), {
+      probe: "exact-edit",
+      onObservation: (o) => editObservations.push(o),
+      abortTurn: () => editController.abort(),
+    });
+    expect(await runPiLoop([wrappedEdit], [{ name: "edit", arguments: sentEdit }], editController.signal)).toHaveLength(1);
+    expect(editObservations).toEqual([expect.objectContaining({ toolName: "edit", params: sentEditCopy, result: "error" })]);
+    expect(readFileSync(join(parent, "b.txt"), "utf8")).toBe("bravo\n");
+
+    // Positive control: the exact echo through the same wrapper records ok with the arguments the model sent.
+    const exact = await run({ ...EXPECTED });
+    expect(exact).toMatchObject({ entries: 1, echoAborts: 1, wrapperAborts: 1 });
+    expect(exact.echoObservations).toEqual([{ exact: true, received: { ...EXPECTED } }]);
+    expect(exact.wrapperObservations).toEqual([expect.objectContaining({
+      probe: "strict-echo", toolName: "ccc_probe_echo", params: { ...EXPECTED }, result: "ok",
+    })]);
+  });
+
   it("a wrapped ccc_submit_verdict records verdict-shape ok and aborts the turn exactly once", async () => {
     const onVerdict = vi.fn(async () => ({ artifactKey: "cccplan-r001-preflight-verdict-v01", digest: "f".repeat(64) }));
     const verdict = createCccVerdictTool({ requirementIds: null, artifactKeys: [], reviewedPaths: null, onVerdict });
