@@ -30,6 +30,13 @@ in the control file. The name list is 70 names, exactly the passing names of a J
 (0 skipped), checked by loading this inventory through index.mjs. Measured on the M5 Max at load averages 8.7 to 11.5
 (1 min) with other agents running suites: 3.4 to 4.5 s vitest duration, 4 to 6 s wall for the four files, over five
 runs. The 180 s timeouts stay hang bounds, 30 times the worst run.
+
+FNXC:CccPlanningProof 2026-10-14-21:17:
+Card L1Z repair 1 adds 3 tests to the control file, each pinning a mutant that survived the build: a deferral row keyed
+by its control_seq (item 3, mutant d3), both within forms scoped by projectId (item 1, mutants wscope and cscope) and
+the within transition's CAS on `from` (item 1, mutant wfrom). The name list is 73 names, exactly the passing names of a
+JSON reporter run of the card command (0 skipped), checked by loading this inventory through index.mjs. Measured with
+other agents running suites: 3.4 to 4.8 s vitest duration for the four files. The 180 s timeouts stay hang bounds.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -137,6 +144,9 @@ export const OFFLINE = Object.freeze([
       `${CONTROL} > a deferral reason that flips back is recorded again: live-lease, descendants-unsettled, then live-lease under one control_seq writes three rows and the latest says live-lease; a repeat writes none (E8-L item 3)`,
       `${CONTROL} > the within-transaction completion writes its own deferral row inside the caller's transaction: a rollback leaves none, a commit leaves one and a repeat adds none (E8-L item 4, r03)`,
       `${CONTROL} > both within forms refuse a malformed run id with RUN_NOT_FOUND before any read, so the caller's transaction stays usable; a well-formed unknown id is read and not found (E8-L item 4, r05)`,
+      `${CONTROL} > a deferral row is keyed by its control_seq: a Build pause that bumps control_seq on a cancelling linked run records the same reason again at ordinal 1; a repeat writes none (E8-L item 3)`,
+      `${CONTROL} > both within forms scope the run by projectId: naming a project that does not own the run refuses RUN_NOT_FOUND and leaves the run and its audit unchanged; the owning project moves and completes it (E8-L item 1)`,
+      `${CONTROL} > the within transition is a CAS on from: a stale from refuses STATE_TRANSITION_REFUSED on field from and writes nothing even when the caller commits; the real from moves the run (E8-L item 1)`,
       `${RETENTION} > keeps an old ccc-plan: audit row and deletes an equally old non-planning row on the same task`,
       `${PARITY} > K1 and the SQL function agree on all 400 pairs, and exactly 65 non-identity pairs are allowed`,
       `${PARITY} > refuses a pair outside the table before any write and applies an allowed pair with a state event`,

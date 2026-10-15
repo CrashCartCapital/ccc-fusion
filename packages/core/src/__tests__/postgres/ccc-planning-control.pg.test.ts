@@ -1093,4 +1093,91 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
     expect(outcome.moved).toMatchObject({ runId: run.runId, state: "paused" });
     expect(await anchor(run)).toMatchObject({ state: "paused" });
   });
+
+  /*
+  FNXC:CccPlanningControl 2026-10-14-21:17:
+  Card L1Z repair 1 pins three mutants that survived the L1z build. Item 3 keys a deferral row by its control_seq, so a
+  Build pause that bumps control_seq on a cancelling linked run records the same reason again at ordinal 1 (mutant d3
+  counted across every control_seq and wrote nothing). Item 1 gives the within forms the direct form's scoping and CAS:
+  a project that does not own the run finds nothing (mutants wscope and cscope moved or completed another project's
+  run), and a stale `from` is refused rather than ignored (mutant wfrom moved the run from its real state).
+  */
+  it("a deferral row is keyed by its control_seq: a Build pause that bumps control_seq on a cancelling linked run records the same reason again at ordinal 1; a repeat writes none (E8-L item 3)", async () => {
+    const run = await seedLinkedRun();
+    expect((await admitCccPlanningDispatch(layer, request(run, TASK_REVIEWER, 1, run.campaignFence))).kind).toBe("dispatch-permit");
+    expect(await recordCccPlanningBuildControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" })).toEqual({ controlSeq: 1 });
+    await layer.transactionImmediate((tx) => transitionCccPlanningRunStateWithin(tx, {
+      projectId: run.projectId, runId: run.runId, from: "building", to: "cancelling", stateCode: null, fence: null,
+    }));
+    const complete = () => completeCccPlanningCancellation(layer, { runId: run.runId });
+    const deferrals = async () => (await events(run.runId, "ccc-planning:control"))
+      .filter((row) => String(row.target).startsWith("cancel-deferred:"))
+      .sort((left, right) => Number((left.metadata as Row).controlSeq) - Number((right.metadata as Row).controlSeq)
+        || Number((left.metadata as Row).deferralOrdinal) - Number((right.metadata as Row).deferralOrdinal));
+
+    expect(await complete()).toEqual({ completed: false });   // descendants-unsettled at control_seq 1
+    expect(await recordCccPlanningBuildControl(layer, { runId: run.runId, request: "pause", actor: "ryan" })).toEqual({ controlSeq: 2 });
+    expect(await complete()).toEqual({ completed: false });   // the same reason at control_seq 2
+    const rows = await deferrals();
+    expect(rows.map((row) => {
+      const meta = row.metadata as Row;
+      return [row.target, meta.controlSeq, meta.deferralOrdinal];
+    })).toEqual([
+      ["cancel-deferred:descendants-unsettled", 1, 1],
+      ["cancel-deferred:descendants-unsettled", 2, 1],
+    ]);
+    expect(rows.map((row) => row.id)).toEqual([deferralEventId(run.runId, 1, 1), deferralEventId(run.runId, 2, 1)]);
+
+    expect(await complete()).toEqual({ completed: false });   // the latest reason of control_seq 2: nothing new
+    expect((await deferrals()).map((row) => row.id)).toEqual(rows.map((row) => row.id));
+    expect(await anchor(run)).toMatchObject({ state: "cancelling", control_seq: 2 });
+  });
+
+  it("both within forms scope the run by projectId: naming a project that does not own the run refuses RUN_NOT_FOUND and leaves the run and its audit unchanged; the owning project moves and completes it (E8-L item 1)", async () => {
+    const run = await seedRun();
+    const transition = (projectId: string) => (tx: DbTransaction) => transitionCccPlanningRunStateWithin(tx, {
+      projectId, runId: run.runId, from: "running", to: "paused", stateCode: null, fence: null,
+    });
+    // The caller catches the refusal and commits its own transaction.
+    expect(await layer.transactionImmediate((tx) => settled(transition(OTHER_PROJECT)(tx))))
+      .toMatchObject({ name: "CccPlanningRefusal", code: "CCC_PLANNING_RUN_NOT_FOUND", field: "runId" });
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 0 });
+    expect(await events(run.runId, "ccc-planning:state")).toHaveLength(0);
+    expect(await layer.transactionImmediate(transition(run.projectId))).toMatchObject({ runId: run.runId, state: "paused" });
+    expect((await events(run.runId, "ccc-planning:state")).map((row) => row.metadata))
+      .toEqual([expect.objectContaining({ from: "running", to: "paused" })]);
+
+    const cancelling = await seedRun();
+    await move(cancelling, "blocked_provider");
+    expect(await requestCccPlanningControl(layer, { runId: cancelling.runId, request: "cancel", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: true });
+    await expireLease(cancelling);
+    const completion = (projectId: string) => (tx: DbTransaction) =>
+      completeCccPlanningCancellationWithin(tx, { projectId, runId: cancelling.runId });
+    const before = await events(cancelling.runId, "ccc-planning:state");
+    expect(await layer.transactionImmediate((tx) => settled(completion(OTHER_PROJECT)(tx))))
+      .toMatchObject({ name: "CccPlanningRefusal", code: "CCC_PLANNING_RUN_NOT_FOUND", field: "runId" });
+    expect(await anchor(cancelling)).toMatchObject({ state: "cancelling", control_seq: 1 });
+    expect(await events(cancelling.runId, "ccc-planning:state")).toEqual(before);
+    expect(await layer.transactionImmediate(completion(cancelling.projectId))).toEqual({ completed: true });
+    expect(await anchor(cancelling)).toMatchObject({ state: "cancelled", state_code: "CCC_PLANNING_CANCELLED" });
+  });
+
+  it("the within transition is a CAS on from: a stale from refuses STATE_TRANSITION_REFUSED on field from and writes nothing even when the caller commits; the real from moves the run (E8-L item 1)", async () => {
+    const run = await seedRun();
+    const transition = (from: "paused" | "running") => (tx: DbTransaction) => transitionCccPlanningRunStateWithin(tx, {
+      projectId: run.projectId, runId: run.runId, from, to: "cancelling", stateCode: null, fence: null,
+    });
+    // The caller catches the refusal and commits its own transaction.
+    expect(await layer.transactionImmediate((tx) => settled(transition("paused")(tx)))).toMatchObject({
+      name: "CccPlanningRefusal", code: "CCC_PLANNING_STATE_TRANSITION_REFUSED", field: "from",
+      detail: expect.stringMatching(/is running, not paused/u),
+    });
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 0, control_request: null });
+    expect(await events(run.runId, "ccc-planning:state")).toHaveLength(0);
+    expect(await layer.transactionImmediate(transition("running"))).toMatchObject({ runId: run.runId, state: "cancelling" });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+    expect((await events(run.runId, "ccc-planning:state")).map((row) => row.metadata))
+      .toEqual([expect.objectContaining({ from: "running", to: "cancelling" })]);
+  });
 });
