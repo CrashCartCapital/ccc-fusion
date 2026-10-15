@@ -2,37 +2,11 @@
   "mission": "Implement CCC-Fusion request-to-code PRD v3 (scratchpad/prd-v3/PRD-v3.md) in ccc-fusion; success = entire PRD verified against actual installed use",
   "minimum_useful_outcome": "I2: an installed fn CLI turns a plain-language request into a reviewed PRD+plan and runnable checked code in an owned disposable repo using actual M3 / GLM 5.3 / Flash, under exact live authority",
   "acceptance": "PRD v3 sections 7 (G0-G9), 12 (24 held-out, 12 criteria), 14 (new commands, negative cases, task verify, installed journeys) \u2014 frozen, never shrunk",
-  "parent": "Opus 5.5 xhigh; ultracode on (workflows); cards sonnet/opus only",
-  "phase": "PAUSED by usage limit 2026-10-15 ~01:08 (resets 01:10 PT). Local INT-3c 299a7dbc3 unpushed (IM1+barrel, X1z, H1).",
+  "parent": "Codex resume; explicit Sol 6.1 child routes, effective identity unknown; Gemini adversarial route reported",
+  "phase": "Scoped finish: five requested repairs implemented and tested; I2 NOT RUN; broader qualification INCOMPLETE",
   "base": "origin/main d5fd9e87d (adjudicated: only base with green gate + green push Full Suite; local main stale; #103 CI never verdicted and PRD forbids leader merging main)",
-  "worktree": "/Users/ryanpappal/03_CODE/ccc-fusion/.worktrees/request-to-code-v3 on agent/request-to-code-v3 (upstream unset, not pushed); HEAD dbe834b82 (INT-1a green)",
-  "active": [
-    {
-      "workflow": "wf_cac548bd-27f",
-      "task": "wssy4fx2o",
-      "what": "C2 final repair (E14), rebased on d028d92cb"
-    },
-    {
-      "workflow": "wf_295cf199-34c",
-      "task": "w0mra8ikx",
-      "what": "W6a: C5 (sonnet normal), AU4 (sonnet normal), BF (opus critical, PG 55661-55664), LV (sonnet normal) from d028d92cb"
-    },
-    {
-      "workflow": "wf_54df1674-4ed",
-      "task": "wz6frjh9p",
-      "what": "AU2 (opus critical, ENGINE_PG 55671-55674) from 6b392adbd"
-    },
-    {
-      "workflow": "wf_3b95e213-9f3",
-      "task": "wl3hcrlin",
-      "what": "GGz final repair (E16) + critical review"
-    },
-    {
-      "workflow": "wf_ea7c2bb0-bbe",
-      "task": "wop65y129",
-      "what": "H1z re-plan (E17, opus critical, PG 55681-55684) from 299a7dbc3"
-    }
-  ],
+  "worktree": "/Users/ryanpappal/03_CODE/ccc-fusion/.worktrees/request-to-code-v3 on agent/request-to-code-v3",
+  "active": [],
   "failures": [
     {
       "t": "2026-10-14",
@@ -45,10 +19,17 @@
       "action": "covered by round-3 rereview2"
     }
   ],
-  "blocked": [],
+  "blocked": [
+    {
+      "lane": "I2",
+      "code": "CCC_PLANNING_COMMAND_NOT_SUPPORTED",
+      "source": "packages/cli/src/commands/plan.ts:367",
+      "needs_from_operator": "None for software blocker; typed receipt digest only after runnable candidate."
+    }
+  ],
   "constraints": "no 4040; no wave-3; no vault edits; no generated-root edits; no main merge/release; no metered fallback; no credential exposure; live model qualification needs valid native authority receipt",
-  "next": "C2 final -> then SF (opus critical) from INT-3c; on W6a/AU2/GGz/H1z: adjudicate+integrate; INT-3c full checks + push; VP after AU4; CB after BF; RV after SF+BF; IB2; ST1/ST2; CL2; WR; O1/EXIT-I1; I2 live receipt",
-  "last_update": "2026-10-15T01:08",
+  "next": "No new cards under current finish scope. I2 is blocked by the missing fn plan start Build entry path. No operator approval can resolve missing code.",
+  "last_update": "2026-10-15T13:10:48.259914+00:00",
   "i0_facts": "i0-digest.md, i0-gap-and-critic.md; all 3 exact model ids in live OmniRoute catalog; glm-5.3/flash not registered locally; Pi 0.81.1 OK; Oct-8 qualification v2 and Cycle 1 freeze docs found nowhere",
   "baseline": "GREEN at 589c293c7: install(offline) build typecheck lint pg-schema-applier(83) pi(104) cli prd+bin(153) darwin-lane(11) test:gate. RED pre-existing: check:quarantine-ledger --strict (6 expired 2026-09-25; daily cron only, not in task verify/ci). NOTE: pg tests reuse host Homebrew PG :5432 (pid 1469) - new offline proof must own its PG. task verify = lint+test:full+build:full (no typecheck) - run typecheck separately. | Q1 a08af2c73: quarantine strict GREEN (6->0); merger-ai-dependency-install 6/6; 5 reliability-interactions files need owned PG (Q1b). | Q1b: 5 reliability-interactions files 18/18 pass, 0 skip on owned PG 127.0.0.1:55401 (TCP-only: unix socket path in scratch exceeds 103-byte limit -> unix_socket_directories='' , max_connections=200; hasPg needs psql on PATH).",
   "decisions": [
@@ -80,7 +61,12 @@
     "R0p(Q1+Q1b)",
     "C6b a0e40f485",
     "B4 e95444feb",
-    "B2 9c2251129"
+    "B2 9c2251129",
+    "C2",
+    "BF",
+    "AU4",
+    "AU2",
+    "H1z"
   ],
   "leaf_worktrees": {
     "p0": {
@@ -156,7 +142,12 @@
       "base": "fcb83879d (INT-2d)"
     },
     "c2": {
-      "base": "fcb83879d (INT-2d)"
+      "base": "fcb83879d (INT-2d)",
+      "final_leaf": "b70ee3eb2",
+      "integration_commit": "c6d042e8c",
+      "state": "IMPLEMENTED; scoped tests PASS; independently reviewed",
+      "tests_passed": 46,
+      "tests_skipped": 0
     },
     "h1": {
       "base": "fcb83879d (INT-2d)"
@@ -169,6 +160,34 @@
     },
     "l1z": {
       "base": "fcb83879d (INT-2d)"
+    },
+    "bf": {
+      "final_leaf": "442f8da6f",
+      "integration_commit": "339890814",
+      "state": "IMPLEMENTED; scoped tests PASS; independently reviewed",
+      "tests_passed": 134,
+      "tests_skipped": 0
+    },
+    "au4": {
+      "final_leaf": "f2a36b337",
+      "integration_commit": "f04f6b0c5",
+      "state": "IMPLEMENTED; scoped tests PASS; independently reviewed",
+      "tests_passed": 33,
+      "tests_skipped": 0
+    },
+    "au2": {
+      "final_leaf": "c04129223",
+      "integration_commit": "e3988aff8",
+      "state": "IMPLEMENTED; scoped tests PASS; independently reviewed",
+      "tests_passed": 10,
+      "tests_skipped": 0
+    },
+    "h1z": {
+      "final_leaf": "549faa92b",
+      "integration_commit": "29b147a17",
+      "state": "IMPLEMENTED; scoped tests PASS; independently reviewed",
+      "tests_passed": 95,
+      "tests_skipped": 0
     }
   },
   "open_items": [
@@ -202,7 +221,7 @@
   },
   "integration": {
     "branch": "agent/request-to-code-v3",
-    "head": "local INT-3c 299a7dbc3 (IM1 x3 + barrel + X1z x3 + H1 x3); core build + engine tc rc=0; not pushed",
+    "head": "29b147a1755dbd32585c169d160af8639aea8856",
     "int1": "a426a4377 (P0,K1,S0,X1 round-2 + barrels)",
     "int1b": "9a8054a0a K1 final, 596a5d7bf S0 final, ff4fc3e4f X1 final; core tc/build, engine tc, cli tc, k1 tests tsc, lint all rc=0",
     "proof": "INT-1 rerun: targeted 8/9, offline 4/5; only failure the x1 timeout:1 quick control (now X1c item 2). Not yet rerun on INT-1b.",
@@ -215,7 +234,8 @@
       "60741ae2f B3"
     ],
     "int3a": "AD1 B3 RP(2) IP(2) IB1(2) cherry-picked + barrel commit ba52f2f92 (B3 preflight in engine ccc-prd barrel, AD1 admission in core barrels, 4040 allowlist marker on IP serve lane). tc x4 rc=0, K1 test-tsc rc=0, lint rc=0, test:ccc-planning 25 cmds 1189 tests 0 skip 0 fail; test:gate run1 1 flake in run-verification-command.test.ts (pre-existing, 10016>10000 ms at load 9.5), run2 rc=0 full",
-    "int3b": "AD1..IB1 + GG(3) + CL1(2) + P1z(2) + L1z(2) + barrels; tc x4 rc=0, K1 test-tsc rc=0, lint rc=0, test:ccc-planning 27 cmds 1301 tests 0 skip 0 fail, test:gate rc=0 owned PG 55601; pushed d028d92cb"
+    "int3b": "AD1..IB1 + GG(3) + CL1(2) + P1z(2) + L1z(2) + barrels; tc x4 rc=0, K1 test-tsc rc=0, lint rc=0, test:ccc-planning 27 cmds 1301 tests 0 skip 0 fail, test:gate rc=0 owned PG 55601; pushed d028d92cb",
+    "head_note": "Last tested code commit; a documentation-only closeout commit follows."
   },
   "verdicts_round3": {
     "k1": "ACCEPTED 0026543d1 with residual U+1E9E key miss -> K1b",
@@ -261,7 +281,7 @@
   },
   "verdicts_w3": {
     "ad1": "ACCEPTED 043863f98 (both) - integrated 29cf6d1e8",
-    "c2": "repair2 (E14) pending rebase onto INT-3b; FIFO, probe wrapper raw params, full tool-set check for every policy (grant over P1 fixtures)",
+    "c2": "APPROVE final b70ee3eb2; integrated c6d042e8c; source review and committed 46/46 tool checks PASS",
     "h1": "LINEAGE CLOSED, integrated b13f33e87 (review3 ACCEPT, adv3 REPAIR: resume/answer race strands held item) - re-plan H1z (E17)",
     "p1z": "ACCEPTED 426a016a7 - integrated INT-3b",
     "x1z": "ACCEPTED 56139aaa9 (repair 2 final, E16) - picked into INT-3c",
@@ -294,11 +314,7 @@
     "E15-3 link IMPORT_IDENTITY_DRIFT after importer commit -> failed/CCC_PLANNING_IMPORT_IDENTITY_DRIFT, never retry",
     "E15-4 IM1 does not compare intent target fields with the anchor; IB2 derives them from the anchor and G6"
   ],
-  "resume": [
-    "Check every in-flight worktree BEFORE re-dispatching (limit-killed agents often leave committed work): r2c-au2 (build died mid-run, 144 tool uses), r2c-c5, r2c-au4, r2c-bf, r2c-lv (W6a wf_295cf199-34c), r2c-ggz (GGz repair2 wf_3b95e213-9f3), r2c-h1z (wf_ea7c2bb0-bbe), r2c-c2 (C2 final wf_cac548bd-27f). git log + status per worktree; stop any owned PG left running (ports 55661-55684, 55611 parent int3c pgdata).",
-    "Read each workflow journal.jsonl; resume only runs whose failed call is followed by no committing call, else write a continuation script (memory: workflow-resume-reruns-after-first-failure).",
-    "Then: adjudicate, INT-3c full checks (tc x4 after engine build, K1 test-tsc, lint, test:ccc-planning, test:gate on owned PG), push; SF after C2."
-  ],
+  "resume": "STOP after the five-repair closeout. Earlier active_at_pause and workflow IDs are historical; do not dispatch them from this checkpoint.",
   "active_at_pause": [
     {
       "workflow": "wf_cac548bd-27f",
@@ -325,5 +341,23 @@
       "task": "wop65y129",
       "what": "H1z re-plan (E17, opus critical, PG 55681-55684) from 299a7dbc3"
     }
-  ]
+  ],
+  "codex_finish": {
+    "scope": "C2/BF/AU4/AU2/H1z only",
+    "closeout": "docs/plans/request-to-code-v3/repair-closeout-2026-10-15.md",
+    "tested_code_commit": "29b147a1755dbd32585c169d160af8639aea8856",
+    "repair_tests": {
+      "passed": 318,
+      "failed": 0,
+      "skipped": 0
+    },
+    "normal_gate": "PASS; 579 passed / 3 existing platform skips",
+    "builds_typechecks_lint": "PASS",
+    "installed": "NOT RUN",
+    "I2": "NOT RUN; Build entry path unsupported",
+    "full_planning_qualification": "INCOMPLETE; X1 lsof sweep uninterruptible; canonical run interrupted",
+    "wider_runtime_regression": "INCOMPLETE; isolated before/after test both timed out",
+    "postgres": "all owned servers stopped; shared5432 untouched",
+    "new_cards": "none after finish steering; SF stopped/unintegrated"
+  }
 }
