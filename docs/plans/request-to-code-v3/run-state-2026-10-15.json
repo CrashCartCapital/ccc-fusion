@@ -1,0 +1,329 @@
+{
+  "mission": "Implement CCC-Fusion request-to-code PRD v3 (scratchpad/prd-v3/PRD-v3.md) in ccc-fusion; success = entire PRD verified against actual installed use",
+  "minimum_useful_outcome": "I2: an installed fn CLI turns a plain-language request into a reviewed PRD+plan and runnable checked code in an owned disposable repo using actual M3 / GLM 5.3 / Flash, under exact live authority",
+  "acceptance": "PRD v3 sections 7 (G0-G9), 12 (24 held-out, 12 criteria), 14 (new commands, negative cases, task verify, installed journeys) \u2014 frozen, never shrunk",
+  "parent": "Opus 5.5 xhigh; ultracode on (workflows); cards sonnet/opus only",
+  "phase": "PAUSED by usage limit 2026-10-15 ~01:08 (resets 01:10 PT). Local INT-3c 299a7dbc3 unpushed (IM1+barrel, X1z, H1).",
+  "base": "origin/main d5fd9e87d (adjudicated: only base with green gate + green push Full Suite; local main stale; #103 CI never verdicted and PRD forbids leader merging main)",
+  "worktree": "/Users/ryanpappal/03_CODE/ccc-fusion/.worktrees/request-to-code-v3 on agent/request-to-code-v3 (upstream unset, not pushed); HEAD dbe834b82 (INT-1a green)",
+  "active": [
+    {
+      "workflow": "wf_cac548bd-27f",
+      "task": "wssy4fx2o",
+      "what": "C2 final repair (E14), rebased on d028d92cb"
+    },
+    {
+      "workflow": "wf_295cf199-34c",
+      "task": "w0mra8ikx",
+      "what": "W6a: C5 (sonnet normal), AU4 (sonnet normal), BF (opus critical, PG 55661-55664), LV (sonnet normal) from d028d92cb"
+    },
+    {
+      "workflow": "wf_54df1674-4ed",
+      "task": "wz6frjh9p",
+      "what": "AU2 (opus critical, ENGINE_PG 55671-55674) from 6b392adbd"
+    },
+    {
+      "workflow": "wf_3b95e213-9f3",
+      "task": "wl3hcrlin",
+      "what": "GGz final repair (E16) + critical review"
+    },
+    {
+      "workflow": "wf_ea7c2bb0-bbe",
+      "task": "wop65y129",
+      "what": "H1z re-plan (E17, opus critical, PG 55681-55684) from 299a7dbc3"
+    }
+  ],
+  "failures": [
+    {
+      "t": "2026-10-14",
+      "what": "network errors killed 7 workflow agents",
+      "action": "resumed wf_400fc1bf-e89"
+    },
+    {
+      "t": "2026-10-14",
+      "what": "rereview:x1 died on ENOTFOUND",
+      "action": "covered by round-3 rereview2"
+    }
+  ],
+  "blocked": [],
+  "constraints": "no 4040; no wave-3; no vault edits; no generated-root edits; no main merge/release; no metered fallback; no credential exposure; live model qualification needs valid native authority receipt",
+  "next": "C2 final -> then SF (opus critical) from INT-3c; on W6a/AU2/GGz/H1z: adjudicate+integrate; INT-3c full checks + push; VP after AU4; CB after BF; RV after SF+BF; IB2; ST1/ST2; CL2; WR; O1/EXIT-I1; I2 live receipt",
+  "last_update": "2026-10-15T01:08",
+  "i0_facts": "i0-digest.md, i0-gap-and-critic.md; all 3 exact model ids in live OmniRoute catalog; glm-5.3/flash not registered locally; Pi 0.81.1 OK; Oct-8 qualification v2 and Cycle 1 freeze docs found nowhere",
+  "baseline": "GREEN at 589c293c7: install(offline) build typecheck lint pg-schema-applier(83) pi(104) cli prd+bin(153) darwin-lane(11) test:gate. RED pre-existing: check:quarantine-ledger --strict (6 expired 2026-09-25; daily cron only, not in task verify/ci). NOTE: pg tests reuse host Homebrew PG :5432 (pid 1469) - new offline proof must own its PG. task verify = lint+test:full+build:full (no typecheck) - run typecheck separately. | Q1 a08af2c73: quarantine strict GREEN (6->0); merger-ai-dependency-install 6/6; 5 reliability-interactions files need owned PG (Q1b). | Q1b: 5 reliability-interactions files 18/18 pass, 0 skip on owned PG 127.0.0.1:55401 (TCP-only: unix socket path in scratch exceeds 103-byte limit -> unix_socket_directories='' , max_connections=200; hasPg needs psql on PATH).",
+  "decisions": [
+    "iteration cap: PRD s5 defines iteration = call processing action feedback, max 10/node attempt -> hard ceiling 1 initial + 10 = 11 calls per node attempt (literal reading, not a widening)",
+    "budget fit: floor 2x(30N+300)<=1536 -> N<=15 planned; FULL-v2 strict N=14; extraction leaves are dynamic fan-out spent from remaining planning allocation, not planned at admission",
+    "quarantine: carry PR #103 test-only commit 1a8002f6d via cherry-pick -x on our branch (not a main merge)",
+    "install deps: prefer offline cache; public registry read-only fetch counts as dependency hydration if cache lacks a package",
+    "challenge-v1: all 16 BLOCKING accepted (adjudication-v1.md); #9 probes reserved against planning allocation but outside N; #15 installed runtime must carry keepalive behaviour itself (hand-patch = synthetic); #19 no raw M3 probe outside a receipt; #6 bridge Build pause/cancel to existing campaign control",
+    "W1 normal-lane reviews use a fresh Opus reviewer + check rerun (Gemini reserved for critical lane, consults kept sequential)",
+    "PRE done: OmniRoute 127.0.0.1:8092 (node pid 1435) serves glm/glm-5.3, glm/glm-5.3-flash, minimax/MiniMax-M3; also lists glm/glm-5.2 and lookalike glm/glm-5.3-flashx -> exact-match tests must refuse both (evidence/pre-catalog.json)",
+    "verify-v2: 12 blocking accepted (adjudication-v2.md); Build pause/resume refused during building/importing -> I4 must-do; repair-count ruling: author lineage keeps one counter across its repairs, review of new candidate version = new node",
+    "Gemini v2 review never ran (subagent response stopped by safety classifier, 0 chars sent); outside review switched to GPT codex-mcp-server (second family, read-only, explicit model gpt-5.6-sol from mcpjungle default)",
+    "questions for Ryan reduced to one: typed live-authority receipt digest at I2",
+    "outside-family consults: Gemini PARKED this session (2 safety-classifier stops, 0 chars sent); GPT 1 timeout -> one more probe allowed only with changed condition (per-card diff, medium effort); else critical-lane substitute = second fresh Opus adversarial reviewer (execution-rules.md:140). Contract critical review so far: challenge-v1 + verify-v2 = two fresh Opus adversarial passes; v3 deltas get one more.",
+    "2026-10-14 W1 reviews: all four REPAIR. Leader errata design/errata-v3-E1.md (E1-1..E1-20 + E1-2b) rules every finding: needsPostgres canonical; runner sets FUSION_PG_TEST_SKIP only for PG-free commands, literal refused there; creds stripped from child env; K1 proof results per item 46, negative time = shortfall, NFC+lowercase path overlap, exact-field keys, verify:<id> per proof; S0 REVOKE DELETE,TRUNCATE on anchor + owns ccc-prd-import-migration test; X1 closure authority moves to controller-side sweep over a per-instance cloned toolchain (ADR X1-R).",
+    "2026-10-14 pushed agent/request-to-code-v3 @ dbe834b82 to origin (CrashCartCapital/ccc-fusion private fork; upstream push DISABLED) for preservation; 0/0 vs upstream; no CI triggered by design",
+    "2026-10-14 GPT codex-mcp-server second failure (300 s idle timeout at medium effort, per-card diff) -> GPT PARKED for session like Gemini. Critical-lane adversarial form for K1/X1/S0 = fresh Opus adversarial with no shared context (execution-rules.md:140). Network ENOTFOUND/ECONNREFUSED killed 7 agents; workflow resumed from cache.",
+    "2026-10-14 errata design/errata-v3-E2.md: contract B1-B8 + N1-N6 accepted as amendments; K1/S0/X1 final repair items; new card X1b (toolchain discovery + package-command compat, W3) because the clone-based closure forces non-platform (Homebrew) binaries and blocks absolute shebangs; WR owns quarantine; P0 follow-ups deferred (E2-30).",
+    "2026-10-14 errata design/errata-v3-E3.md: E2 new codes mapped to existing ones (STATE_TRANSITION_REFUSED, ROUTE_NOT_ADMITTED role-class-mismatch, INTERNAL_ERROR); CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED via new tiny card K1b (W3); review lanes this session: normal = fresh Opus, critical = Opus + Opus adversary + parent rerun. X1 timing flake (timeout:1 quick control) routed to X1b with a grant on the X1 test file.",
+    "2026-10-14 errata design/errata-v3-E4.md: K1/S0/X1 final repairs accepted and cherry-picked (INT-1b). E2-5 state = blocked_prerequisite; WR latches CccConfinementClosureError through the Pi tool loop; PermanentError(msg, code); X1b missing tool = CONFINEMENT_UNQUALIFIED toolchain-missing:<tool>; dispose returns {closure}; reviewer-class = critic. New cards K1b (expanded), X1c, X1b start now from INT-1b; contract v3.2 compiles E3+E4.",
+    "2026-10-14 E5/E6: A1, K1b accepted; toolchain required set minimal (bash sh node git task rg coreutils), grep/sed/findutils/gawk/diffutils optional, Homebrew-only search path, no host brew install; Taskfile package commands need bash -c (I3 prerequisite); RV uses PermanentError(msg, code).",
+    "2026-10-14 E7: final repair for K2 L1 P1 X1b; leaves rebased onto INT-2c; drift on upstream error refuses receipt-mismatch (D10 amended); WR attaches the 5-key bound-route marker via P1 export, BF supplies values; BF uses L1 functions incl. completeCccPlanningCancellationWithin; L1 granted removal of deferred-leased in K1 types.ts; CL2 PROFILE_NOT_SUPPORTED case deferred to I5; failure after repair 2 -> leader re-plans the card.",
+    "2026-10-14 E8: P1/X1b lineages closed and integrated with residuals re-planned as P1z/X1z (P1z before W6, X1z before W4); L1z adds transitionCccPlanningRunStateWithin for BF; semantic-id collision refusal moved from AD1 to GG (G4); WR uses the returned controller from attachCccProviderAttemptBoundRoute; BF linked attempt result gains route values; K2 parse widening to lean/adaptive is I6",
+    "2026-10-14 E9: IP installed keepalive lane leaves runner inventory (parent-run at 4.2 step 0 and LV); IP arm A described as sibling-bundle test, fn-path arm deferred to LV; GG gains write-root-canonical and N-3 fixed-lineage collision refusal; B3 accepted.",
+    "2026-10-14 E12: GG integrated; GGz re-plans G4 parity residuals (colon closure paths, entity-id pattern, shared-proof over-refusal, proof-graph parity, relative admitted roots fail-closed, IB1-built fixtures, source-path dedup); GGz before W8/IB2 and the live slice"
+  ],
+  "cards_done": [
+    "PRE",
+    "R0p(Q1+Q1b)",
+    "C6b a0e40f485",
+    "B4 e95444feb",
+    "B2 9c2251129"
+  ],
+  "leaf_worktrees": {
+    "p0": {
+      "branch": "agent/r2c-p0",
+      "v1": "8097bce26",
+      "review_v1": "REPAIR",
+      "repair1": "e3f459740",
+      "verdict": "ACCEPTED at e3f459740 (rereview ACCEPT, normal lane)"
+    },
+    "k1": {
+      "branch": "agent/r2c-k1",
+      "v1": "39c394054",
+      "review_v1": "REPAIR",
+      "repair1": "85fe0fa64",
+      "round2": "rereview ACCEPT; adversarial REPAIR (APFS full case fold) -> repair2"
+    },
+    "x1": {
+      "branch": "agent/r2c-x1",
+      "v1": "12d67fb9a",
+      "review_v1": "REPAIR",
+      "repair1": "6154e32c5",
+      "round2": "rereview died (network); adversarial REPAIR (E1-19 RED missing) -> repair2"
+    },
+    "s0": {
+      "branch": "agent/r2c-s0",
+      "v1": "0719c0e98",
+      "review_v1": "REPAIR",
+      "repair1": "063e4a287",
+      "round2": "rereview ACCEPT; adversarial REPAIR (import FK not deferrable breaks promotion; undefined metadata replay; NULL project_id guard bypass) -> repair2"
+    },
+    "k2": {
+      "status": "integrated at INT-2d"
+    },
+    "l1": {
+      "status": "integrated at INT-2d"
+    },
+    "a1": {
+      "branch": "agent/r2c-a1",
+      "base": "a426a4377"
+    },
+    "g1": {
+      "status": "integrated at INT-2c"
+    },
+    "p1": {
+      "status": "integrated at INT-2d"
+    },
+    "k1b": {
+      "branch": "agent/r2c-k1b",
+      "base": "ff4fc3e4f"
+    },
+    "x1c": {
+      "status": "integrated at INT-2c"
+    },
+    "x1b": {
+      "status": "integrated at INT-2d"
+    },
+    "rp": {
+      "base": "115ab8d7f (INT-2c)"
+    },
+    "ip": {
+      "base": "115ab8d7f (INT-2c)"
+    },
+    "b3": {
+      "base": "115ab8d7f (INT-2c)"
+    },
+    "ib1": {
+      "base": "115ab8d7f (INT-2c)"
+    },
+    "gg": {
+      "base": "115ab8d7f (INT-2c)"
+    },
+    "ad1": {
+      "base": "fcb83879d (INT-2d)"
+    },
+    "c2": {
+      "base": "fcb83879d (INT-2d)"
+    },
+    "h1": {
+      "base": "fcb83879d (INT-2d)"
+    },
+    "p1z": {
+      "base": "fcb83879d (INT-2d)"
+    },
+    "x1z": {
+      "base": "fcb83879d (INT-2d)"
+    },
+    "l1z": {
+      "base": "fcb83879d (INT-2d)"
+    }
+  },
+  "open_items": [
+    "push integration branch at each wave end after INT (agent/* pushes trigger no CI: workflows fire only on PR->main, push->main, v* tags)",
+    "X1b (W3): toolchain discovery + unprefixed names + package-command shim layer + grant: fix timing-sensitive quick control in ccc-confined-shell.darwin.test.ts",
+    "K1b (W3): append CCC_PLANNING_WRITER_CLOSURE_UNCONFIRMED",
+    "E2-30 P0 follow-ups when the runner is next touched",
+    "after W2: rebase W2 leaves onto INT-1b (E2-82), rerun their checks, INT-2",
+    "after W1 residual: cherry-pick K1b/X1c/X1b, rerun targeted+offline proof",
+    "REPORT to Ryan: W2 G1 builder created test DBs on shared localhost:5432 (fusion_test_18636_1_q7wdfj, fusion_test_18636_1_r0nmlz, fusion_test_18636_12_z2o4vv may remain); parent did not touch :5432",
+    "after repair 1: INT-2 = cherry-pick accepted K2 L1 G1 P1 X1c X1b; engine barrel export isCccCustodyGuardedTask; pnpm test:gate; targeted+offline proof",
+    "I3 prerequisite: verifier Taskfiles wrap package commands in bash -c (VP/GG enforce)",
+    "host risk: lsof stalls from unreachable smbfs Time Machine mount (X1c investigating)",
+    "INT-2 after final repair: cherry-pick accepted K2 L1 P1 X1b; engine barrel exports isCccCustodyGuardedTask, CccProviderAttemptBoundRoute, attachCccProviderAttemptBoundRoute; core barrel completeCccPlanningCancellationWithin; full checks + test:gate + test:ccc-planning + offline proof; push",
+    "risk rows: X1c template digest per build; no ulimit -u in confined wrapper",
+    "GG: add N-3 semantic-id collision refusal (review:<id> vs planning fixed lineages) in its repair round or a follow-up before W8",
+    "IB2: build G8 identity only for the judge task (K2 residual)"
+  ],
+  "acceptance_tracker": {
+    "I4_must_do": [
+      "fn plan pause/resume during building and importing (refused in I2 with CCC_PLANNING_COMMAND_NOT_SUPPORTED)"
+    ],
+    "NOT_RUN_in_I2": [
+      "extraction leaves",
+      "coding repair",
+      "G9 delivery",
+      "live Spec mode",
+      "ADAPTIVE/LEAN",
+      "macOS CI lane"
+    ]
+  },
+  "integration": {
+    "branch": "agent/request-to-code-v3",
+    "head": "local INT-3c 299a7dbc3 (IM1 x3 + barrel + X1z x3 + H1 x3); core build + engine tc rc=0; not pushed",
+    "int1": "a426a4377 (P0,K1,S0,X1 round-2 + barrels)",
+    "int1b": "9a8054a0a K1 final, 596a5d7bf S0 final, ff4fc3e4f X1 final; core tc/build, engine tc, cli tc, k1 tests tsc, lint all rc=0",
+    "proof": "INT-1 rerun: targeted 8/9, offline 4/5; only failure the x1 timeout:1 quick control (now X1c item 2). Not yet rerun on INT-1b.",
+    "int2a": "a07f81830 A1 (accepted) + 9d4add879 barrels (ccc-campaign view types, index.gate ccc-planning mirror); core/engine/cli/dashboard tc, lint, A1 22/22 + S0 25/25 on owned PG",
+    "int2b": "ee89957c1 K1b (accepted); core tc/build, engine tc, k1 tsc, k1 vitest 125/125, lint all rc=0",
+    "int2c": "90a4003bd 1c50053a2 (G1) fc2b82cca 115ab8d7f (X1c); tc core/engine/cli/dashboard + lint rc=0; test:ccc-planning 14 cmds 646 tests 0 skipped; test:gate rc=0 on owned PG 55493 (engine-core 3 skipped, files untouched by INT-2c); pushed origin 115ab8d7f",
+    "int2d": "K2 11c512ee1 9485e02cc 2e9d0cbb8; L1 5bb02616c b6680746c ccad72351; P1 d4bef2024 33f5789a9 f689f11d5; X1b 3ca856f00 40918ac77 b290aac0d; barrels fcb83879d. tc all rc=0 (cli/dash after engine build), K1 test-tsc, lint; test:ccc-planning 19 cmds 970 tests 0 skipped; test:gate rc=0 owned PG 55495; pushed",
+    "int3_picks": [
+      "29cf6d1e8 AD1",
+      "60741ae2f B3"
+    ],
+    "int3a": "AD1 B3 RP(2) IP(2) IB1(2) cherry-picked + barrel commit ba52f2f92 (B3 preflight in engine ccc-prd barrel, AD1 admission in core barrels, 4040 allowlist marker on IP serve lane). tc x4 rc=0, K1 test-tsc rc=0, lint rc=0, test:ccc-planning 25 cmds 1189 tests 0 skip 0 fail; test:gate run1 1 flake in run-verification-command.test.ts (pre-existing, 10016>10000 ms at load 9.5), run2 rc=0 full",
+    "int3b": "AD1..IB1 + GG(3) + CL1(2) + P1z(2) + L1z(2) + barrels; tc x4 rc=0, K1 test-tsc rc=0, lint rc=0, test:ccc-planning 27 cmds 1301 tests 0 skip 0 fail, test:gate rc=0 owned PG 55601; pushed d028d92cb"
+  },
+  "verdicts_round3": {
+    "k1": "ACCEPTED 0026543d1 with residual U+1E9E key miss -> K1b",
+    "s0": "ACCEPTED 7d8e2118d (both reviewers ACCEPT)",
+    "x1": "ACCEPTED production 63a5c05f0; vacuous E2-24 layout test, check over 180 s bound, quick-control flake, hardening gaps -> X1c",
+    "contract_v3_1": "AMEND (6 blocking F1-F6, 10 non-blocking) -> errata E4"
+  },
+  "verdicts_w2_round1": {
+    "a1": "ACCEPTED 1a758d644 (normal lane)",
+    "k2": "REPAIR (E5-K2: NaN guard, literal flash, g8 allowlist, run-receipt binding, mutant table, provider dedup, .GIT)",
+    "l1": "REPAIR (E5-L1: real race, fence kind, lineage admission, superseded lineages, control-pending CAS, unknown refusal, DB clock, one path to cancelled, epoch replay, metadata bounds, A1 publisher)",
+    "g1": "REPAIR (E5-G1: deleteTaskIf PG path, snapshot-writer backstop, coverage)",
+    "p1": "REPAIR (E5-P1: refusal-first, abort shape, D48 linked writer, receipt vs transport markers in adapter, binding types, view imports, policy match, dispose type)"
+  },
+  "verdicts_w1r_round1": {
+    "k1b": "ACCEPTED a46fed5e1 (critical, both)",
+    "x1c": "REPAIR (E6-X: orphan-kill fail-open, dispose evidence, orphan filter, lsof stall root cause smbfs TM mount, K1 key import, template material)",
+    "x1b": "REPAIR (E6-B: shim interpreter pin, dir-first pin, hardening tests, minimal required + optional set, Homebrew-only search path)",
+    "contract_v3_2": "FREEZE with 12 non-blocking -> E6-C"
+  },
+  "verdicts_repair1": {
+    "g1": "ACCEPTED 11fff1ad1 (both)",
+    "x1c": "ACCEPTED c16d103bf (critical, both); residuals: lsof -b inferred, template digest per build, no ulimit -u",
+    "k2": "REPAIR (adversary): certificate scope Array.isArray, vacuous deadline row, cap type, pinning tests, review identity by exact shape, .git in changedPaths",
+    "l1": "REPAIR (both): pause-at-admitted wedge, pending cancel erased by ->paused, lineage role/leaf-cap tests, deferred reason row, settlement string bounds, superseded lineage, split children, within-tx completion",
+    "p1": "REPAIR (both): error before [DONE] = transport, loopback REDs, drift-on-error refuses, evidence values, linked-writer model check, item-7 slot wedge, BoundRoute exports",
+    "x1b": "REPAIR (adversary, test-only): nested bash shim merge, env bash shebang, no-shebang fallback"
+  },
+  "verdicts_repair2": {
+    "k2": "ACCEPTED c594c8c02",
+    "l1": "ACCEPTED dbe1f6a71",
+    "p1": "lineage closed; integrated; residual -> P1z (post-[DONE] body failure, non-SSE 200)",
+    "x1b": "lineage closed; integrated; residual -> X1z (searchPath optional default, decorator dispose)",
+    "contract_v3_4": "AMEND B-1 (BF needs within-tx transition) -> L1z; N-1..N-8 ruled in E8"
+  },
+  "verdicts_early_i2": {
+    "b3": "ACCEPTED 16a637d20 - integrated",
+    "rp": "ACCEPTED 34eaa9ab5 - integrated",
+    "ip": "ACCEPTED d48a723a0 - integrated",
+    "ib1": "ACCEPTED 96d252cbc - integrated",
+    "gg": "LINEAGE CLOSED: repair2 1ee8b3bf8 review ACCEPT, adversary REPAIR (3 parity gaps) -> integrated, residuals re-planned as GGz (E12)",
+    "ggz": "REPAIR at 0e0bae81a (adv2 lone surrogate); repair 2 final per E16 in flight wf_3b95e213-9f3"
+  },
+  "verdicts_w3": {
+    "ad1": "ACCEPTED 043863f98 (both) - integrated 29cf6d1e8",
+    "c2": "repair2 (E14) pending rebase onto INT-3b; FIFO, probe wrapper raw params, full tool-set check for every policy (grant over P1 fixtures)",
+    "h1": "LINEAGE CLOSED, integrated b13f33e87 (review3 ACCEPT, adv3 REPAIR: resume/answer race strands held item) - re-plan H1z (E17)",
+    "p1z": "ACCEPTED 426a016a7 - integrated INT-3b",
+    "x1z": "ACCEPTED 56139aaa9 (repair 2 final, E16) - picked into INT-3c",
+    "l1z": "ACCEPTED 5ea7a413a - integrated INT-3b"
+  },
+  "contract": "CONTRACT-v3.5.md + E9 + E10 (v3.5 check AMEND: B-1 import rule scoped to engine/CLI cards, N-1..N-6 adopted)",
+  "outage": "2026-10-14 ~21:40-21:50 API ENOTFOUND killed 11 agents; orphaned PGs (build-h1 55551, review2-l1z 55563, adv2-l1z 55564) stopped via pg_ctl; dead scratch dirs moved to scratchpad/.dead-outage/",
+  "follow_ups": [
+    "run-verification-command.test.ts 'aborts a spawned verifier process group before its hard timeout' failed once under gate load (durationMs 10016 vs 10000; timedOut false, killed true; 18 ms in isolation): abort may settle only at the hard timeout under load - possible real defect in the protected safety lane; not quarantined (evidence scratchpad/int3a2/test-gate-flake-evidence.log)",
+    "B3 engine test keeps a vi.mock @fusion/engine overlay that is redundant after the INT-3a barrel export; drop it in a later B3-area card",
+    "reviewer process slip: one read-only git ls-remote by the RP re-reviewer (no write, no credentials of its own)",
+    "GG CCC_PLANNING_G4_SOURCE_PATHS duplicated locally - parent dedup at integration",
+    "L1 STATE_CODE_REQUIRED omits awaiting_intent (defence in depth) - next core planning card",
+    "PRE-EXISTING ON MAIN (load only, measured 2026-10-15 by perf-auth: BASE d5fd9e87d0 15.7-20.1 s, TIP 14.6-16.2 s, test file byte-identical): ccc-campaign-execution-authorization.pg.test.ts RED-S3-opened-lifecycles runs 4 heavy fixtures and sits at the 15 s vitest default, timing out at load >= ~12. It is in run-ccc-pg-proof.mjs frozen mapping, not test:gate or test:ccc-planning; not quarantined by this campaign (frozen mapping), not timeout-widened. Fix later by splitting per lifecycle or sharing the fixture. Evidence scratchpad/perf-auth/*.log",
+    "X1 discovery test: pin optional-loop and role-fallback probe dirs when searchPath absent (E16 X1z note)",
+    "VP: closure dirs differing only in case admitted under plumbing B1 (E16 residual)",
+    "ci-linux: first real run of GGz NFD non-Darwin custody branch"
+  ],
+  "verdicts_w4": {
+    "cl1": "ACCEPTED 04ba56649 (normal) - integrated locally",
+    "im1": "ACCEPTED bc4d1a695 (repair 2 final; review3 ACCEPT, adv3 ACCEPT) - E15; integrating at INT-3c"
+  },
+  "obligations_ib2": [
+    "admission_facts JSON bounds = full five-field intent.limits",
+    "CccPlanningImportClosure from @fusion/core",
+    "receipt slot import-receipt-v01; deterministic release value across crash/restart",
+    "G8 identity only for the judge task (E10 N-5)",
+    "E15-1 intent built from bundle.bundleHash/sourceHash/sidecarHash exactly",
+    "E15-2 exactly one complete bundle and admission_facts artifact per revision",
+    "E15-3 link IMPORT_IDENTITY_DRIFT after importer commit -> failed/CCC_PLANNING_IMPORT_IDENTITY_DRIFT, never retry",
+    "E15-4 IM1 does not compare intent target fields with the anchor; IB2 derives them from the anchor and G6"
+  ],
+  "resume": [
+    "Check every in-flight worktree BEFORE re-dispatching (limit-killed agents often leave committed work): r2c-au2 (build died mid-run, 144 tool uses), r2c-c5, r2c-au4, r2c-bf, r2c-lv (W6a wf_295cf199-34c), r2c-ggz (GGz repair2 wf_3b95e213-9f3), r2c-h1z (wf_ea7c2bb0-bbe), r2c-c2 (C2 final wf_cac548bd-27f). git log + status per worktree; stop any owned PG left running (ports 55661-55684, 55611 parent int3c pgdata).",
+    "Read each workflow journal.jsonl; resume only runs whose failed call is followed by no committing call, else write a continuation script (memory: workflow-resume-reruns-after-first-failure).",
+    "Then: adjudicate, INT-3c full checks (tc x4 after engine build, K1 test-tsc, lint, test:ccc-planning, test:gate on owned PG), push; SF after C2."
+  ],
+  "active_at_pause": [
+    {
+      "workflow": "wf_cac548bd-27f",
+      "task": "wssy4fx2o",
+      "what": "C2 final repair (E14), rebased on d028d92cb"
+    },
+    {
+      "workflow": "wf_295cf199-34c",
+      "task": "w0mra8ikx",
+      "what": "W6a: C5 (sonnet normal), AU4 (sonnet normal), BF (opus critical, PG 55661-55664), LV (sonnet normal) from d028d92cb"
+    },
+    {
+      "workflow": "wf_54df1674-4ed",
+      "task": "wz6frjh9p",
+      "what": "AU2 (opus critical, ENGINE_PG 55671-55674) from 6b392adbd"
+    },
+    {
+      "workflow": "wf_3b95e213-9f3",
+      "task": "wl3hcrlin",
+      "what": "GGz final repair (E16) + critical review"
+    },
+    {
+      "workflow": "wf_ea7c2bb0-bbe",
+      "task": "wop65y129",
+      "what": "H1z re-plan (E17, opus critical, PG 55681-55684) from 299a7dbc3"
+    }
+  ]
+}

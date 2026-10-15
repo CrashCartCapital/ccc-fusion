@@ -5,6 +5,7 @@ This folder contains current direction plus older design and execution records. 
 ## Current target
 
 - [2026-10-13 Request-to-code implementation PRD v3](./2026-10-13-ccc-fusion-request-to-code-prd-v3.md) - current implementation target for turning a plain-language request into a reviewed PRD, dependency plan, and checked code. It carries Ryan's explicit model amendment: the routine pool is GLM 5.3 (`glm/glm-5.3`), GLM 5.3 Flash (`glm/glm-5.3-flash`), and MiniMax M3 (`minimax/MiniMax-M3`), assigned by role. GLM 5.2 is excluded from new worker and fallback routes. Where the defaults below still say GLM 5.2, PRD v3 wins. Preserved byte-for-byte; sha256 `5aa8bc8dad8d2ad975983ad0af94209e3f09989b079f799ef65f0d5fe1c03927`.
+- [Request-to-code v3 implementation contract](./request-to-code-v3/) - the frozen implementation contract for PRD v3 (`CONTRACT-v3.5.md`), the four design ADRs (`adr/`), and errata E1-E17 (`errata/`). Precedence: the highest-numbered erratum wins, then E16, E15 and so on down to E1, then the contract, then the PRD for intent. `run-state-2026-10-15.json` is the orchestrator's last checkpoint. Start with [the Codex handoff](./2026-10-15-request-to-code-v3-codex-handoff.md).
 - [2026-08-11 CCC-Fusion product direction](./2026-08-11-ccc-fusion-product-direction.md) - current repo-local direction for worker compute, campaign parallelism, capacity learning, and delivery boundaries.
 
 ## How to read older plans
