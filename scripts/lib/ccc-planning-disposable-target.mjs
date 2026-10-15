@@ -13,7 +13,7 @@ Refusals are `CccPlanningDisposableTargetError` with a `CCC_PLANNING_DISPOSABLE_
 */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { access, constants, mkdir, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { access, constants, lstat, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL, fileURLToPath, pathToFileURL } from "node:url";
@@ -98,7 +98,7 @@ const sha256Of = (value) => createHash("sha256").update(value).digest("hex");
 
 async function pathExists(target) {
   try {
-    await stat(target);
+    await lstat(target);
     return true;
   } catch (error) {
     if (error?.code === "ENOENT") return false;
@@ -230,6 +230,22 @@ async function defaultPostgresRun(file, args, environment) {
   return execFileAsync(file, args, { env: environment, encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 120_000 });
 }
 
+function postgresRunner(root, run) {
+  return run ?? ((file, args) => defaultPostgresRun(file, args, postgresEnvironment(root)));
+}
+
+/** FNXC:CccPlanningDisposableTarget 2026-10-15-05:08: A failed startup or seal must relinquish only its own cluster; teardown failure remains visible alongside the original failure. */
+async function failAfterPostgresCleanup(error, stop) {
+  try {
+    await stop();
+  } catch (stopError) {
+    const failure = new CccPlanningDisposableTargetError("POSTGRES_CLEANUP_FAILED", `${error?.message ?? String(error)}; owned PostgreSQL teardown failed: ${stopError?.message ?? String(stopError)}`);
+    failure.cause = error;
+    throw failure;
+  }
+  throw error;
+}
+
 /**
  * initdb, start, wait until ready, create the database. When anything after `start` fails the server this call started
  * is stopped again (only its own data directory), then the error is rethrown. Returns what step 3 and step 6 need.
@@ -237,8 +253,7 @@ async function defaultPostgresRun(file, args, environment) {
 export async function provisionCccPlanningDisposablePostgres({ root, pgBinDir = DEFAULT_PG_BIN_DIR, run, pickPort, sleep, binariesPresent } = {}) {
   const dataDir = path.join(root, "pg");
   const logPath = path.join(root, "evidence", "pg.log");
-  const environment = postgresEnvironment(root);
-  const exec = run ?? ((file, args) => defaultPostgresRun(file, args, environment));
+  const exec = postgresRunner(root, run);
   const wait = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const choosePort = pickPort ?? (() => pickCccPlanningFreeLoopbackPort());
 
@@ -261,8 +276,9 @@ export async function provisionCccPlanningDisposablePostgres({ root, pgBinDir = 
   const port = await choosePort();
   const commands = cccPlanningDisposablePostgresCommands({ pgBinDir, dataDir, logPath, port });
   await exec(commands.initdb.file, commands.initdb.args);
-  await exec(commands.start.file, commands.start.args);
   try {
+    // pg_ctl can start the server and still report failure (for example, a readiness timeout).
+    await exec(commands.start.file, commands.start.args);
     let ready = false;
     for (let attempt = 0; attempt < PG_READY_ATTEMPTS && !ready; attempt += 1) {
       try {
@@ -275,12 +291,7 @@ export async function provisionCccPlanningDisposablePostgres({ root, pgBinDir = 
     if (!ready) throw new CccPlanningDisposableTargetError("POSTGRES_FAILED", `the owned PostgreSQL on 127.0.0.1:${port} never became ready; see ${logPath}`);
     await exec(commands.createdb.file, commands.createdb.args);
   } catch (error) {
-    try {
-      await exec(commands.stop.file, commands.stop.args);
-    } catch {
-      // the original failure is the one to report
-    }
-    throw error;
+    await failAfterPostgresCleanup(error, () => exec(commands.stop.file, commands.stop.args));
   }
   return { dataDir, logPath, port, databaseUrl: `postgresql://postgres@127.0.0.1:${port}/${POSTGRES_DATABASE}`, pgBinDir };
 }
@@ -344,6 +355,22 @@ async function assertNothingOwnedExists(root) {
   }
 }
 
+/** FNXC:CccPlanningDisposableTarget 2026-10-15-05:08: Existing layout directories cannot redirect this builder's writes outside its scratch root, including through a dangling symlink. Run before the first write. */
+async function assertExistingLayoutDirectories(root) {
+  for (const directory of [root, ...LAYOUT_DIRECTORIES.map((name) => path.join(root, name)), path.join(root, "home", ".fusion")]) {
+    let entry;
+    try {
+      entry = await lstat(directory);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new CccPlanningDisposableTargetError("ROOT_INVALID", `${directory} must be a real directory, never a symlink or another file type`);
+    }
+  }
+}
+
 /**
  * Builds the target and returns the report the parent turns into the receipt's `target` and `request` fields.
  * @param {{ root: string, omniRouteBaseUrl: string, pins: { glm53: string, glm53Flash: string, minimaxM3: string },
@@ -353,6 +380,7 @@ export async function buildCccPlanningDisposableTarget(options) {
   const { omniRouteBaseUrl, pins, provisionPostgres = false, postgres = {}, clock = () => new Date() } = options;
   preflight(options.root, { pins, omniRouteBaseUrl });
   const root = path.resolve(options.root);
+  await assertExistingLayoutDirectories(root);
   await assertNothingOwnedExists(root);
 
   // The nested check runs before anything is created: from the root if it exists, else from its nearest existing ancestor.
@@ -404,38 +432,45 @@ export async function buildCccPlanningDisposableTarget(options) {
   await writeFile(settingsPath, settingsBytes);
 
   // The owned PostgreSQL, only when asked.
-  const provisioned = provisionPostgres ? await provisionCccPlanningDisposablePostgres({ root: scratchRoot, ...postgres }) : null;
+  const provisioned = provisionPostgres ? await provisionCccPlanningDisposablePostgres({ ...postgres, root: scratchRoot }) : null;
 
   // owner.json last: the seal.
-  const ownerPath = path.join(scratchRoot, "owner.json");
-  const ownerBytes = Buffer.from(`${JSON.stringify({
-    schema: CCC_PLANNING_DISPOSABLE_TARGET_OWNER_SCHEMA,
-    repositoryRealpath,
-    nonce: randomBytes(16).toString("hex"),
-    createdAt: clock().toISOString(),
-  }, null, 2)}\n`, "utf8");
-  await writeFile(ownerPath, ownerBytes, { flag: "wx" });
+  try {
+    const ownerPath = path.join(scratchRoot, "owner.json");
+    const ownerBytes = Buffer.from(`${JSON.stringify({
+      schema: CCC_PLANNING_DISPOSABLE_TARGET_OWNER_SCHEMA,
+      repositoryRealpath,
+      nonce: randomBytes(16).toString("hex"),
+      createdAt: clock().toISOString(),
+    }, null, 2)}\n`, "utf8");
+    await writeFile(ownerPath, ownerBytes, { flag: "wx" });
 
-  return {
-    schema: CCC_PLANNING_DISPOSABLE_TARGET_REPORT_SCHEMA,
-    scratchRoot,
-    repositoryRealpath,
-    branch: "main",
-    baseCommit,
-    baseTree,
-    remotes: [],
-    ownershipMarker: { path: ownerPath, sha256: sha256Of(ownerBytes) },
-    request: { path: requestPath, sha256: sha256Of(requestBytes), byteLength: requestBytes.length },
-    settings: {
-      path: settingsPath,
-      sha256: sha256Of(settingsBytes),
-      omniRouteBaseUrl,
-      providerIds: { ...CCC_PLANNING_DISPOSABLE_TARGET_PROVIDER_IDS },
-      models: { ...pins },
-    },
-    directories: { ...directories, target: repositoryRealpath },
-    postgres: provisioned,
-  };
+    return {
+      schema: CCC_PLANNING_DISPOSABLE_TARGET_REPORT_SCHEMA,
+      scratchRoot,
+      repositoryRealpath,
+      branch: "main",
+      baseCommit,
+      baseTree,
+      remotes: [],
+      ownershipMarker: { path: ownerPath, sha256: sha256Of(ownerBytes) },
+      request: { path: requestPath, sha256: sha256Of(requestBytes), byteLength: requestBytes.length },
+      settings: {
+        path: settingsPath,
+        sha256: sha256Of(settingsBytes),
+        omniRouteBaseUrl,
+        providerIds: { ...CCC_PLANNING_DISPOSABLE_TARGET_PROVIDER_IDS },
+        models: { ...pins },
+      },
+      directories: { ...directories, target: repositoryRealpath },
+      postgres: provisioned,
+    };
+  } catch (error) {
+    if (provisioned === null) throw error;
+    const { stop } = cccPlanningDisposablePostgresCommands(provisioned);
+    const exec = postgresRunner(scratchRoot, postgres.run);
+    await failAfterPostgresCleanup(error, () => exec(stop.file, stop.args));
+  }
 }
 
 // ---------------------------------------------------------------- entry

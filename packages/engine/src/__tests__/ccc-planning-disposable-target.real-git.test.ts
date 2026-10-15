@@ -439,6 +439,94 @@ describe("ccc planning disposable target builder", () => {
     expect(calls.map(([file]) => file.split("/").pop())).toEqual(["initdb", "pg_ctl", "pg_isready", "createdb", "pg_ctl"]);
     expect(calls.at(-1)![1]).toEqual(["-D", expect.stringContaining("pg"), "-m", "fast", "stop"]);
   });
+
+  it("refuses existing layout symlinks before writing any target or following an external directory", async () => {
+    for (const relative of [".", "home", "home/.fusion", "install", "pg", "tmp", "request", "authority", "evidence"]) {
+      sequence += 1;
+      const holder = join(base, `${sequence}-symlink-layout`);
+      const root = join(holder, "ccc-planning-i2-symlink");
+      const outside = join(holder, "outside");
+      await mkdir(outside, { recursive: true });
+      const link = relative === "." ? root : join(root, relative);
+      await mkdir(join(link, ".."), { recursive: true });
+      await symlink(outside, link);
+      const before = await readdir(root);
+      await expect(builder.buildCccPlanningDisposableTarget({ root, omniRouteBaseUrl: OMNIROUTE_URL, pins: PINS }))
+        .rejects.toMatchObject({ code: "CCC_PLANNING_DISPOSABLE_TARGET_ROOT_INVALID" });
+      expect(await readdir(root)).toEqual(before);
+      expect(await readdir(outside)).toEqual([]);
+    }
+    expect(await run(inputOf(await control("symlink-control")))).toEqual(ADMITTED);
+  });
+
+  it("keeps PostgreSQL inside the builder root even when PostgreSQL options name another root", async () => {
+    sequence += 1;
+    const root = join(base, `${sequence}-pg-root`, "ccc-planning-i2-pg-root");
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const report = await builder.buildCccPlanningDisposableTarget({
+      root, omniRouteBaseUrl: OMNIROUTE_URL, pins: PINS, provisionPostgres: true,
+      postgres: {
+        root: join(base, "foreign-pg-root"), pgBinDir: "/pg/bin", pickPort: async () => 55123,
+        binariesPresent: async () => null,
+        run: async (file: string, args: string[]) => { calls.push({ file, args }); return { stdout: "", stderr: "" }; },
+      },
+    });
+    expect(report.postgres?.dataDir).toBe(join(report.scratchRoot, "pg"));
+    expect(calls[0]?.args).toContain(join(report.scratchRoot, "pg"));
+    expect(JSON.stringify(calls)).not.toContain("foreign-pg-root");
+  });
+
+  it("attempts exact owned PostgreSQL teardown when start fails and preserves a teardown failure", async () => {
+    for (const stopFails of [false, true]) {
+      sequence += 1;
+      const root = join(base, `${sequence}-pg-start`, "ccc-planning-i2-pg-start");
+      const calls: Array<{ file: string; args: string[] }> = [];
+      const failure = await builder.buildCccPlanningDisposableTarget({
+        root, omniRouteBaseUrl: OMNIROUTE_URL, pins: PINS, provisionPostgres: true,
+        postgres: {
+          pgBinDir: "/pg/bin", pickPort: async () => 55123, binariesPresent: async () => null,
+          run: async (file: string, args: string[]) => {
+            calls.push({ file, args });
+            if (args.at(-1) === "start") throw new Error("start reported failure");
+            if (args.at(-1) === "stop" && stopFails) throw new Error("stop reported failure");
+            return { stdout: "", stderr: "" };
+          },
+        },
+      }).catch((error: Error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).toContain("start reported failure");
+      expect(calls.map(({ file }) => file.split("/").at(-1))).toEqual(["initdb", "pg_ctl", "pg_ctl"]);
+      expect(calls.at(-1)?.args).toEqual(["-D", join(await realpath(root), "pg"), "-m", "fast", "stop"]);
+      if (stopFails) expect(String(failure)).toContain("stop reported failure");
+      await expect(stat(join(root, "owner.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("stops owned PostgreSQL when sealing fails after startup and preserves a teardown failure", async () => {
+    for (const stopFails of [false, true]) {
+      sequence += 1;
+      const root = join(base, `${sequence}-pg-seal`, "ccc-planning-i2-pg-seal");
+      const calls: Array<{ file: string; args: string[] }> = [];
+      const failure = await builder.buildCccPlanningDisposableTarget({
+        root, omniRouteBaseUrl: OMNIROUTE_URL, pins: PINS, provisionPostgres: true,
+        clock: () => { throw new Error("owner seal failed"); },
+        postgres: {
+          pgBinDir: "/pg/bin", pickPort: async () => 55123, binariesPresent: async () => null,
+          run: async (file: string, args: string[]) => {
+            calls.push({ file, args });
+            if (args.at(-1) === "stop" && stopFails) throw new Error("stop reported failure");
+            return { stdout: "", stderr: "" };
+          },
+        },
+      }).catch((error: Error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).toContain("owner seal failed");
+      expect(calls.map(({ file }) => file.split("/").at(-1))).toEqual(["initdb", "pg_ctl", "pg_isready", "createdb", "pg_ctl"]);
+      expect(calls.at(-1)?.args).toEqual(["-D", join(await realpath(root), "pg"), "-m", "fast", "stop"]);
+      if (stopFails) expect(String(failure)).toContain("stop reported failure");
+      await expect(stat(join(root, "owner.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
 });
 
 describe("assertCccPlanningOwnedDisposableTarget", () => {
