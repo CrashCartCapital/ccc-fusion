@@ -13,7 +13,11 @@
  *
  * Non-vacuity, as the card states it:
  * - atomicity: the anchor CAS and the import_intent artifact are written in one transaction, so a failing
- *   `beforeArtifact` hook leaves no intent digest; an implementation that commits the CAS on its own fails the test;
+ *   `beforeArtifact` hook leaves no intent digest; an implementation that commits the CAS on its own fails the test.
+ *   FNXC:CccPlanningImportLink 2026-10-14-23:20 (repair 1): the hook alone could not tell where it ran, so the hook
+ *   test also requires, while the hook runs, one open writer holding a write lock on the anchor table only, and a
+ *   second test makes the artifact publication itself fail (SLOT_CONFLICT), which rolls the CAS back whatever the
+ *   hook order;
  * - bounds: the drifted intent carries exactly the limits stored in `admission_facts`, so only an implementation that
  *   reads the published bundle artifact refuses it.
  */
@@ -303,21 +307,70 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
     expect(await events(run, "ccc-planning:import-intent")).toHaveLength(1);
   });
 
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:20 (card IM1, repair 1):
+   * A failing hook alone cannot tell where the hook ran, so an implementation that calls it before two separate
+   * transactions passed this test. While the hook runs, the admin connection therefore requires exactly one open
+   * writing transaction and reads the project tables it holds a granted RowExclusiveLock on: only the anchor
+   * (`ccc_planning_runs`). The CAS is in flight and uncommitted, and neither the artifact (`task_documents`) nor the
+   * event (`run_audit_events`) is written yet, so the rollback below proves they share the CAS's transaction.
+   */
   it("a failing beforeArtifact hook rolls back the anchor CAS with the artifact, so the anchor has no intent digest; the same intent then records", async () => {
     const run = await seedRun();
     const intent = intentFor(run);
     const injected = new Error("injected failure before the import_intent artifact");
+    let inFlight: string[] | null = null;
     const failing = vi.fn(async () => {
+      const writers = (await db.execute(sql`
+        SELECT pid FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid() AND backend_type = 'client backend'
+           AND backend_xid IS NOT NULL
+      `)) as unknown as Array<{ pid: number }>;
+      expect(writers, "the intent transaction is the one open writer while the hook runs").toHaveLength(1);
+      inFlight = ((await db.execute(sql`
+        SELECT c.relname FROM pg_locks l
+          JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE l.pid = ${writers[0]!.pid} AND l.locktype = 'relation' AND l.mode = 'RowExclusiveLock' AND l.granted
+           AND n.nspname = 'project' AND c.relkind IN ('r', 'p')
+      `)) as unknown as Array<{ relname: string }>).map((row) => row.relname).sort();
       throw injected;
     });
 
     await expect(record(run, intent, failing)).rejects.toBe(injected);
     expect(failing).toHaveBeenCalledTimes(1);
+    expect(inFlight, "the anchor CAS is in flight and nothing else is written yet").toEqual(["ccc_planning_runs"]);
     await expectNoIntent(run);
 
     await expect(record(run, intent)).resolves.toEqual({ intentDigest: digestOf(intent), replayed: false });
     expect(await anchor(run)).toMatchObject({ import_intent_digest: digestOf(intent) });
     expect(await documents(run, INTENT_KEY)).toHaveLength(1);
+  });
+
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:20 (card IM1, repair 1):
+   * Atomicity whatever the hook order: the import_intent publication itself fails inside the intent's transaction,
+   * because its slot already holds other bytes (A1 refuses SLOT_CONFLICT). An implementation that commits the anchor
+   * CAS in a transaction of its own leaves the intent digest set; here it must roll back with the refused artifact, and
+   * no import-intent event may exist. The records-once test above, on an unoccupied run, is the positive control.
+   */
+  it("a refused import_intent publication (its slot already holds other bytes) rolls back the anchor CAS with it, whatever the hook order", async () => {
+    const run = await seedRun();
+    const occupied = { occupied: run.runId };
+    await publishCccPlanningArtifact(layer, {
+      planningTaskId: run.taskId, runId: run.runId, inputs: [], producer: CONTROLLER, policy: NO_POLICY, status: "complete",
+      fence: { kind: "work_item_lease", workItemId: run.workItemId, leaseOwner: LEASE_OWNER, attempt: 1, runId: run.runId },
+      now: NOW, slot: { runRevision: 1, stageId: "import", slot: "intent", version: 1 }, kind: "import_intent",
+      contentSchema: "ccc-planning.import-intent.v1", content: { type: "json", value: occupied },
+    });
+    const hook = vi.fn(async () => undefined);
+
+    await expectRefusal(record(run, intentFor(run), hook), "CCC_PLANNING_ARTIFACT_SLOT_CONFLICT");
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(await anchor(run)).toMatchObject({ state: "importing", import_intent_digest: null, import_idempotency_key: null });
+    expect(await events(run, "ccc-planning:import-intent")).toHaveLength(0);
+    const stored = await documents(run, INTENT_KEY);
+    expect(stored).toHaveLength(1);
+    expect(JSON.parse(stored[0]!.content)).toEqual(occupied);
   });
 
   it("refuses a second intent with another digest with IMPORT_LINK_WRITE_ONCE and writes nothing; the first intent still replays", async () => {
