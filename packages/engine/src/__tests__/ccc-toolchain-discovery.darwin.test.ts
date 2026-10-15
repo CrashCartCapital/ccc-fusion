@@ -19,6 +19,18 @@ result is reported as evidence, not asserted (E4-15).
 
 The single `skipIf(process.platform !== "darwin")` is the only skip form a
 Darwin-tagged planning suite may carry (ADR D, skip policy).
+
+FNXC:CccToolchainDiscovery 2026-10-14-17:15:
+Repair 1 (errata E6-B items 2-4, E6-0). The default `required` set is the
+minimal set (the roles, task, rg, GNU coreutils); GNU grep, sed, findutils,
+gawk and diffutils are optional, sealed when found and silently left out
+otherwise, and a caller may pass its own `optional` list. The default search
+path is Homebrew only, so a tool that sits only in a user-writable PATH
+directory (~/.local/bin, ~/go/bin, ...) is missing by default and found only
+when the caller passes that directory; that test and the host scan read this
+host's Homebrew. Directory-first lookup is pinned by an unprefixed `cat` in a
+directory after the one holding `gcat` (loops-swapped mutant D12), and the
+missing bash and node roles and the execute-permission check have tests.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readFileSync, realpathSync } from "node:fs";
@@ -35,6 +47,7 @@ import {
 } from "../ccc-confinement/confined-shell.js";
 import {
   CCC_TOOLCHAIN_GNU_TOOLS,
+  CCC_TOOLCHAIN_OPTIONAL_TOOLS,
   CCC_TOOLCHAIN_REQUIRED_TOOLS,
   CCC_TOOLCHAIN_ROLE_TOOLS,
   cccToolchainDefaultSearchPath,
@@ -42,6 +55,9 @@ import {
 } from "../ccc-confinement/toolchain-discovery.js";
 
 const MACH_O_64 = Buffer.from([0xcf, 0xfa, 0xed, 0xfe]);
+/** E6-0: GNU grep, sed, findutils (find, xargs), gawk (awk) and diffutils (diff, cmp) are optional. */
+const OPTIONAL_TOOLS: readonly string[] = ["grep", "sed", "find", "xargs", "awk", "diff", "cmp"];
+const REFUSAL_CODE = "CCC_PLANNING_CONFINEMENT_UNQUALIFIED";
 const APPLE_PLATFORM = /^\/(?:bin|sbin|usr\/bin|usr\/sbin|usr\/libexec|usr\/lib|System)\//u;
 /** The real platform directories every fixture search path starts with. */
 const PLATFORM_DIRS = ["/bin", "/usr/bin"] as const;
@@ -139,8 +155,17 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
     return new Map(toolchain.utilities.map((utility) => [utility.name ?? basename(utility.path), utility]));
   }
 
+  function utilityNames(toolchain: CccSealedToolchain): string[] {
+    return [...utilityByName(toolchain).keys()].sort();
+  }
+
+  /** The default required utilities: the required list without the four roles. */
+  function requiredUtilities(): string[] {
+    return CCC_TOOLCHAIN_REQUIRED_TOOLS.filter((tool) => !CCC_TOOLCHAIN_ROLE_TOOLS.includes(tool));
+  }
+
   describe("fixture search path", () => {
-    it("seals every required tool from the non-platform directory under its unprefixed name, gcat as cat and gawk as awk, skipping the platform binaries in /bin and /usr/bin and a script shim earlier on the path", async () => {
+    it("seals every required tool and every optional tool it finds from the non-platform directory under its unprefixed name, gcat as cat and gawk as awk, skipping the platform binaries in /bin and /usr/bin and a script shim earlier on the path", async () => {
       const root = await fixtureRoot();
       const brew = await brewDir(root);
       const shims = await scriptShimDir(root, { git: gitSource, cat: "/bin/cat" });
@@ -159,8 +184,7 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(toolchain!.git.path).toBe(join(brew, "git"));
       expect(toolchain!.git.execPath).toBe(realpathSync(toolchain!.git.execPath));
       const utilities = utilityByName(toolchain!);
-      const expectedUtilities = CCC_TOOLCHAIN_REQUIRED_TOOLS.filter((tool) => !CCC_TOOLCHAIN_ROLE_TOOLS.includes(tool));
-      expect([...utilities.keys()].sort()).toEqual([...expectedUtilities].sort());
+      expect([...utilities.keys()].sort()).toEqual([...new Set([...requiredUtilities(), ...OPTIONAL_TOOLS])].sort());
       expect(utilities.get("cat")).toEqual({ path: join(brew, "gcat"), sha256: sha256(join(brew, "gcat")), name: "cat" });
       expect(utilities.get("awk")).toEqual({ path: join(brew, "gawk"), sha256: sha256(join(brew, "gawk")), name: "awk" });
       // A tool whose file already carries its name is sealed without one, so its digest entry is unchanged.
@@ -223,19 +247,96 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(found.value!.git.path).toBe(join(later, "git"));
     });
 
-    it("seals exactly the tools a caller requires plus the four roles, so a path without gawk seals without awk, while the default list refuses toolchain-missing:awk", async () => {
+    it("refuses a missing bash role as toolchain-missing:bash and a missing node role as toolchain-missing:node, skipping the platform /bin/bash, while the same paths with those binaries added seal them", async () => {
+      expect(existsSync("/bin/bash")).toBe(true);
+      const root = await fixtureRoot();
+      const noBash = await brewDir(root, { omit: ["bash"] });
+      const noNode = await brewDir(root, { omit: ["node"] });
+      const later = join(root, "later-roles");
+      await mkdir(later);
+      const discover = (dir: string) => settle(discoverCccToolchain({
+        searchPath: [...PLATFORM_DIRS, dir, later],
+        required: ["cat"],
+        optional: [],
+      }));
+
+      const bashMissing = await discover(noBash);
+      const nodeMissing = await discover(noNode);
+      await stub(later, "bash");
+      await stub(later, "node");
+      const bashFound = await discover(noBash);
+      const nodeFound = await discover(noNode);
+
+      expect(refusalOf(bashMissing.error)).toEqual({ code: REFUSAL_CODE, detail: "toolchain-missing:bash" });
+      expect(refusalOf(nodeMissing.error)).toEqual({ code: REFUSAL_CODE, detail: "toolchain-missing:node" });
+      expect(bashFound.error).toBeNull();
+      expect(bashFound.value!.bash.path).toBe(join(later, "bash"));
+      expect(bashFound.value!.sh.path).toBe(join(later, "bash"));
+      expect(nodeFound.error).toBeNull();
+      expect(nodeFound.value!.node.path).toBe(join(later, "node"));
+    });
+
+    it("skips a candidate without execute permission and takes the binary in a later directory, while the same candidate made executable is taken", async () => {
+      const root = await fixtureRoot();
+      const brew = await brewDir(root);
+      const earlier = join(root, "no-exec");
+      await mkdir(earlier);
+      const unexecutable = await stub(earlier, "gcat");
+      await chmod(unexecutable, 0o644);
+      const discover = () => settle(discoverCccToolchain({ searchPath: [...PLATFORM_DIRS, earlier, brew], required: ["cat"], optional: [] }));
+
+      const skipped = await discover();
+      await chmod(unexecutable, 0o755);
+      const taken = await discover();
+
+      expect(skipped.error).toBeNull();
+      expect(utilityByName(skipped.value!).get("cat")?.path).toBe(join(brew, "gcat"));
+      expect(taken.error).toBeNull();
+      expect(utilityByName(taken.value!).get("cat")?.path).toBe(unexecutable);
+    });
+
+    it("seals exactly the required tools plus the four roles when optional is empty, adds each optional tool it finds when optional is left at its default or named, and so seals a path without gawk without awk", async () => {
       const root = await fixtureRoot();
       const brew = await brewDir(root, { omit: ["awk"] });
       const searchPath = [...PLATFORM_DIRS, brew];
 
-      const narrow = await settle(discoverCccToolchain({ searchPath, required: ["task", "cat", "sed"] }));
+      const narrow = await settle(discoverCccToolchain({ searchPath, required: ["task", "cat", "sed"], optional: [] }));
+      const narrowDefault = await settle(discoverCccToolchain({ searchPath, required: ["task", "cat"] }));
+      const chosen = await settle(discoverCccToolchain({ searchPath, required: ["task"], optional: ["grep", "awk"] }));
       const full = await settle(discoverCccToolchain({ searchPath }));
 
       expect(narrow.error).toBeNull();
-      expect([...utilityByName(narrow.value!).keys()].sort()).toEqual(["cat", "sed", "task"]);
+      expect(utilityNames(narrow.value!)).toEqual(["cat", "sed", "task"]);
       expect(narrow.value!.bash.path).toBe(join(brew, "bash"));
       expect(narrow.value!.git.path).toBe(join(brew, "git"));
-      expect(refusalOf(full.error)).toEqual({ code: "CCC_PLANNING_CONFINEMENT_UNQUALIFIED", detail: "toolchain-missing:awk" });
+      expect(narrowDefault.error).toBeNull();
+      expect(utilityNames(narrowDefault.value!)).toEqual(["cat", "task", ...OPTIONAL_TOOLS.filter((tool) => tool !== "awk")].sort());
+      expect(utilityByName(narrowDefault.value!).get("grep")).toEqual({ path: join(brew, "ggrep"), sha256: sha256(join(brew, "ggrep")), name: "grep" });
+      expect(chosen.error).toBeNull();
+      expect(utilityNames(chosen.value!)).toEqual(["grep", "task"]);
+      expect(full.error).toBeNull();
+      expect(utilityByName(full.value!).has("awk")).toBe(false);
+    });
+
+    it("treats GNU grep, sed, findutils, gawk and diffutils as optional by default, so a path without any of them still seals a toolchain without those names, while a missing coreutil still refuses toolchain-missing:dirname", async () => {
+      const root = await fixtureRoot();
+      const noOptional = await brewDir(root, { omit: OPTIONAL_TOOLS });
+      const noDirname = await brewDir(root, { omit: [...OPTIONAL_TOOLS, "dirname"] });
+      // The platform directories offer every optional tool, which discovery must still skip.
+      for (const tool of OPTIONAL_TOOLS) expect(existsSync(`/usr/bin/${tool}`), `platform ${tool}`).toBe(true);
+
+      const sealed = await settle(discoverCccToolchain({ searchPath: [...PLATFORM_DIRS, noOptional] }));
+      const refused = await settle(discoverCccToolchain({ searchPath: [...PLATFORM_DIRS, noDirname] }));
+
+      expect(sealed.error).toBeNull();
+      expect(utilityNames(sealed.value!)).toEqual([...requiredUtilities()].sort());
+      for (const tool of OPTIONAL_TOOLS) expect(utilityByName(sealed.value!).has(tool), tool).toBe(false);
+      expect(refusalOf(refused.error)).toEqual({ code: REFUSAL_CODE, detail: "toolchain-missing:dirname" });
+      // The default lists themselves: the optional set, and a required set without it or whoami (E6-0).
+      expect(CCC_TOOLCHAIN_OPTIONAL_TOOLS).toEqual(OPTIONAL_TOOLS);
+      expect(CCC_TOOLCHAIN_REQUIRED_TOOLS.filter((tool) => OPTIONAL_TOOLS.includes(tool) || tool === "whoami")).toEqual([]);
+      expect(CCC_TOOLCHAIN_GNU_TOOLS).not.toContain("whoami");
+      expect(CCC_TOOLCHAIN_REQUIRED_TOOLS.slice(0, 6)).toEqual(["bash", "sh", "node", "git", "task", "rg"]);
     });
 
     it("takes the first directory on the path that holds a usable candidate, and inside one directory the unprefixed name before the g-prefixed one", async () => {
@@ -249,19 +350,22 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       await symlink(join(brew, "gsed"), join(gnubin, "sed"));
       await stub(gnubin, "gsed");
       await stub(earlier, "gcat");
+      // An unprefixed cat in a later directory: a name-first search would take it over earlier/gcat.
+      await stub(gnubin, "cat");
 
       const { value: toolchain, error } = await settle(discoverCccToolchain({
         searchPath: [...PLATFORM_DIRS, earlier, gnubin, brew],
         required: ["cat", "sed"],
+        optional: [],
       }));
 
       expect(error).toBeNull();
       const utilities = utilityByName(toolchain!);
       expect(utilities.get("sed")).toMatchObject({ path: join(brew, "gsed"), name: "sed" });
-      expect(utilities.get("cat")).toMatchObject({ path: join(earlier, "gcat"), name: "cat" });
+      expect(utilities.get("cat")).toEqual({ path: join(earlier, "gcat"), sha256: sha256(join(earlier, "gcat")), name: "cat" });
     });
 
-    it("rejects a malformed required name with a TypeError before any search, and ignores relative search-path entries, while the absolute entry is searched", async () => {
+    it("rejects a malformed required or optional name with a TypeError before any search, and ignores relative search-path entries, while the absolute entry is searched", async () => {
       const root = await fixtureRoot();
       const brew = await brewDir(root);
       // A relative entry that would resolve, from this process's cwd, to a directory holding another gcat.
@@ -272,28 +376,63 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(isAbsolute(relativeEntry)).toBe(false);
 
       const malformed = await settle(discoverCccToolchain({ searchPath: [brew], required: ["../cat"] }));
+      const malformedOptional = await settle(discoverCccToolchain({ searchPath: [brew], required: ["cat"], optional: ["../grep"] }));
       const relativeFirst = await settle(discoverCccToolchain({ searchPath: [relativeEntry, brew], required: ["cat"] }));
       const absoluteFirst = await settle(discoverCccToolchain({ searchPath: [elsewhere, brew], required: ["cat"] }));
 
       expect(malformed.error).toBeInstanceOf(TypeError);
+      expect(malformedOptional.error).toBeInstanceOf(TypeError);
+      expect((malformedOptional.error as Error).message).toContain('"../grep"');
       expect(relativeFirst.error).toBeNull();
       expect(utilityByName(relativeFirst.value!).get("cat")?.path).toBe(join(brew, "gcat"));
       expect(utilityByName(absoluteFirst.value!).get("cat")?.path).toBe(join(elsewhere, "gcat"));
     });
   });
 
+  describe("default search path (this host's Homebrew)", () => {
+    it("keeps user-writable directories off the default search path, so a tool found only in a PATH directory such as ~/.local/bin is missing by default and found when the caller passes that directory explicitly", async () => {
+      const root = await fixtureRoot();
+      const userBin = join(root, "home", ".local", "bin");
+      await mkdir(userBin, { recursive: true });
+      const tool = `ccc-x1b-user-tool-${randomBytes(4).toString("hex")}`;
+      await stub(userBin, tool);
+      // The operator's PATH names the user-writable directory first, as this host's ~/.local/bin and ~/go/bin are.
+      const savedPath = process.env.PATH;
+      process.env.PATH = `${userBin}:${savedPath ?? ""}`;
+      let defaults: readonly string[];
+      try {
+        defaults = cccToolchainDefaultSearchPath();
+      } finally {
+        if (savedPath === undefined) delete process.env.PATH;
+        else process.env.PATH = savedPath;
+      }
+
+      const byDefault = await settle(discoverCccToolchain({ searchPath: defaults, required: [tool], optional: [] }));
+      const explicit = await settle(discoverCccToolchain({ searchPath: [...defaults, userBin], required: [tool], optional: [] }));
+
+      expect(refusalOf(byDefault.error)).toEqual({ code: REFUSAL_CODE, detail: `toolchain-missing:${tool}` });
+      expect(explicit.error).toBeNull();
+      expect(utilityByName(explicit.value!).get(tool)?.path).toBe(join(userBin, tool));
+      expect(defaults).not.toContain(userBin);
+      expect(defaults[0]).toBe("/opt/homebrew/bin");
+      expect(defaults.filter((entry) => !entry.startsWith("/opt/homebrew/"))).toEqual([]);
+    });
+  });
+
   describe("host scan (positive control)", () => {
-    it("finds and seals bash, sh, node, git, task, rg and cat on this host from the default search path, and the sealed cat (from gcat) runs as cat inside X1's sandbox with task, rg and git", async () => {
-      const scan = await settle(discoverCccToolchain({
-        searchPath: cccToolchainDefaultSearchPath(),
-        required: ["bash", "sh", "node", "git", "task", "rg", "cat"],
-      }));
+    it("discovers the default toolchain on this host from the Homebrew-only default search path, every sealed file under /opt/homebrew, and the sealed cat (from gcat) runs as cat inside X1's sandbox with task, rg and git", async () => {
+      const scan = await settle(discoverCccToolchain({ searchPath: cccToolchainDefaultSearchPath() }));
       expect(scan.error).toBeNull();
       const toolchain = scan.value!;
-      const cat = utilityByName(toolchain).get("cat");
+      const utilities = utilityByName(toolchain);
+      for (const tool of requiredUtilities()) expect(utilities.has(tool), tool).toBe(true);
+      for (const name of utilities.keys()) expect(requiredUtilities().includes(name) || OPTIONAL_TOOLS.includes(name), name).toBe(true);
+      expect(utilities.has("whoami")).toBe(false);
+      const cat = utilities.get("cat");
       expect(cat?.name).toBe("cat");
       expect(basename(cat!.path)).toBe("gcat");
       for (const executable of [toolchain.bash, toolchain.sh, toolchain.node, toolchain.git, ...toolchain.utilities]) {
+        expect(executable.path.startsWith("/opt/homebrew/"), executable.path).toBe(true);
         expect(executable.path).not.toMatch(APPLE_PLATFORM);
         expect(readFileSync(executable.path).subarray(0, 2).toString("latin1")).not.toBe("#!");
       }

@@ -1,9 +1,9 @@
 /*
-FNXC:CccShellCompat 2026-10-14-15:40:
+FNXC:CccShellCompat 2026-10-14-17:25:
 Card X1b (request-to-code PRD v3 §8, D12; errata E2 "out of scope for X1",
-E4-B): run package commands through the sealed toolchain inside X1's confined
-shell. Required before the I3 held-out cases; I2 (pure `node --test` with
-Taskfile) needs only discovery.
+E4-B; repair 1 per E6-B): run package commands through the sealed toolchain
+inside X1's confined shell. Required before the I3 held-out cases; I2 (pure
+`node --test` with Taskfile) needs only discovery.
 
 The constraint, measured on the M5 Max: inside X1's sandbox `process-exec` is
 admitted only under the per-instance clone directory, and macOS checks it on
@@ -39,22 +39,32 @@ Where it lives: `<scratch>/toolchains/ccc-shell-compat-<digest>/`. X1's profile
 denies every write under `<scratch>/toolchains/` (E2-24) and admits reads of
 the scratch root, so the dispatcher is read-only to every confined command.
 The directory is published by an atomic rename and its bytes are re-checked
-before every exec; a changed or extra file refuses the exec.
+before every exec; a changed file, or an extra file in the directory itself or
+in its wrappers directory, refuses the exec (E6-B item 3).
 
 `withCccShellCompat(operations, …)` prefixes each command with one line that
 exports `BASH_ENV` and sources the dispatcher (the first bash cannot read
 `BASH_ENV` from its environment: X1 seals the environment and refuses
 `BASH_`-prefixed task variables). It returns the same operations with only
-`exec` replaced, so `dispose` is X1's own; `cccConfinedShellLastClosure` must
-be read from the inner operations.
+`exec` replaced, so `dispose` is X1's own.
 
-Residual, recorded: a shim run by an explicit path (`./node_modules/.bin/x`),
-or found through a PATH entry added after the shell started, still fails with
-"Operation not permitted", and so does a script spawned by a non-bash parent
-(Taskfile's built-in shell, node's `child_process` without a shell): only bash
-can consult `command_not_found_handle`. pnpm and yarn have no wrapper: their
-Homebrew installs are not readable inside the sandbox and corepack needs the
-network.
+Recorded, not fixed (E6-B item 6):
+- `cccConfinedShellLastClosure` must be read from the inner operations, not
+  from the wrapper (X1 keys its closure records by the inner object); WR does
+  this.
+- Taskfile: go-task runs `cmds` in its own built-in shell, so neither the
+  `BASH_ENV` dispatcher nor `command_not_found_handle` applies there. Verifier
+  Taskfiles that run package scripts wrap them in `bash -c`, which VP or GG
+  enforce (E6-0, an I3 prerequisite; I2's target runs `node --test` directly).
+- `exec`: bash's `exec` builtin never consults `command_not_found_handle`, so
+  `exec <shim>` fails with "not found" (127), in a command or a package script.
+- PATH changes: a shim run by an explicit path (`./node_modules/.bin/x`), or
+  found through a PATH entry added after the shell started, still fails with
+  "Operation not permitted"; so does a script spawned by any other non-bash
+  parent (node's `child_process` without a shell), and a `#!/bin/sh` shim that
+  calls another shim (bash started as `sh` does not read `BASH_ENV`).
+- pnpm and yarn have no wrapper: their Homebrew installs are not readable
+  inside the sandbox and corepack needs the network.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -240,10 +250,19 @@ function isRealDirectory(path: string): boolean {
   }
 }
 
+/** Throws unless `dir` holds exactly the `expected` entries. */
+function assertExactListing(dir: string, expected: readonly string[]): void {
+  const want = [...expected].sort();
+  const present = readdirSync(dir).sort();
+  if (present.join("\u0000") !== want.join("\u0000")) {
+    throw new Error(`ccc-shell-compat: ${dir} holds ${JSON.stringify(present)}, not ${JSON.stringify(want)}`);
+  }
+}
+
 /**
  * Re-checks an install against the bytes this toolchain implies: the directory
- * is a real directory, every file holds its bytes, and the wrappers directory
- * holds nothing else. Throws on any difference.
+ * is a real directory, every file holds its bytes, and neither the directory
+ * nor its wrappers directory holds anything else. Throws on any difference.
  */
 export function verifyCccShellCompat(install: CccShellCompatInstall, toolchain: CccSealedToolchain): void {
   const files = compatFiles(toolchain);
@@ -260,11 +279,12 @@ export function verifyCccShellCompat(install: CccShellCompatInstall, toolchain: 
     }
     if (bytes !== file.content) throw new Error(`ccc-shell-compat: ${path} does not hold the installed bytes`);
   }
-  const expected = files.filter((file) => file.path.startsWith(`${WRAPPER_DIR}/`)).map((file) => file.path.slice(WRAPPER_DIR.length + 1)).sort();
-  const present = readdirSync(install.wrapperDir).sort();
-  if (present.join("\u0000") !== expected.join("\u0000")) {
-    throw new Error(`ccc-shell-compat: ${install.wrapperDir} holds ${JSON.stringify(present)}, not ${JSON.stringify(expected)}`);
-  }
+  // FNXC:CccShellCompat 2026-10-14-17:25: E6-B item 3: an extra file at either level refuses, as the header claims.
+  assertExactListing(install.dir, [BASH_ENV_FILE, WRAPPER_DIR]);
+  assertExactListing(
+    install.wrapperDir,
+    files.filter((file) => file.path.startsWith(`${WRAPPER_DIR}/`)).map((file) => file.path.slice(WRAPPER_DIR.length + 1)),
+  );
 }
 
 /**

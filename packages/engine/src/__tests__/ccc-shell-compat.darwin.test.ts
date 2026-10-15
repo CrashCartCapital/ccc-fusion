@@ -18,12 +18,21 @@ are the same instance, with and without `withCccShellCompat`.
 
 The single `skipIf(process.platform !== "darwin")` is the only skip form a
 Darwin-tagged planning suite may carry (ADR D, skip policy).
+
+FNXC:CccShellCompat 2026-10-14-17:15:
+Repair 1 (errata E6-B items 1 and 3). The pnpm-style `#!/bin/sh` shim prints
+`$BASH` and whether `SHELLOPTS` holds `posix`, so the test pins which clone
+interpreter ran it: bash started as the clone's `sh` (POSIX mode on) when `sh`
+was sealed from bash, or dash (no `$BASH`) when it was sealed from dash; the
+mutant `sh|dash) tool=bash` fails. A `#!/usr/bin/env -S node <flag>` shim runs
+through the clone's node with its flag, and an extra file planted in the shim
+layer's directory or its wrappers directory refuses the next exec.
 */
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
-import { appendFile, chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import {
@@ -51,6 +60,9 @@ const PNPM_SHIM = [
   "    *CYGWIN*|*MINGW*|*MSYS*) basedir=unsupported ;;",
   "esac",
   'echo "SHIM-ARG0=$0"',
+  // Which clone interpreter runs this file: bash started as `sh` sets $BASH to that path and turns POSIX mode on.
+  'echo "SH-BASH=${BASH-unset}"',
+  'case ":${SHELLOPTS-}:" in *:posix:*) echo "SH-POSIX=on" ;; *) echo "SH-POSIX=off" ;; esac',
   'exec node "$basedir/../hello/cli.js" "$@"',
   "",
 ].join("\n");
@@ -99,6 +111,11 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
       writeFile(join(worktree, "node_modules", "hi", "bin.js"), '#!/usr/bin/env node\nconsole.log("HI-NODE " + process.argv.slice(2).join(" ") + " exec=" + process.execPath);\n'),
       writeFile(join(bin, "hello"), PNPM_SHIM),
       writeFile(join(bin, "py-tool"), "#!/usr/bin/env python3\nprint('never')\n"),
+      writeFile(join(bin, "envs-tool"), [
+        "#!/usr/bin/env -S node --no-warnings",
+        'console.log("ENVS-NODE execArgv=" + process.execArgv.join(",") + " args=" + process.argv.slice(2).join(",") + " exec=" + process.execPath);',
+        "",
+      ].join("\n")),
       writeFile(join(worktree, "package.json"), `${JSON.stringify({
         name: "ccc-shell-compat-fixture",
         version: "1.0.0",
@@ -110,6 +127,7 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
     await symlink("../hi/bin.js", join(bin, "hi-node"));
     await chmod(join(bin, "hello"), 0o755);
     await chmod(join(bin, "py-tool"), 0o755);
+    await chmod(join(bin, "envs-tool"), 0o755);
     raw = createCccConfinedBashOperations({
       profileId: "ccc-writer-shell.v1",
       worktreeRoot: worktree,
@@ -177,15 +195,43 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
     expect(dirname(exec)).toMatch(CLONE_BIN);
     expect(line(confined.output, "script-shell")).toBe(join(dirname(exec), "bash"));
     expect(line(confined.output, "SHIM-ARG0")).toBe(join(worktree, "node_modules", ".bin", "hello"));
+    // The #!/bin/sh shim ran from the clone's sh: bash started as sh (POSIX mode), or dash, which sets no $BASH.
+    if (toolchain.sh.path === toolchain.bash.path) {
+      expect(line(confined.output, "SH-BASH")).toBe(join(dirname(exec), "sh"));
+      expect(line(confined.output, "SH-POSIX")).toBe("on");
+    } else {
+      expect(basename(toolchain.sh.path)).toBe("dash");
+      expect(line(confined.output, "SH-BASH")).toBe("unset");
+    }
     expect(line(confined.output, "hello-rc")).toBe("0");
     expect(confined.output).toContain(`HI-NODE c exec=${exec}`);
     expect(line(confined.output, "hi-rc")).toBe("0");
     // Control: without the shim layer the same shims cannot run inside the sandbox.
     expect(plain.error).toBeNull();
+    expect(line(plain.output, "SH-BASH")).toBeUndefined();
     expect(line(plain.output, "script-shell")).toBe("");
     expect(plain.output).toContain("/bin/sh: bad interpreter: Operation not permitted");
     expect(line(plain.output, "hello-rc")).toBe("126");
     expect(line(plain.output, "hi-rc")).toBe("126");
+  });
+
+  it("runs a #!/usr/bin/env -S node shim through the toolchain node with the flags its shebang names, while the raw shell cannot run it", async () => {
+    const command = 'PATH="$PWD/node_modules/.bin:$PATH" bash -c \'envs-tool p q; echo "envs-rc=$?"\'';
+
+    const confined = await run(compat, command, worktree);
+    const plain = await run(raw, command, worktree);
+
+    expect(confined.error).toBeNull();
+    const match = /^ENVS-NODE execArgv=(\S*) args=(\S*) exec=(\S+)$/mu.exec(confined.output);
+    expect(match?.[1]).toBe("--no-warnings");
+    expect(match?.[2]).toBe("p,q");
+    expect(dirname(match?.[3] ?? "")).toMatch(CLONE_BIN);
+    expect(line(confined.output, "envs-rc")).toBe("0");
+    // Control: the raw shell finds the shim by PATH and cannot execute it inside the sandbox.
+    expect(plain.error).toBeNull();
+    expect(plain.output).toContain("bad interpreter: Operation not permitted");
+    expect(plain.output).not.toContain("ENVS-NODE");
+    expect(line(plain.output, "envs-rc")).toBe("126");
   });
 
   it("npm run starts its script shell from the toolchain bash, which loads the dispatcher and runs a .bin shim, while npm's default sh cannot run the shim", async () => {
@@ -249,6 +295,30 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
     expect(tampered.error).toBeInstanceOf(Error);
     expect((tampered.error as Error).message).toContain(`ccc-shell-compat: ${install.bashEnv} does not hold the installed bytes`);
     expect(tampered.output).toBe("");
+    expect(restored.error).toBeNull();
+    expect(line(restored.output, "ran-rc")).toBe("0");
+  });
+
+  it("refuses an exec once an extra file is planted in the shim layer's directory or in its wrappers directory, while the exec runs again once the file is removed", async () => {
+    const install = await installCccShellCompat({ toolchain, scratchRoot });
+    const outcomes: Record<string, Ran> = {};
+    for (const [key, dir] of [["top", install.dir], ["wrappers", install.wrapperDir]] as const) {
+      const planted = join(dir, "extra-planted");
+      await writeFile(planted, "planted\n");
+      try {
+        outcomes[key] = await run(compat, 'echo "ran-rc=$?"', worktree);
+      } finally {
+        await unlink(planted);
+      }
+    }
+    const restored = await run(compat, 'echo "ran-rc=$?"', worktree);
+
+    expect(outcomes.top.error).toBeInstanceOf(Error);
+    expect((outcomes.top.error as Error).message).toContain(`ccc-shell-compat: ${install.dir} holds ["bash-env","extra-planted","wrappers"]`);
+    expect(outcomes.top.output).toBe("");
+    expect(outcomes.wrappers.error).toBeInstanceOf(Error);
+    expect((outcomes.wrappers.error as Error).message).toContain(`ccc-shell-compat: ${install.wrapperDir} holds ["extra-planted","npm","npx"]`);
+    expect(outcomes.wrappers.output).toBe("");
     expect(restored.error).toBeNull();
     expect(line(restored.output, "ran-rc")).toBe("0");
   });
