@@ -302,7 +302,8 @@ function watchedSessions(factory: CccPlanningSessionFactory, stageSignal: AbortS
       its signal is ended at the limit, and a session the factory hands back after the deadline is disposed in the
       background (its dispose is never awaited by the stage), so a late session is never used and never leaks.
       */
-      const opening = factory.open({ ...input, signal: attempt.signal });
+      // FNXC:CccPlanningHost 2026-10-15-05:24: synchronous open failures must use the same watchdog cleanup path.
+      const opening = Promise.resolve().then(() => factory.open({ ...input, signal: attempt.signal }));
       let session: CccPlanningSession;
       try {
         session = await Promise.race([opening, openDeadline]);

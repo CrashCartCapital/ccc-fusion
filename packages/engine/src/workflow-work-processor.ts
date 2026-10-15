@@ -448,17 +448,40 @@ async function runPlanningWorkflowWorkItem(
     await settle(() => releaseQuietly("runnable", { lastError: reason.message }), reason, flush);
     return failed(reason.message);
   };
-  /** A held or cancelling run: hold the item, then let L1 complete a cancellation if one is due (D45). */
+  /** FNXC:CccPlanningHost 2026-10-15-05:20: Resume or answer may land before the held write; read back after settling. */
   const holdWorkItem = async (hold: CccPlanningHoldContext): Promise<void> => {
     const blockedReason = hold.disposition === "cancel"
       ? "ccc-planning:cancelling"
       : ["ccc-planning", hold.runState, hold.code, hold.decisionId]
         .filter((part): part is string => typeof part === "string" && part.length > 0)
         .join(":");
+    let held = false;
     await settle(
-      () => releaseQuietly("held", { blockedReason, lastError: null }),
+      async () => { held = await releaseQuietly("held", { blockedReason, lastError: null }); return held; },
       new Error(hold.disposition === "cancel" ? "ccc-planning-cancelling" : `ccc-planning-held:${hold.runState}`),
     );
+    if (!held) return;
+    let requeue = false;
+    try {
+      const ledger = cccPlanningHostLedger(store);
+      if (!ledger) throw new Error("ccc planning ledger is unwired");
+      const run = await ledger.inspectCccPlanningRun(workItem.runId);
+      requeue = run.state === "admitted" || run.state === "running"
+        || (run.mode === "build" && (run.state === "spec_ready" || run.state === "importing"));
+    } catch (error) {
+      diagnostics.push(`ccc planning held read-back deferred: ${message(error)}`);
+      requeue = true;
+    }
+    if (!requeue) return;
+    try {
+      await store.transitionWorkflowWorkItem!(workItem.id, "runnable", {
+        now: opts.now, expectedState: "held", expectedAttempt: workItem.attempt,
+        attempt: workItem.attempt + 1, leaseOwner: null, leaseExpiresAt: null, blockedReason: null, lastError: null,
+      });
+    } catch (error) {
+      // A concurrent control may already have requeued or ended the item; never overwrite its new attempt.
+      diagnostics.push(`ccc planning held requeue skipped: ${message(error)}`);
+    }
   };
   /** Conclude a failure that is not a hold before the work item moves (W3 repair 1). */
   const concludeFailure = async (base: WorkflowTaskRuntimeResult, reason: string): Promise<WorkflowTaskRuntimeResult> => {

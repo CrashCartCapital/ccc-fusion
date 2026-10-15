@@ -802,6 +802,19 @@ describe("ccc planning host with a registered runtime", () => {
   });
 
   describe("session watchdog (D40)", () => {
+    it("H1z watchdog: a synchronous session-open failure clears the timer and abort listener", async () => {
+      vi.useFakeTimers();
+      const world = createWorld({ state: "running" });
+      const { stages } = recordingStages(world, { preflight: sessionStage(world, 1) });
+      const before = vi.getTimerCount();
+      const remove = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+      const factory: CccPlanningSessionFactory = { open: () => { throw new Error("synchronous open failure"); } };
+      const result = await processPlanning(world, planningRuntime(world, stages, factory));
+      expect(result.runtime?.disposition).toBe("failed");
+      expect(vi.getTimerCount()).toBe(before);
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+    });
+
     function timedSessions(durationsMs: readonly number[]) {
       const opened: Array<{ signal: AbortSignal; openedAt: number; abortedAfterMs: number | null; disposed: number }> = [];
       const factory: CccPlanningSessionFactory = {
