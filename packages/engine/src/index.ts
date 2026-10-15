@@ -308,6 +308,7 @@ export {
 } from "./runtimes/in-process-runtime.js";
 export {
   isCccCampaignTask,
+  isCccCustodyGuardedTask,
   isImportedCccCampaignTask,
 } from "./ccc-campaign-routing.js";
 export {
@@ -576,6 +577,9 @@ export {
 } from "./merger-squash-audit.js";
 export { reviewStep, type ReviewType, type ReviewVerdict, type ReviewResult, type ReviewOptions } from "./reviewer.js";
 export { createFnAgent, promptWithFallback, describeModel, setHostExtensionPaths, getHostExtensionPaths, wrapToolsWithActionGate, type AgentOptions, type AgentResult } from "./pi.js";
+// FNXC:CccPlanning 2026-10-14-21:05 (INT-2d, E7-0): the 5-key bound-route marker for linked writers; WR attaches
+// it and uses the returned controller, BF supplies the values.
+export { attachCccProviderAttemptBoundRoute, type CccProviderAttemptBoundRoute } from "./pi.js";
 export { resolveMcpServersForRuntime, resolveMcpServersForStore, type ResolvedMcpServersForRuntime } from "./mcp-resolution.js";
 export { discoverMcpServers, type DiscoverMcpServersOptions, type DiscoverMcpServersResult } from "./mcp-discovery-service.js";
 export { runtimeSupportsMcp, logMcpForwardingSkipped } from "./mcp-runtime-support.js";

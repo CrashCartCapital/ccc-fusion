@@ -2302,3 +2302,9 @@ export * from "./task-document-concurrency.js";
 // planning contracts (custody guards in triage.ts and ccc-campaign-routing.ts) resolves
 // them under the engine-core gate alias too, instead of reading undefined.
 export * from "./ccc-planning/index.js";
+// FNXC:CccPlanning 2026-10-14-21:05 (INT-2d, D34 parent barrel): the planning store operations of cards A1
+// (artifact publish/read/list/closure) and L1 (call ledger, control, cancellation, including E7's
+// completeCccPlanningCancellationWithin) become package exports, so the engine and CLI cards (H1, RV, WR, CL1)
+// import one definition through @fusion/core instead of reaching into core's task-store files.
+export * from "./task-store/ccc-planning-artifact-ops.js";
+export * from "./task-store/ccc-planning-ops.js";

@@ -1,5 +1,5 @@
 import { isCccPlanningCustodyTask } from "@fusion/core";
-import { isCccCampaignTask } from "@fusion/engine";
+import { isCccCustodyGuardedTask } from "@fusion/engine";
 import { ApiError, conflict } from "../api-error.js";
 import type { ApiRoutesContext } from "./types.js";
 
@@ -46,7 +46,7 @@ export function cccCampaignTaskMutationConflict(taskIds: string[]): ApiError {
 
 /*
 FNXC:CccPlanningCustody 2026-10-14-13:41 (card G1, D22):
-A held request-to-code planning task (K1 marker: `ccc-plan:` run-id lineage, paused, not user-paused) is owned by the `fn plan` CLI the same way an imported campaign task is owned by `fn prd`, so the same guard refuses it with the same stable code; `custody: "planning"` and the message tell the operator which CLI to use. The predicate is composed here from `isCccCampaignTask` and core's `isCccPlanningCustodyTask`, which is exactly the engine's guard-only `isCccCustodyGuardedTask`: the engine barrel that would export that name is parent-owned (D34) and not yet re-exported.
+A held request-to-code planning task (K1 marker: `ccc-plan:` run-id lineage, paused, not user-paused) is owned by the `fn plan` CLI the same way an imported campaign task is owned by `fn prd`, so the same guard refuses it with the same stable code; `custody: "planning"` and the message tell the operator which CLI to use. The guard asks the engine's guard-only `isCccCustodyGuardedTask` (exported at INT-2d, E5-G1 item 6) whether the task is held, then core's `isCccPlanningCustodyTask` only to choose which CLI the message names.
 */
 export const CCC_TASK_CUSTODY_LOOKUP_FAILED_CODE = "CCC_TASK_CUSTODY_LOOKUP_FAILED";
 
@@ -144,12 +144,10 @@ export function registerCccCampaignTaskMutationGuard(ctx: ApiRoutesContext): voi
       next(custodyLookupFailed(taskId, error));
       return;
     }
-    if (task && isCccPlanningCustodyTask(task)) {
-      next(cccPlanningTaskMutationConflict([taskId]));
-      return;
-    }
-    if (task && isCccCampaignTask(task)) {
-      next(cccCampaignTaskMutationConflict([taskId]));
+    if (task && isCccCustodyGuardedTask(task)) {
+      next(isCccPlanningCustodyTask(task)
+        ? cccPlanningTaskMutationConflict([taskId])
+        : cccCampaignTaskMutationConflict([taskId]));
       return;
     }
     next();
