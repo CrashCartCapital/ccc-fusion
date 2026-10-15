@@ -56,6 +56,7 @@ export const CCC_PLANNING_DISPOSABLE_TARGET_CHECKS = Object.freeze({
   ownerMarkerDigest: "owner-marker-digest",
   ownerMarkerInvalid: "owner-marker-invalid",
   ownerMarkerRepository: "owner-marker-repository",
+  gitDirectory: "git-directory-owned",
   noRemote: "no-remote",
   noRemoteConfig: "no-remote-config",
   headCommit: "head-commit",
@@ -152,6 +153,22 @@ export async function assertCccPlanningOwnedDisposableTarget(
   if (sha256Hex(marker.value) !== target.ownershipMarker.sha256) return refused(CHECKS.ownerMarkerDigest);
   const markerVerdict = ownerMarkerVerdict(marker.value, target.repositoryRealpath);
   if (markerVerdict !== null) return refused(markerVerdict);
+
+  /*
+  FNXC:CccPlanningDisposableTarget 2026-10-15-05:25:
+  AU4 repair 2: a matching marker and working tree do not own an external Git directory. Reject .git symlinks, gitfiles and shared common directories before git reads their configuration, index or objects. A canonical child HEAD also proves .git is a directory without changing the frozen filesystem dependency API.
+  */
+  const gitDirectory = join(target.repositoryRealpath, ".git");
+  for (const requiredPath of [gitDirectory, join(gitDirectory, "HEAD")]) {
+    const resolved = await answer(() => realpath(requiredPath));
+    if (!resolved.answered || resolved.value !== requiredPath) return refused(CHECKS.gitDirectory);
+  }
+  try {
+    await realpath(join(gitDirectory, "commondir"));
+    return refused(CHECKS.gitDirectory);
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code !== "ENOENT") return refused(CHECKS.gitDirectory);
+  }
 
   // 4. to 6. git. Only now: the repository is tied to a marker the receipt's digest covers.
   const runGit = async (args: readonly string[], cwd: string) => {

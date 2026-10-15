@@ -13,7 +13,7 @@ Refusals are `CccPlanningDisposableTargetError` with a `CCC_PLANNING_DISPOSABLE_
 */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { access, constants, lstat, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
+import { access, constants, lstat, mkdir, open, readdir, realpath, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL, fileURLToPath, pathToFileURL } from "node:url";
@@ -37,7 +37,7 @@ const PG_READY_DELAY_MS = 1000;
 /** Directories the layout creates empty (section 4.1), `home/.fusion` and `request` included. */
 const LAYOUT_DIRECTORIES = Object.freeze(["home", "install", "pg", "tmp", "request", "authority", "evidence"]);
 /** Paths the build owns: it refuses when one already exists, so it can never overwrite earlier work. */
-const OWNED_PATHS = Object.freeze(["owner.json", "target", "request", "authority", path.join("home", ".fusion", "settings.json")]);
+const OWNED_PATHS = Object.freeze(["owner.json", "target", "request", "authority", path.join("home", ".fusion", "settings.json"), path.join("evidence", "pg.log")]);
 
 /**
  * The slot-to-role map that reads K1's policy: the pin for each slot is the model of the role the contract names for it
@@ -275,6 +275,19 @@ export async function provisionCccPlanningDisposablePostgres({ root, pgBinDir = 
 
   const port = await choosePort();
   const commands = cccPlanningDisposablePostgresCommands({ pgBinDir, dataDir, logPath, port });
+  /*
+  FNXC:CccPlanningDisposableTarget 2026-10-15-05:25:
+  AU4 repair 2: pg_ctl follows its log path, so reserve this owned leaf exclusively before initdb or startup. wx refuses a file or symlink created after the layout preflight; failure leaves every PostgreSQL command uncalled.
+  */
+  try {
+    const log = await open(logPath, "wx", 0o600);
+    await log.close();
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new CccPlanningDisposableTargetError("EXISTS", `${logPath} already exists; the owned PostgreSQL log must be a fresh file`);
+    }
+    throw error;
+  }
   await exec(commands.initdb.file, commands.initdb.args);
   try {
     // pg_ctl can start the server and still report failure (for example, a readiness timeout).

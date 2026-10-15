@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -476,6 +476,37 @@ describe("ccc planning disposable target builder", () => {
     expect(JSON.stringify(calls)).not.toContain("foreign-pg-root");
   });
 
+  it("refuses a pre-existing or late-created pg.log symlink before PostgreSQL can append outside the scratch root", async () => {
+    for (const late of [false, true]) {
+      sequence += 1;
+      const holder = join(base, `${sequence}-pg-log`);
+      const root = join(holder, "ccc-planning-i2-pg-log");
+      const logPath = join(root, "evidence", "pg.log");
+      const outside = join(holder, "outside.log");
+      await mkdir(join(root, "evidence"), { recursive: true });
+      await writeFile(outside, "outside unchanged\n");
+      if (!late) await symlink(outside, logPath);
+      const calls: string[] = [];
+      const refusalCode = await builder.buildCccPlanningDisposableTarget({
+        root, omniRouteBaseUrl: OMNIROUTE_URL, pins: PINS, provisionPostgres: true,
+        postgres: {
+          pgBinDir: "/pg/bin", pickPort: async () => 55123,
+          binariesPresent: async () => { if (late) await symlink(outside, logPath); return null; },
+          run: async (file: string, args: string[]) => {
+            calls.push(file.split("/").at(-1)!);
+            // Fake only pg_ctl's log append: no PostgreSQL process is started.
+            if (args.at(-1) === "start") await appendFile(logPath, "PostgreSQL log\n");
+            return { stdout: "", stderr: "" };
+          },
+        },
+      }).then(() => "resolved", (error: { code?: string }) => error.code ?? "unclassified");
+      expect({ refusalCode, calls, outside: await readFile(outside, "utf8") }).toEqual({
+        refusalCode: "CCC_PLANNING_DISPOSABLE_TARGET_EXISTS", calls: [], outside: "outside unchanged\n",
+      });
+      if (!late) await expect(stat(join(root, "target"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
   it("attempts exact owned PostgreSQL teardown when start fails and preserves a teardown failure", async () => {
     for (const stopFails of [false, true]) {
       sequence += 1;
@@ -696,6 +727,29 @@ describe("assertCccPlanningOwnedDisposableTarget", () => {
     expect(await run(inputOf(c, { receipt: rootAlias }))).toEqual(refusal(CHECKS.scratchRootRealpath));
     const repoAlias = receiptOf(c.report, (target) => { target.repositoryRealpath = join(c.root, "target-alias"); });
     expect(await run(inputOf(c, { receipt: repoAlias }))).toEqual(refusal(CHECKS.repositoryRealpath));
+  });
+
+  it("refuses an external .git symlink, gitfile or common directory before any git command; the owned standalone control passes", async () => {
+    for (const kind of ["symlink", "gitfile", "commondir"]) {
+      const c = await control(`git-metadata-${kind}`);
+      expect(await run(inputOf(c))).toEqual(ADMITTED);
+      const gitDir = join(c.repo, ".git");
+      const outside = join(c.holder, "external-git");
+      await rename(gitDir, outside);
+      if (kind === "symlink") await symlink(outside, gitDir);
+      else if (kind === "gitfile") await writeFile(gitDir, `gitdir: ${outside}\n`);
+      else {
+        await mkdir(gitDir);
+        await writeFile(join(gitDir, "HEAD"), await readFile(join(outside, "HEAD")));
+        await writeFile(join(gitDir, "index"), await readFile(join(outside, "index")));
+        await writeFile(join(gitDir, "commondir"), `${outside}\n`);
+      }
+      const calls: string[] = [];
+      const result = await run(inputOf(c, {
+        git: async (args, cwd) => { calls.push(args.join(" ")); return realGit(args, cwd); },
+      }));
+      expect({ result, calls }).toEqual({ result: refusal("git-directory-owned"), calls: [] });
+    }
   });
 
   it("refuses a receipt that is not an owned disposable target without remotes, or whose fields are not what the check reads", async () => {
