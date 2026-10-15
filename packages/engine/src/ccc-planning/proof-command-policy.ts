@@ -12,13 +12,17 @@ import {
 
 /*
 FNXC:CccPlanningProofCommands 2026-10-14-18:52:
-Card GG, verify-v2 item 41 (D19, challenge 29). A plan G4 admits must not be refused later by the importer's semantic-proof custody check, so this policy mirrors that check's rules (semantic-proof-custody.ts: the PROOF_COMMAND and VERIFY_TARGET patterns near :29, the literal-command and strict-target parsers near :211-292, verifyTaskfile near :297-350, and hydrateProof with assertClosureDisjoint near :1266-1330) over the plan instead of a repository: every proof command is exactly `task verify:<proof id>`; the bundle's Taskfile.yml declares that target with exactly one literal `node <harness> <candidate...>` command; the verifier closure (Taskfile.yml as the one task runner, the one harness, any fixtures) consists of files of the VP verifier bundle, which B1 commits and the custody check reads at that base commit; no closure path is the same as, inside or above any task's owned path or write root; every candidate lies inside the write roots of the task that runs the proof and is not a closure path; and writer tasks own only `src/**` and `bin/**`.
+Card GG, verify-v2 item 41 (D19, challenge 29). A plan G4 admits must not be refused later by the importer's semantic-proof custody check, so this policy mirrors that check's rules (semantic-proof-custody.ts: the PROOF_COMMAND and VERIFY_TARGET patterns near :29, the literal-command and strict-target parsers near :211-292, verifyTaskfile near :297-350, and hydrateProof with assertClosureDisjoint near :1266-1330) over the plan instead of a repository: every proof command is exactly `task verify:<proof id>`; the bundle's Taskfile.yml declares that target with exactly one literal `node <harness> <candidate...>` command; the verifier closure (Taskfile.yml as the one task runner, the one harness, any fixtures) consists of files of the VP verifier bundle, which B1 commits and the custody check reads at that base commit; no closure path is the same as, inside or above any task's owned path or write root; every candidate lies inside an owned path or write root of a task that runs the proof and is not a closure path; and writer tasks own only `src/**` and `bin/**`.
 FNXC:CccPlanningProofCommands 2026-10-14-18:52:
 Paths are compared on K1's `cccPlanningPathComparisonKey` (E2-13, E2-40a) wherever two spellings could name one file on the I2 host's case- and normalization-insensitive volume, so `./TASKFILE.yml` is the writer-owned `Taskfile.yml` and `TEST/Tokenizer.test.mjs` overlaps the harness `test/tokenizer.test.mjs`. Where the custody check compares exact strings to admit something (the task runner must be `Taskfile.yml`, a closure file must exist at its exact path in the bundle, a candidate must lie inside a write root), the policy keeps the exact comparison too, because an equivalent spelling the custody check would not match must not pass here. Each violation is a CCC_PLANNING_GRAPH_INADMISSIBLE diagnostic whose detail names the rule, the proof (or the task) and the path.
 FNXC:CccPlanningProofCommands 2026-10-14-18:52:
 The frozen signature is `(taskPlan, verifierBundle)`, which derives each proof the way the importer will see it from the bundle: command `task <taskfileTask>`, closure `Taskfile.yml`, the target's harness and the proof's other files as fixtures, and the target's candidate arguments. G4 passes a third argument, the proposal's own proof definitions, so the commands, closures and candidates that will actually be compiled are the ones checked against the bundle. The Python adapter profile is not modelled: a planning bundle has no verifier profile, so a `python3` target is refused (fail-closed). The E6-0 `bash -c` rule for package scripts is an I3 prerequisite and is not enforced here.
 FNXC:CccPlanningProofCommands 2026-10-14-21:10:
 Errata E9 GG item 1, rule `write-root-canonical`. Overlap is compared on the comparison key, but a path is admitted only in its exact canonical spelling, because the custody check runs `canonicalRelativePath` on every task's owned paths and write roots before comparing exact strings (semantic-proof-custody.ts:1271, inside assertClosureDisjoint; importer.ts passes every route's ownedPaths and allowedWriteRoots as model write roots), and the importer's execution policy refuses the same spellings plus surrounding whitespace and a path listed twice in one field (canonical.ts:353-391, exactTargetRelativePaths). K1's task-plan validator normalizes before its own checks, so without this rule G4 admitted `./src/x.mjs` or `src/x/`, spent the review calls, and import refused the plan. Each offending path of a task gets one diagnostic naming the task, the fields that hold it, the path and the rule it breaks.
+FNXC:CccPlanningProofCommands 2026-10-14-23:14:
+Errata E12 item 1 (card GGz), rule `closure-path-git-literal`. The custody check reads each closure file from the base commit with `git ls-tree -z --full-tree <commit> -- <path>` (semantic-proof-custody.ts:150) and refuses unless the one entry git lists has exactly that path (:164-167). Git reads a pathspec that starts with `:` as magic, so `:data.json` lists `data.json` and the custody check refuses the proof although the bundle holds the file. A closure path whose first character is `:` is therefore refused here; a `:` later in the path (`fixtures:x/words.txt`) is literal to git and stays admitted. Both are pinned against the real custody hydration in the parity test.
+FNXC:CccPlanningProofCommands 2026-10-14-23:14:
+Errata E12 item 3 (card GGz), rule `candidate-in-running-task-paths`, which replaces `candidate-in-own-write-roots`. The custody check does not hydrate a proof once per task: it runs once per proof with every route's owned paths and write roots as the model write roots (importer.ts:1509-1517, hydrateProof), so it admits a candidate inside any of them. IB1 makes a proof's candidates the owned paths of the tasks that name it (proposal.ts:261), which for a proof two tasks share is the union of both, and for an owned directory is the directory itself, outside any narrower write root. The rule G4 applies is the custody rule restricted to the proof's own tasks: each candidate lies, by exact spelling, inside an owned path or write root of at least one task that runs the proof. A candidate that matches one only on the comparison key is refused, because the custody check compares exact strings.
 */
 
 export type CccPlanningProofDefinition = Readonly<{
@@ -40,11 +44,12 @@ export const CCC_PLANNING_PROOF_COMMAND_RULES = Object.freeze([
   "target-candidates-match-proof",
   "closure-has-one-taskfile-runner",
   "closure-path-canonical",
+  "closure-path-git-literal",
   "closure-in-verifier-bundle",
   "closure-disjoint-from-write-roots",
   "candidate-path-canonical",
   "candidate-not-closure",
-  "candidate-in-own-write-roots",
+  "candidate-in-running-task-paths",
   "writer-owns-only-src-bin",
   "write-root-canonical",
 ] as const);
@@ -299,6 +304,10 @@ export function checkCccPlanningProofCommands(
     for (const entry of closure) {
       const problem = canonicalPathProblem(entry.path);
       if (problem) add("closure-path-canonical", subject, entry.path, problem);
+      if (typeof entry.path === "string" && entry.path.startsWith(":")) {
+        add("closure-path-git-literal", subject, entry.path,
+          "starts with \":\", which git reads as pathspec magic, so the custody check's `git ls-tree` lists another path and refuses the proof (semantic-proof-custody.ts:150, :164-167)");
+      }
       const key = cccPlanningPathComparisonKey(entry.path);
       const first = closureKeys.get(key);
       if (first !== undefined) add("closure-path-canonical", subject, entry.path, `is the same path as closure path ${first}`);
@@ -354,7 +363,8 @@ export function checkCccPlanningProofCommands(
     }
 
     // The candidates.
-    // The custody check hydrates a proof for each task that runs it, so a candidate must lie inside every such task's write roots.
+    // The custody check hydrates each proof once, against every route's owned paths and write roots (importer.ts:1509-1517);
+    // G4 restricts that to the tasks that run the proof: a candidate lies, by exact spelling, inside a path of at least one of them.
     const runningTasks = tasks.filter((task) => task.proofIds.includes(proof.id));
     const candidates = new Set<string>();
     for (const candidate of proof.candidateInputs) {
@@ -369,15 +379,14 @@ export function checkCccPlanningProofCommands(
       const closurePath = closureKeys.get(key);
       if (closurePath !== undefined) add("candidate-not-closure", subject, candidate, `is the verifier closure path ${closurePath}`);
       if (runningTasks.length === 0) {
-        add("candidate-in-own-write-roots", subject, candidate, "no task in the plan runs this proof, so the candidate lies in no task's write roots");
+        add("candidate-in-running-task-paths", subject, candidate, "no task in the plan runs this proof, so the candidate lies in no running task's owned paths or write roots");
+        continue;
       }
-      for (const task of runningTasks) {
-        if (task.roots.some((root) => isSameOrWithin(candidate, root))) continue;
-        const aliased = task.roots.find((root) => keyWithin(candidate, root));
-        add("candidate-in-own-write-roots", subject, candidate, aliased !== undefined
-          ? `matches task ${task.id} write root ${aliased} only on the comparison key; the custody check needs the exact spelling`
-          : `is outside the write roots of task ${task.id} (${task.roots.join(", ") || "none"})`);
-      }
+      if (runningTasks.some((task) => task.all.some((path) => isSameOrWithin(candidate, path)))) continue;
+      const aliased = runningTasks.flatMap((task) => task.all.filter((path) => keyWithin(candidate, path)).map((path) => `task ${task.id} path ${path}`))[0];
+      add("candidate-in-running-task-paths", subject, candidate, aliased !== undefined
+        ? `matches ${aliased} only on the comparison key; the custody check needs the exact spelling`
+        : `is outside the owned paths and write roots of every task that runs the proof (${runningTasks.map((task) => `${task.id}: ${task.all.join(", ") || "none"}`).join("; ")})`);
     }
   }
   return diagnostics;

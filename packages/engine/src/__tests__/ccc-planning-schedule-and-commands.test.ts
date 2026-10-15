@@ -4,20 +4,31 @@ import {
   cccPlanningCriticalPathMs,
   validateCccPlanningTaskPlanV1,
   validateCccPlanningVerifierBundleV1,
+  type CccPlanningRequirementMapV1,
   type CccPlanningTaskPlanV1,
   type CccPlanningVerifierBundleV1,
   type CccPrdDiagnostic,
 } from "@fusion/core";
 import {
+  renderCccPlanningAdmissionFacts,
+  renderCccPlanningFinalPrd,
+  renderCccPlanningTechnicalAnnex,
+  type CccPlanningAdmissionFacts,
+} from "../ccc-planning/packet.js";
+import {
+  CCC_PLANNING_PROOF_COMMAND_RULES,
   checkCccPlanningProofCommands,
   cccPlanningProofDefinitionsFromBundle,
   type CccPlanningProofDefinition,
 } from "../ccc-planning/proof-command-policy.js";
+import { buildCccPlanningAuthoringProposal } from "../ccc-planning/proposal.js";
 import { simulateCccPlanningSchedule } from "../ccc-planning/schedule-simulation.js";
 
 /*
 FNXC:CccPlanningScheduleAndCommands 2026-10-14-18:40:
 Card GG (D19, challenge 29, verify-v2 item 41). The section 4.1 diamond is the positive control for both gates: T1 tokenizer, then T2 word frequency and T3 reading time, then T4 CLI. Writers own only `src/**` and `bin/**`; every proof is `task verify:<name>`, whose Taskfile.yml target runs `node test/<name>.test.mjs <the task's src or bin file>` from the verifier bundle committed at B1. Each refusal below changes one thing in that fixture and asserts the rule the detail names, so a refusal for some other reason does not satisfy it.
+FNXC:CccPlanningScheduleAndCommands 2026-10-14-23:14:
+Errata E12 item 6 (card GGz). G4 checks the proofs of the proposal IB1 builds, so wherever a case passes proof definitions it takes them from IB1's real `buildCccPlanningAuthoringProposal` (`ib1Proofs`, mapped as gates.ts maps the proposal's proofs), and the positive control pins that, for the diamond, they are exactly what the frozen two-argument signature derives from the bundle. A case keeps the bundle-derived proofs (`cccPlanningProofDefinitionsFromBundle`, the frozen signature's default) or a hand edit only where it needs a shape IB1 cannot build, and says so: IB1 writes every command as `task <the bundle's target>`, takes the closure from the bundle proof's files and the candidates from the owned paths of the tasks that name the proof, so a different command, a closure path outside the bundle, or a candidate outside those tasks' owned paths cannot come from it.
 */
 
 type Spec = Readonly<{ id: string; proof: string; owned: readonly string[]; deps: readonly string[] }>;
@@ -74,6 +85,55 @@ function bundle(targets: Readonly<Record<string, string>> = DIAMOND_TARGETS): Cc
   };
 }
 
+const IB1_TARGET = "/private/tmp/ccc-planning-i2-gg/commands";
+
+const IB1_FACTS: CccPlanningAdmissionFacts = {
+  targetRepository: { path: IB1_TARGET, baseCommit: "1".repeat(40) },
+  admittedWriteRoots: [
+    { path: `${IB1_TARGET}/.fusion`, purpose: "Fusion task and artifact state" },
+    { path: `${IB1_TARGET}/src`, purpose: "writer source modules" },
+    { path: `${IB1_TARGET}/bin`, purpose: "writer command line entry point" },
+  ],
+  bounds: { maxRequests: 3072, maxDurationMs: 86_400_000, maxConcurrency: 1 },
+  protectedActions: [],
+};
+
+/**
+ * The proofs IB1's real builder makes for this plan and bundle, as proof definitions mapped the way G4 maps the proposal's
+ * proofs (gates.ts proposalProofs). The requirement map gives each requirement one annex-derived clause citing the decisions
+ * of the tasks that claim it, and the bundle proofs that cover it; the sources are IB1's own renderings.
+ */
+function ib1Proofs(taskPlan: CccPlanningTaskPlanV1 = plan(), verifierBundle: CccPlanningVerifierBundleV1 = bundle()): CccPlanningProofDefinition[] {
+  const requirementIds = [...new Set(taskPlan.tasks.flatMap((task) => task.requirementIds))];
+  const requirementMap: CccPlanningRequirementMapV1 = {
+    schema: "ccc-planning.requirement-map.v1",
+    requirements: requirementIds.map((id) => ({
+      id, title: `Requirement ${id}`, statement: `The statement of ${id}.`,
+      proofIds: verifierBundle.proofs.filter((proof) => proof.requirementIds.includes(id)).map((proof) => proof.id),
+      clauses: [{ id: "C1", text: `The clause of ${id}.`, derivation: {
+        kind: "annex" as const, decisionIds: taskPlan.tasks.filter((task) => task.requirementIds.includes(id)).map((task) => `DEC-${task.id}`),
+      } }],
+    })),
+    nonGoals: [],
+  };
+  const sources = {
+    originalRequest: Buffer.from("Build the text statistics tool.\n", "utf8"),
+    admissionFacts: renderCccPlanningAdmissionFacts(IB1_FACTS),
+    finalPrd: renderCccPlanningFinalPrd({ requirementMap, verifierBundle }),
+    technicalAnnex: renderCccPlanningTechnicalAnnex({ taskPlan }),
+  };
+  const proposal = buildCccPlanningAuthoringProposal({ sources, requirementMap, taskPlan, verifierBundle, facts: IB1_FACTS });
+  return proposal.proofs.map((proof) => ({
+    id: proof.id,
+    command: proof.command,
+    verifierClosure: proof.verifierClosure.map(({ role, path }) => ({ role, path })),
+    candidateInputs: [...proof.candidateInputs],
+  }));
+}
+
+const byId = (proofs: readonly CccPlanningProofDefinition[]) => [...proofs].sort((a, b) => a.id.localeCompare(b.id));
+
+/** The bundle-derived proofs with one command changed: IB1 writes every command as `task <the bundle's target>`, so this is a hand edit. */
 function withCommand(proofId: string, command: string): CccPlanningProofDefinition[] {
   return cccPlanningProofDefinitionsFromBundle(bundle()).map((proof) => (proof.id === proofId ? { ...proof, command } : proof));
 }
@@ -132,6 +192,11 @@ describe("checkCccPlanningProofCommands", () => {
       candidateInputs: ["src/tokenizer.mjs"],
     });
     expect(checkCccPlanningProofCommands(plan(), bundle(), proofs)).toEqual([]);
+    // IB1's proofs for the diamond are exactly the bundle-derived ones, so a case that keeps the bundle-derived shape tests
+    // what G4 sees from IB1 wherever IB1 can build that shape (errata E12 item 6).
+    const built = ib1Proofs();
+    expect(byId(built)).toEqual(byId(proofs));
+    expect(checkCccPlanningProofCommands(plan(), bundle(), built)).toEqual([]);
   });
 
   it("refuses the proof command npm install && node --test", () => {
@@ -195,12 +260,77 @@ describe("checkCccPlanningProofCommands", () => {
     expect(refused[0]!.message).toContain("path test/fixtures/sample.txt");
   });
 
-  it("refuses a candidate path outside the task's own write roots", () => {
+  /*
+  FNXC:CccPlanningScheduleAndCommands 2026-10-14-23:14:
+  Errata E12 item 3. The candidate rule is the custody rule (each candidate inside some route's owned path or write root, importer.ts:1509-1517) restricted to the tasks that run the proof. src/tokenizer.mjs is T1's, and T1 does not run word-frequency, so the candidate is refused although the custody check would admit it. IB1 never builds this candidate (it takes the owned paths of the proof's own tasks), so the case uses the bundle-derived proof, whose candidates are the Taskfile target's arguments.
+  */
+  it("refuses a candidate path outside the owned paths and write roots of every task that runs the proof", () => {
     const targets = { ...DIAMOND_TARGETS, "verify:word-frequency": "node test/word-frequency.test.mjs src/word-frequency.mjs src/tokenizer.mjs" };
-    const refused = byRule(checkCccPlanningProofCommands(plan(), bundle(targets)), "candidate-in-own-write-roots");
+    const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets));
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "candidate-in-running-task-paths");
     expect(refused).toHaveLength(1);
     expect(refused[0]!.message).toContain("proof word-frequency");
     expect(refused[0]!.message).toContain("path src/tokenizer.mjs");
+    expect(refused[0]!.message).toContain("T2: src/word-frequency.mjs");
+    expect(CCC_PLANNING_PROOF_COMMAND_RULES).not.toContain("candidate-in-own-write-roots");
+  });
+
+  it("admits a proof shared by two tasks whose candidates are the union of their owned paths, as IB1 builds it", () => {
+    const shared = plan(DIAMOND, (tasks) => {
+      (tasks[1]!.proofIds as string[]).push("stats");
+      (tasks[2]!.proofIds as string[]).push("stats");
+    });
+    const withStats = (targets: Readonly<Record<string, string>>): CccPlanningVerifierBundleV1 => {
+      const base = bundle(targets);
+      return {
+        ...base,
+        files: [...base.files, { path: "test/stats.test.mjs", mode: "100644", content: "// stats harness\n" }],
+        proofs: [...base.proofs, { id: "stats", requirementIds: ["REQ-T2", "REQ-T3"], files: ["Taskfile.yml", "test/stats.test.mjs"], taskfileTask: "verify:stats" }],
+      };
+    };
+    const verifier = withStats({ ...DIAMOND_TARGETS, "verify:stats": "node test/stats.test.mjs src/reading-time.mjs src/word-frequency.mjs" });
+    const proofs = ib1Proofs(shared, verifier);
+    expect(proofs.find(({ id }) => id === "stats")!.candidateInputs).toEqual(["src/reading-time.mjs", "src/word-frequency.mjs"]);
+    // Neither T2 nor T3 holds both candidates; each holds one, which is all the custody check needs.
+    expect(checkCccPlanningProofCommands(shared, verifier, proofs)).toEqual([]);
+  });
+
+  it("admits an owned directory as a candidate although no write root contains it, as IB1 builds it", () => {
+    const nested = plan(DIAMOND, (tasks) => {
+      tasks[0]!.ownedPaths = ["src/tokenizer.mjs", "src/lib"];
+      tasks[0]!.allowedWriteRoots = ["src/tokenizer.mjs", "src/lib/x.mjs"];
+    });
+    const verifier = bundle({ ...DIAMOND_TARGETS, "verify:tokenizer": "node test/tokenizer.test.mjs src/lib src/tokenizer.mjs" });
+    const proofs = ib1Proofs(nested, verifier);
+    expect(proofs.find(({ id }) => id === "tokenizer")!.candidateInputs).toEqual(["src/lib", "src/tokenizer.mjs"]);
+    expect(checkCccPlanningProofCommands(nested, verifier, proofs)).toEqual([]);
+  });
+
+  /*
+  FNXC:CccPlanningScheduleAndCommands 2026-10-14-23:14:
+  Errata E12 item 1. The custody check reads each closure file with `git ls-tree -- <path>` (semantic-proof-custody.ts:150) and needs the entry git lists to be spelled exactly as asked (:164-167); a leading colon is git pathspec magic, so a closure path that starts with one is refused, and a colon later in the path is not. IB1 builds both closures from the bundle proof's files.
+  */
+  it("refuses a verifier closure path that starts with a colon, which git reads as pathspec magic", () => {
+    const withFixture = (path: string): CccPlanningVerifierBundleV1 => {
+      const base = bundle();
+      return {
+        ...base,
+        files: [...base.files, { path, mode: "100644", content: "{}\n" }],
+        proofs: base.proofs.map((proof) => (proof.id === "tokenizer" ? { ...proof, files: [...proof.files, path] } : proof)),
+      };
+    };
+    const red = withFixture(":data.json");
+    const diagnostics = checkCccPlanningProofCommands(plan(), red, ib1Proofs(plan(), red));
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "closure-path-git-literal");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.message).toContain("proof tokenizer");
+    expect(refused[0]!.message).toContain("path :data.json:");
+    expect(refused[0]!.message).toContain("semantic-proof-custody.ts:150");
+    // Control: a colon after the first character is literal to git.
+    const control = withFixture("fixtures:x/words.txt");
+    expect(checkCccPlanningProofCommands(plan(), control, ib1Proofs(plan(), control))).toEqual([]);
   });
 
   it("compares paths on the comparison key: ./TASKFILE.yml is refused as a writer-owned Taskfile.yml", () => {
@@ -313,7 +443,7 @@ describe("checkCccPlanningProofCommands", () => {
   Errata E11 GG item 3. Where the custody check admits only an exact spelling, the policy compares exact strings, not K1's comparison key: the custody check's verifyTaskfile needs the target to invoke the one declared harness as spelled, it reads each closure path at B1 by its exact path, and it needs each candidate inside a write root as spelled. E2-13's comparison key governs overlap and identity, not custody spelling, so moving any of these three comparisons onto the key (mutants K4, K2 and K1) would fail open. Each case has its exact-case twin as the control.
   */
   it("refuses a Taskfile target that names the declared harness in another letter case", () => {
-    const declared = cccPlanningProofDefinitionsFromBundle(bundle());
+    const declared = ib1Proofs();
     const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node TEST/tokenizer.test.mjs src/tokenizer.mjs" };
     const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets), declared);
     expect(diagnostics).toHaveLength(1);
@@ -327,9 +457,10 @@ describe("checkCccPlanningProofCommands", () => {
   });
 
   it("refuses a closure harness that names the bundle file in another letter case", () => {
-    // The target follows the closure's spelling, so only the closure's own lookup in the bundle can refuse it.
+    // The target follows the closure's spelling, so only the closure's own lookup in the bundle can refuse it. IB1 takes the
+    // closure from the bundle proof's files, which K1 requires to be bundle files, so this closure is a hand edit of IB1's proofs.
     const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node TEST/tokenizer.test.mjs src/tokenizer.mjs" };
-    const proofs = cccPlanningProofDefinitionsFromBundle(bundle()).map((proof) => (proof.id === "tokenizer"
+    const proofs = ib1Proofs().map((proof) => (proof.id === "tokenizer"
       ? { ...proof, verifierClosure: [{ role: "task_runner" as const, path: "Taskfile.yml" }, { role: "harness" as const, path: "TEST/tokenizer.test.mjs" }] }
       : proof));
     const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets), proofs);
@@ -339,14 +470,15 @@ describe("checkCccPlanningProofCommands", () => {
     expect(refused[0]!.message).toContain("proof tokenizer");
     expect(refused[0]!.message).toContain("path TEST/tokenizer.test.mjs:");
     // Control: the exact-case twin, whose closure harness is the bundle file test/tokenizer.test.mjs.
-    expect(checkCccPlanningProofCommands(plan(), bundle(), cccPlanningProofDefinitionsFromBundle(bundle()))).toEqual([]);
+    expect(checkCccPlanningProofCommands(plan(), bundle(), ib1Proofs())).toEqual([]);
   });
 
   it("refuses a candidate that lies inside the task's write root only on the comparison key", () => {
+    // IB1 takes candidates from the owned paths as spelled, so the respelled candidate comes from the bundle-derived proof.
     const targets = { ...DIAMOND_TARGETS, "verify:tokenizer": "node test/tokenizer.test.mjs SRC/tokenizer.mjs" };
     const diagnostics = checkCccPlanningProofCommands(plan(), bundle(targets));
     expect(diagnostics).toHaveLength(1);
-    const refused = byRule(diagnostics, "candidate-in-own-write-roots");
+    const refused = byRule(diagnostics, "candidate-in-running-task-paths");
     expect(refused).toHaveLength(1);
     expect(refused[0]!.message).toContain("proof tokenizer");
     expect(refused[0]!.message).toContain("path SRC/tokenizer.mjs:");

@@ -20,7 +20,13 @@ import {
 } from "@fusion/core";
 import { validateTaskCustodyProvenance } from "../ccc-prd/authoring.js";
 import { analyzeCccPrdMaterialCoverage } from "../ccc-prd/material-coverage.js";
-import { diagnoseCccPlanningImportShape, diagnoseCccPlanningTaskPlanGraph } from "./graph-gate.js";
+import {
+  diagnoseCccPlanningImportEntityIds,
+  diagnoseCccPlanningImportShape,
+  diagnoseCccPlanningProofGraph,
+  diagnoseCccPlanningTaskPlanGraph,
+} from "./graph-gate.js";
+import { CCC_PLANNING_PACKET_SOURCES, cccPlanningPacketSourcePath, type CccPlanningPacketSourceKey } from "./packet.js";
 import { checkCccPlanningProofCommands, type CccPlanningProofDefinition } from "./proof-command-policy.js";
 import { simulateCccPlanningSchedule, type CccPlanningSchedulePolicy } from "./schedule-simulation.js";
 import { checkCccPlanningSourceFidelity } from "./source-fidelity.js";
@@ -30,14 +36,13 @@ FNXC:CccPlanningG4 2026-10-14-18:58:
 Card GG, G4 (D19, ADR B Q3, T3.2 and T3.3, verify-v2 item 41). G4 is pure and deterministic and runs before any review is reserved, so a plan the compiler, the importer or the custody check would refuse costs no review spend. It runs, in layers, the checks section 2.17 names: the four content schemas; then the graph (the compiler's own product-graph admission, through B2, plus the importer's merge-landing rule), the importer's write-root and bounds admission on the proposal, and the agreement of the proposal with the reviewed task plan; then source-reference resolution and custody provenance; and last material coverage, source fidelity, the schedule simulation and the proof-command policy. A layer that fails ends G4 with its own diagnostics, because every later layer reads what it establishes: a proposal that is not the reviewed plan, or a task whose source evidence does not resolve, would only produce secondary diagnostics that hide the real refusal.
 FNXC:CccPlanningG4 2026-10-14-18:58:
 The frozen signature takes only the task plan, the proposal, the four sources, the acceptance cases and the requirement map, which cannot reach the request anchor, the proof commands or the schedule. G4's input therefore also carries the request artifact's digest (the anchor G1 recorded), the verifier bundle (the proof-command policy's other operand) and an optional schedule policy (defaulting to K1's budget policy estimates). The packet's request digest is the SHA-256 of `sources.originalRequest`, the bytes B4 wrote to the packet. Material coverage mirrors the compiler (`compiler.ts:2085-2170`): the same analysis over the same four packet sources, and the same codes for conflicts, undispositioned sections and requirements, and an implausibly shallow extraction; the compiler's comparison against a sidecar's declared coverage has no counterpart here because G4 runs before any sidecar exists. Acceptance-clause reconciliation stays with the compile at preparation (IB1), not G4.
+FNXC:CccPlanningG4 2026-10-14-23:14:
+Errata E12 items 2 to 4 and 7 (card GGz). The shape layer also runs the importer's entity-id admission over the plan's and the proposal's ids and the importer's semantic proof plan over the proposal (both in graph-gate.ts), so a plan G4 admits is not refused by `assertCccPrdImportBundle` or `semanticV2WorkflowProofPlan` after review. The source paths are derived from IB1's `CCC_PLANNING_PACKET_SOURCES` through `cccPlanningPacketSourcePath` (packet.ts:29-41), under the same exported name, so the paths G4 resolves quotes against are the paths IB1 writes and cites; the parity test pins the two key by key.
 */
 
-export const CCC_PLANNING_G4_SOURCE_PATHS = Object.freeze({
-  originalRequest: "sources/__fusion__/planning/original-request.md",
-  admissionFacts: "sources/__fusion__/planning/admission-facts.md",
-  finalPrd: "sources/__fusion__/planning/final-prd.md",
-  technicalAnnex: "sources/__fusion__/planning/technical-annex.md",
-} as const);
+export const CCC_PLANNING_G4_SOURCE_PATHS: Readonly<Record<CccPlanningPacketSourceKey, string>> = Object.freeze(Object.fromEntries(
+  (Object.keys(CCC_PLANNING_PACKET_SOURCES) as CccPlanningPacketSourceKey[]).map((key) => [key, cccPlanningPacketSourcePath(key)]),
+) as Record<CccPlanningPacketSourceKey, string>);
 
 export type CccPlanningG4Sources = Readonly<{
   originalRequest: Buffer; admissionFacts: Buffer; finalPrd: Buffer; technicalAnnex: Buffer;
@@ -213,6 +218,8 @@ export function runCccPlanningG4(i: CccPlanningG4Input): readonly CccPrdDiagnost
   const shape = [
     ...diagnoseCccPlanningTaskPlanGraph(i.taskPlan),
     ...diagnoseCccPlanningImportShape(i.proposal),
+    ...diagnoseCccPlanningImportEntityIds(i.taskPlan, i.proposal),
+    ...diagnoseCccPlanningProofGraph(i.proposal),
     ...agreementDiagnostics(i.taskPlan, i.proposal, i.requirementMap),
   ];
   if (shape.length > 0) return shape;
