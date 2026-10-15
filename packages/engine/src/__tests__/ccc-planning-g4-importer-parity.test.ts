@@ -7,10 +7,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
+  WorkflowExtensionRegistry,
+  canonicalCccPrdJson,
+  deriveWorkflowExtensionHostProvenance,
+  encodeCccPlanningArtifactKey,
   hydrateCccPrdSemanticProofV2Custody,
   parseCccCampaignProductExecutionPolicy,
   type CccPlanningAcceptanceCasesV1,
+  type CccPlanningArtifactEnvelopeV1,
+  type CccPlanningArtifactKind,
   type CccPlanningRequirementMapV1,
+  type CccPlanningRoleId,
+  type CccPlanningStageId,
   type CccPlanningTaskPlanV1,
   type CccPlanningVerifierBundleV1,
   type CccPrdAuthoringProposalV2,
@@ -22,17 +30,21 @@ import {
 import { createCccPrdImportTestBundle, rehashCccPrdImportTestBundle } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import { assertCccPrdImportBundle } from "../../../core/src/ccc-prd/import-admission.js";
 import { nativeWorkflowIr } from "../../../core/src/ccc-prd/importer.js";
+import { CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION, CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID } from "../ccc-campaign-proof-admission.js";
+import { authorCccPrdPacket } from "../ccc-prd/authoring.js";
+import { compileCccPrdPacket } from "../ccc-prd/compiler.js";
 import { CCC_PLANNING_G4_SOURCE_PATHS, runCccPlanningG4, type CccPlanningG4Input } from "../ccc-planning/gates.js";
 import {
   CCC_PLANNING_PACKET_SOURCES,
   cccPlanningPacketSourcePath,
+  materializeCccPlanningPacket,
   renderCccPlanningAdmissionFacts,
   renderCccPlanningFinalPrd,
   renderCccPlanningTechnicalAnnex,
   type CccPlanningAdmissionFacts,
   type CccPlanningPacketSourceKey,
 } from "../ccc-planning/packet.js";
-import { buildCccPlanningAuthoringProposal } from "../ccc-planning/proposal.js";
+import { buildCccPlanningAuthoringProposal, createCccPlanningAuthoringAdapter } from "../ccc-planning/proposal.js";
 
 /*
 FNXC:CccPlanningG4ImporterParity 2026-10-14-23:14:
@@ -316,6 +328,70 @@ async function custodyVerdict(input: CccPlanningG4Input): Promise<string> {
   }
 }
 
+const RUN_ID = "ccc-plan:0123456789abcdef01234567";
+
+const PRODUCER_ROWS: ReadonlyArray<Readonly<{ kind: CccPlanningArtifactKind; stageId: CccPlanningStageId; roleId: CccPlanningRoleId; slot: string }>> = [
+  { kind: "requirement_map", stageId: "spec", roleId: "spec-author", slot: "reqmap" },
+  { kind: "final_prd", stageId: "spec", roleId: "spec-author", slot: "prd" },
+  { kind: "technical_annex", stageId: "spec", roleId: "spec-author", slot: "annex" },
+  { kind: "task_plan", stageId: "plan", roleId: "execution-planner", slot: "plan" },
+  { kind: "verifier_bundle", stageId: "verifier", roleId: "verifier-author", slot: "bundle" },
+];
+
+/** The producer envelopes IB1's authoring adapter reads its model label from (one per reviewed artifact). */
+function producerEnvelopes(): CccPlanningArtifactEnvelopeV1[] {
+  return PRODUCER_ROWS.map((row) => ({
+    schema: "ccc-planning.artifact-envelope.v1",
+    artifactKey: encodeCccPlanningArtifactKey({ runRevision: 1, stageId: row.stageId, slot: row.slot, version: 1 }),
+    runId: RUN_ID, runRevision: 1, stageId: row.stageId, slot: row.slot, version: 1, kind: row.kind,
+    contentType: "application/json", contentSchema: `test.${row.kind}.v1`, inputs: [],
+    producer: { kind: "model", roleId: row.roleId, instanceId: `instance-${row.slot}`, requestedModel: "glm/glm-5.3", resolvedModel: "glm/glm-5.3", routeReceiptDigest: sha256(`route-${row.slot}`) },
+    policy: { promptVersion: "v1", promptDigest: sha256("prompt"), toolPolicyVersion: "v1", toolPolicyDigest: sha256("tools") },
+    outputDigest: sha256(`output-${row.slot}`), status: "complete", fence: { kind: "admission" },
+    identityDigest: sha256(`identity-${row.slot}`), publishedAt: "2026-10-15T00:00:00.000Z",
+  }) as CccPlanningArtifactEnvelopeV1);
+}
+
+/**
+ * The real compile on IB2's path (section 2.17 bridge step 2): IB1 writes the packet from the sources, the real
+ * `authorCccPrdPacket` authors the proposal through IB1's authoring adapter, and the real `compileCccPrdPacket` compiles the
+ * sidecar. Without the controller's toolchain each proof also compiles to CCC_PRD_PROOF_ADMISSION_MISSING (the IB1 proposal
+ * test pins that), so the result is every diagnostic the compile raises.
+ */
+async function compileDiagnostics(input: CccPlanningG4Input): Promise<CccPrdDiagnostic[]> {
+  const scratchRoot = mkdtempSync(join(tmpdir(), "ccc-planning-ggz-compile-"));
+  scratchRoots.push(scratchRoot);
+  const packet = await materializeCccPlanningPacket({ scratchRoot, runId: RUN_ID, runRevision: 1, sources: input.sources });
+  const registry = new WorkflowExtensionRegistry();
+  registry.register(
+    CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+    CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+    await deriveWorkflowExtensionHostProvenance({
+      pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID, pluginVersion: "1.0.0", trustedRootPath: packet.rootDir,
+      entryRelativePath: cccPlanningPacketSourcePath("originalRequest"), manifestRelativePath: "manifest.json",
+    }),
+  );
+  const authored = await authorCccPrdPacket({
+    rootDir: packet.rootDir, manifestPath: packet.manifestPath, semanticProofContract: "v2",
+    adapter: createCccPlanningAuthoringAdapter({ proposal: input.proposal, producers: producerEnvelopes(), runId: RUN_ID, runRevision: 1 }),
+    constraints: { targetRepository: FACTS.targetRepository, bounds: FACTS.bounds, maxReviewItems: 16 },
+    workflowExtensionRegistry: registry,
+  });
+  if (authored.kind !== "candidate") return authored.diagnostics;
+  const sidecarPath = join(packet.rootDir, "sidecar.json");
+  writeFileSync(sidecarPath, `${canonicalCccPrdJson(authored.sidecar)}\n`);
+  const compiled = compileCccPrdPacket({
+    rootDir: packet.rootDir, manifestPath: packet.manifestPath, sidecarPath,
+    expectedTarget: TARGET, expectedBase: BASE, requireMaterialCoverage: true,
+  });
+  return compiled.kind === "refusal" ? compiled.diagnostics : [];
+}
+
+/** The compile's closure refusals: one CCC_PRD_PROOF_INVALID per verifier closure entry `isCanonicalRootRelativeSource` refuses. */
+function closureRefusals(diagnostics: readonly CccPrdDiagnostic[]): string[] {
+  return diagnostics.filter(({ code, message }) => code === "CCC_PRD_PROOF_INVALID" && /verifierClosure\[\d+\]/u.test(message)).map(({ message }) => message);
+}
+
 /* ================================================================== the cases */
 
 describe("G4 importer and custody parity", () => {
@@ -358,7 +434,7 @@ describe("G4 importer and custody parity", () => {
 
   /*
   FNXC:CccPlanningG4ImporterParity 2026-10-15-00:02:
-  Card GGz repair 1 (adversary finding, the sibling of E12 item 1: a closure path git cannot address literally). `git init` on the I2 host's APFS volume writes core.precomposeunicode=true into the repository's own config, and the custody check still reads that config (it scrubs only the global and system config), so git composes a decomposed (NFD) `ls-tree -- <path>` argument to NFC. A bundle committed through the working tree, as this harness and B1 do, holds the NFC name, so the one entry listed differs from the path asked and the custody check refuses (semantic-proof-custody.ts:150, :164-167); a bundle that kept the NFD name through plumbing lists nothing and is refused the same way. Every earlier G4 layer, IB1 and K1's bundle validator accept the NFD path, so G4 refuses any closure path that is not NFC. Git precomposes only on Darwin: elsewhere the custody check admits the NFD path and G4's refusal is a fail-closed over-refusal, consistent with K1's Darwin-first comparison key, so the custody verdict pinned here is the one for the platform the test runs on.
+  Card GGz repair 1 (adversary finding, the sibling of E12 item 1: a closure path git cannot address literally). `git init` on the I2 host's APFS volume writes core.precomposeunicode=true into the repository's own config, and the custody check still reads that config (it scrubs only the global and system config), so git composes a decomposed (NFD) `ls-tree -- <path>` argument to NFC. This harness commits the bundle through a working tree, which stores the NFC name, so the one entry listed differs from the path asked and the custody check refuses (semantic-proof-custody.ts:150, :164-167). VP builds B1 with plumbing instead (D20), and the refusal holds there too (errata E16 item 4, probed on the I2 host): plumbing that takes the path as an argument stores the NFC name as well, and plumbing that reads it from stdin keeps the NFD name, which ls-tree then never lists. Every earlier G4 layer, IB1 and K1's bundle validator accept the NFD path, so G4 refuses any closure path that is not NFC. Git precomposes only on Darwin: elsewhere the custody check admits the NFD path and G4's refusal is a fail-closed over-refusal, consistent with K1's Darwin-first comparison key, so the custody verdict pinned here is the one for the platform the test runs on. On Darwin too the rule refuses a few names NFC changes and git leaves alone (the Angstrom, Ohm and Kelvin signs, U+F900, decomposed Kaithi), which the custody check admits: an accepted fail-closed residual (proof-command-policy.ts).
   */
   it("a verifier closure path that is not in Unicode NFC fails G4, as git's precomposeunicode on the Darwin host makes the custody check miss it", async () => {
     const withFixture = (path: string) => edit(BASE_FIXTURE, (draft) => {
@@ -389,6 +465,89 @@ describe("G4 importer and custody parity", () => {
     const control = g4Input(withFixture(nfc));
     expect(runCccPlanningG4(control)).toEqual([]);
     expect(await custodyVerdict(control)).toBe("admitted");
+  });
+
+  /*
+  FNXC:CccPlanningG4ImporterParity 2026-10-15-00:53:
+  Errata E16 GGz repair 2 item 1 (adversary 2). A JavaScript string can hold an unpaired UTF-16 surrogate, which no file name can: Node (24 on the I2 host) writes it as U+FFFD when it encodes the custody check's `git ls-tree -- <path>` argument, so git lists `fixtures/<U+FFFD>.txt`, which never equals the path asked, and the custody check refuses (semantic-proof-custody.ts:150, :164-167) on every platform and whether B1 is committed through a working tree or with plumbing. K1's bundle validator, IB1 and every earlier G4 rule accept it, and canonical JSON keeps it as a `\ud800` escape, so G4 refuses a closure path that is not well-formed Unicode. The control is the replacement character itself, a real file name both admit.
+  */
+  it("a verifier closure path that is not well-formed Unicode fails G4, as Node writes a lone surrogate as U+FFFD and the custody check misses it", async () => {
+    const withFixture = (path: string) => edit(BASE_FIXTURE, (draft) => {
+      draft.verifierBundle.files.push({ path, mode: "100644", content: "words\n" });
+      draft.verifierBundle.proofs[0]!.files.push(path);
+    });
+    const lone = "fixtures/\ud800.txt";
+    const replacement = "fixtures/\ufffd.txt";
+    expect(lone.isWellFormed()).toBe(false);
+    expect(lone.normalize("NFC")).toBe(lone);
+    const red = g4Input(withFixture(lone));
+    expect(red.proposal.proofs[0]!.verifierClosure.map(({ role, path }) => `${role} ${path}`)).toContain(`fixture ${lone}`);
+    const diagnostics = runCccPlanningG4(red);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(byRule(diagnostics, "closure-path-git-literal")).toHaveLength(1);
+    expect(diagnostics[0]!.message).toContain("proof tokenizer");
+    expect(diagnostics[0]!.message).toContain(`path ${lone}:`);
+    expect(diagnostics[0]!.message).toContain("well-formed");
+    const custodyRed = await custodyVerdict(red);
+    const refusedAt = "refused: CCC semantic-proof path is missing, non-regular, or ambiguous at ";
+    expect(custodyRed.startsWith(refusedAt)).toBe(true);
+    expect(custodyRed.slice(refusedAt.length)).toMatch(/^[0-9a-f]{40}: fixtures\/\ud800\.txt$/);
+    // Control: the replacement character the lone surrogate becomes is a well-formed name, admitted by G4 and by the custody hydration.
+    const control = g4Input(withFixture(replacement));
+    expect(runCccPlanningG4(control)).toEqual([]);
+    expect(await custodyVerdict(control)).toBe("admitted");
+  });
+
+  /*
+  FNXC:CccPlanningG4ImporterParity 2026-10-15-00:53:
+  Errata E16 GGz repair 2 item 2 (review 1 note). IB2 compiles IB1's packet before import (section 2.17 bridge step 2), and the compiler refuses a proof whose verifier closure path fails `isCanonicalRootRelativeSource` (compiler.ts:93-105, applied to each closure entry at :515): a value that is empty or not trimmed, that holds a backslash or NUL, that starts with `file:` in any letter case, that is absolute (posix or win32), or that has an empty, `.` or `..` segment. K1's bundle validator, IB1 and the custody rules admit `File:data.json`, so G4 used to admit it and the compile refused the plan after review. G4 now mirrors the predicate under `closure-path-canonical`. Every refused shape is pinned here against the real compile on IB2's path (packet, `authorCccPrdPacket` through IB1's adapter, `compileCccPrdPacket`): the RED and its control are built through IB1; the other shapes, which K1's bundle validator refuses before IB1 could carry them or which IB1 renders identically, are put into the IB1-built proposal's closure by hand to stand for a producer that skips those checks, and the compile refuses each one at its own closure index, including the shapes an earlier G4 rule already refused.
+  */
+  it("a verifier closure path the compiler's canonical-source rule refuses fails G4 before review, each refused shape pinned against the real compile", async () => {
+    const withFixture = (path: string) => edit(BASE_FIXTURE, (draft) => {
+      draft.verifierBundle.files.push({ path, mode: "100644", content: "{\"words\": 3}\n" });
+      draft.verifierBundle.proofs[0]!.files.push(path);
+    });
+    const red = g4Input(withFixture("File:data.json"));
+    const redClosure = red.proposal.proofs.find(({ id }) => id === "tokenizer")!.verifierClosure;
+    const redIndex = redClosure.findIndex(({ path }) => path === "File:data.json");
+    expect(redClosure[redIndex]?.role).toBe("fixture");
+    const diagnostics = runCccPlanningG4(red);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(byRule(diagnostics, "closure-path-canonical")).toHaveLength(1);
+    expect(diagnostics[0]!.message).toContain("proof tokenizer: path File:data.json:");
+    expect(diagnostics[0]!.message).toContain("compiler.ts:93-105");
+    expect(closureRefusals(await compileDiagnostics(red))).toEqual([`proof tokenizer verifierClosure[${redIndex}] custody is malformed or duplicated`]);
+    // Control: the same file under a canonical name is admitted by G4, and the compile raises nothing but the missing proof admissions.
+    const control = g4Input(withFixture("fixtures/file-data.json"));
+    expect(runCccPlanningG4(control)).toEqual([]);
+    const controlCompile = await compileDiagnostics(control);
+    expect(controlCompile.map(({ code }) => code)).toEqual(control.proposal.proofs.map(() => "CCC_PRD_PROOF_ADMISSION_MISSING"));
+    // Every shape the compiler's predicate refuses, put by hand in the place of the control's fixture path.
+    const shapes = [
+      " fixtures/data.json", "fixtures/data.json ", "   ", "",
+      "fixtures\\data.json", "fixtures/data\0.json",
+      "file:data.json", "FILE:data.json", "fIlE:fixtures/data.json",
+      "/fixtures/data.json", "C:/fixtures/data.json", "//server/share/data.json",
+      "fixtures//data.json", "fixtures/data.json/", "fixtures/./data.json", "fixtures/../data.json", "./data.json", ".", "..",
+    ];
+    const handEdited = (paths: readonly string[]): CccPlanningG4Input => {
+      const input = g4Input(withFixture("fixtures/file-data.json"));
+      const proof = (input.proposal as unknown as { proofs: Array<{ id: string; verifierClosure: Array<{ role: string; path: string }> }> }).proofs.find(({ id }) => id === "tokenizer")!;
+      const fixture = proof.verifierClosure.find(({ path }) => path === "fixtures/file-data.json")!;
+      proof.verifierClosure = [...proof.verifierClosure.filter((entry) => entry !== fixture), ...paths.map((path) => ({ ...fixture, path }))];
+      return input;
+    };
+    for (const shape of shapes) {
+      const refused = byRule(runCccPlanningG4(handEdited([shape])), "closure-path-canonical");
+      expect(refused.filter(({ message }) => message.includes(`proof tokenizer: path ${shape}: `)), JSON.stringify(shape)).toHaveLength(1);
+    }
+    const all = handEdited(shapes);
+    const closure = all.proposal.proofs.find(({ id }) => id === "tokenizer")!.verifierClosure;
+    expect(closureRefusals(await compileDiagnostics(all)).sort()).toEqual(
+      shapes.map((shape) => `proof tokenizer verifierClosure[${closure.findIndex(({ path }) => path === shape)}] custody is malformed or duplicated`).sort(),
+    );
   });
 
   /*
@@ -454,6 +613,56 @@ describe("G4 importer and custody parity", () => {
     const diagnostics = runCccPlanningG4(input);
     expect(byRule(diagnostics, "import-entity-id").map(({ message }) => /: (?:task|import intent) (.+?): /u.exec(message)?.[1]))
       .toEqual(["T4 cli", "IMPORT-TASK-T4 cli"]);
+  });
+
+  /*
+  FNXC:CccPlanningG4ImporterParity 2026-10-15-00:53:
+  Errata E16 GGz repair 2 item 3 (both reviewers' notes). G4's import-entity-id rule also reads the ids the proposal itself declares: its workflow id, every import intent id and every intent entity id (graph-gate.ts diagnoseCccPlanningImportEntityIds), as `assertCccPrdImportBundle` does (import-admission.ts:113-125). IB1 cannot build any of these shapes, because its workflow, intent and campaign ids are constants (proposal.ts:53-54, :300, :309-315, :332-333), so each case renames the IB1-built proposal by hand, consistently (the tasks' workflowId and the intents' entity ids follow the rename), to stand for a producer that does. Each must be refused by the real admission and by G4 exactly once under import-entity-id, labelled as the row it comes from.
+  */
+  it("a proposal-declared workflow id, import intent id or intent entity id the importer's entity-id rule refuses fails G4 (hand-built)", () => {
+    type Draft = { tasks: Array<{ workflowId: string }>; workflows: Array<{ id: string }>; importIntents: Array<{ id: string; entityType: string; entityId: string }> };
+    const handEdited = (mutate: (draft: Draft) => void): CccPrdAuthoringProposalV2 => {
+      const input = g4Input();
+      mutate(input.proposal as unknown as Draft);
+      expect(runCccPlanningG4(input), "the hand edit keeps every other G4 rule satisfied but the entity id").toHaveLength(1);
+      return input.proposal;
+    };
+    const cases = [
+      {
+        name: "workflow id",
+        proposal: handEdited((draft) => {
+          const from = draft.workflows[0]!.id;
+          draft.workflows[0]!.id = "WORKFLOW PLANNING";
+          for (const task of draft.tasks) task.workflowId = "WORKFLOW PLANNING";
+          for (const intent of draft.importIntents) if (intent.entityId === from) intent.entityId = "WORKFLOW PLANNING";
+        }),
+        admission: "refused: workflow has an unsafe identifier: \"WORKFLOW PLANNING\"",
+        row: "workflow WORKFLOW PLANNING",
+      },
+      {
+        name: "import intent id",
+        proposal: handEdited((draft) => { draft.importIntents.find(({ id }) => id === "IMPORT-WORKFLOW")!.id = "IMPORT WORKFLOW"; }),
+        admission: "refused: import intent has an unsafe identifier: \"IMPORT WORKFLOW\"",
+        row: "import intent IMPORT WORKFLOW",
+      },
+      {
+        name: "intent entity id",
+        proposal: handEdited((draft) => {
+          const campaign = draft.importIntents.find(({ entityType }) => entityType === "campaign")!.entityId;
+          for (const intent of draft.importIntents) if (intent.entityId === campaign) intent.entityId = "CAMPAIGN PLANNING";
+        }),
+        admission: "refused: campaign entity has an unsafe identifier: \"CAMPAIGN PLANNING\"",
+        row: "campaign entity CAMPAIGN PLANNING",
+      },
+    ] as const;
+    for (const entry of cases) {
+      expect(admissionVerdict(entry.proposal), entry.name).toBe(entry.admission);
+      const input = { ...g4Input(), proposal: entry.proposal };
+      const refused = byRule(runCccPlanningG4(input), "import-entity-id");
+      expect(refused.map(({ message }) => message.includes(`rule import-entity-id: ${entry.row}: `)), entry.name).toEqual([true]);
+    }
+    // Control: the IB1-built proposal's own constants are admitted by both.
+    expect(admissionVerdict(g4Input().proposal)).toBe("admitted");
   });
 
   /*
@@ -563,7 +772,7 @@ describe("G4 importer and custody parity", () => {
       draft.taskPlan.tasks[1]!.proofIds.push("stats");
       draft.taskPlan.tasks[2]!.proofIds.push("stats");
     });
-    const cases: ReadonlyArray<Readonly<{ name: string; input: CccPlanningG4Input; rule: string; importer: RegExp }>> = [
+    const cases: ReadonlyArray<Readonly<{ name: string; input: CccPlanningG4Input; rule: string; importer: RegExp; names?: string }>> = [
       {
         name: "cross-task requirement (IB1-built)",
         input: g4Input(edit(BASE_FIXTURE, (draft) => {
@@ -603,12 +812,31 @@ describe("G4 importer and custody parity", () => {
         input: handEdited((draft) => { draft.workflows[0]!.taskIds = draft.workflows[0]!.taskIds.filter((id) => id !== "T3"); }),
         rule: "workflow-gates-every-task",
         importer: /^refused: CCC PRD workflow WORKFLOW-PLANNING must gate every semantic task exactly once$/u,
+        names: "does not gate task T3",
+      },
+      // Errata E16 GGz repair 2 item 3: IB1 gives every task the one workflow id and lists each task once (proposal.ts:300, :332-333),
+      // so these two shapes are hand edits standing for a producer that does not. The refusal names the offending task.
+      {
+        name: "a task whose workflowId is another workflow",
+        input: handEdited((draft) => { draft.tasks.find(({ id }) => id === "T3")!.workflowId = "WORKFLOW-OTHER"; }),
+        rule: "workflow-gates-every-task",
+        importer: /^refused: CCC PRD workflow WORKFLOW-PLANNING must gate every semantic task exactly once$/u,
+        names: "task T3 names workflow WORKFLOW-OTHER",
+      },
+      {
+        name: "a task the workflow lists twice",
+        input: handEdited((draft) => { draft.workflows[0]!.taskIds.push("T3"); }),
+        rule: "workflow-gates-every-task",
+        importer: /^refused: CCC PRD workflow WORKFLOW-PLANNING must gate every semantic task exactly once$/u,
+        names: "lists task T3 more than once",
       },
     ];
     for (const entry of cases) {
       expect(proofPlanVerdict(entry.input.proposal), entry.name).toMatch(entry.importer);
       const diagnostics = runCccPlanningG4(entry.input);
-      expect(byRule(diagnostics, entry.rule).length, `${entry.name}: ${JSON.stringify(diagnostics)}`).toBeGreaterThan(0);
+      const refused = byRule(diagnostics, entry.rule);
+      expect(refused.length, `${entry.name}: ${JSON.stringify(diagnostics)}`).toBeGreaterThan(0);
+      if (entry.names !== undefined) expect(refused.map(({ message }) => message).join("\n"), entry.name).toContain(entry.names);
       for (const diagnostic of diagnostics) expect(diagnostic.code, entry.name).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
     }
   });

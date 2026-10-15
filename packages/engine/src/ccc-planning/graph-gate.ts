@@ -24,6 +24,8 @@ FNXC:CccPlanningGraphGate 2026-10-14-23:14:
 Errata E12 item 2 (card GGz). The importer refuses a bundle any of whose task, dependency edge, workflow, document or artifact ids, import intent ids or intent entity ids falls outside `^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$` (`ENTITY_ID_PATTERN`, import-admission.ts:22, checked over that list at :113-125). Core does not export the pattern, so it is mirrored here and pinned against the real `assertCccPrdImportBundle` in the parity test. G4 applies it, as rule `import-entity-id`, to every task and edge id of the plan and to the intent ids IB1 builds from them (`IMPORT-TASK-<task id>` and `IMPORT-EDGE-<edge id>`, proposal.ts:309-310), so the 192-character limit counts the prefix, and, in depth, to every id and entity id the proposal declares. One diagnostic per offending id string.
 FNXC:CccPlanningGraphGate 2026-10-14-23:14:
 Errata E12 items 3 and 4 (card GGz). The importer's semantic proof plan (`semanticV2WorkflowProofPlan`, importer.ts:660-762) runs on every v2 product import, so G4 mirrors each of its rules over the proposal, whose tasks, proofs, requirements and workflows carry the same fields under the same names, as CCC_PLANNING_GRAPH_INADMISSIBLE diagnostics: `workflow-gates-every-task` (a workflow gates every task exactly once, :664-675); `task-proof-one-owner` (a task-phase proof has exactly one task naming it, :700-705); `task-proof-requirement-owned` and `task-proof-requirement-exclusive` (its requirements are its owner's and no other task's, :706-722); `task-proof-clause-owned` (its clauses are known and its owner's, :723-736); `task-has-task-proof` (every task names at least one task-phase proof, :742-748; IB1 gives the task phase only to a proof that no other task names, so this is the rule that a task needs a proof of its own); and `clause-final-coverage` (every accepted clause has a final_integrated proof covering it, :752-764). A proof a task names but the proposal does not declare is left to the proof-command policy's `task-proof-defined`. Each rule is pinned against the real `nativeWorkflowIr` in the parity test.
+FNXC:CccPlanningGraphGate 2026-10-15-00:53:
+Errata E16 GGz repair 2 item 3. The `workflow-gates-every-task` refusal keeps the importer's condition unchanged (importer.ts:664-675) and now names what breaks it: a task the workflow lists more than once, a listed id that is no task, a task the workflow does not gate, and a task whose workflowId names another workflow, so an operator sees which task to fix. The parity test pins each sub-condition (the duplicate listing and the workflowId mismatch as hand edits IB1 cannot build) and the proposal-declared workflow, intent and entity id rows of `import-entity-id` against the real importer.
 */
 
 export const CCC_PLANNING_WORKFLOW_ID = "ccc-planning-workflow";
@@ -236,8 +238,16 @@ export function diagnoseCccPlanningProofGraph(proposal: CccPrdAuthoringProposalV
     const listed = stringEntries(workflow.taskIds);
     const gated = new Set(listed);
     if (gated.size !== listed.length || gated.size !== tasks.length || tasks.some((task) => !gated.has(task.id) || task.workflowId !== workflow.id)) {
+      const taskIds = new Set(tasks.map(({ id }) => id));
+      const offences = [
+        ...[...gated].filter((id) => listed.indexOf(id) !== listed.lastIndexOf(id)).map((id) => `lists task ${id} more than once`),
+        ...[...gated].filter((id) => !taskIds.has(id)).map((id) => `gates ${id}, which is not a task of the proposal`),
+        ...tasks.filter((task) => !gated.has(task.id)).map((task) => `does not gate task ${task.id}`),
+        ...tasks.filter((task) => task.workflowId !== workflow.id).map((task) => `task ${task.id} names workflow ${String(task.workflowId)}`),
+      ];
       refuse("workflow-gates-every-task", `workflow ${String(workflow.id)}`,
-        `gates tasks ${listed.join(", ") || "none"} but the proposal's tasks are ${tasks.map(({ id }) => id).join(", ") || "none"};`
+        `gates tasks ${listed.join(", ") || "none"} but the proposal's tasks are ${tasks.map(({ id }) => id).join(", ") || "none"}`
+        + `${offences.length > 0 ? ` (${offences.join("; ")})` : ""};`
         + " the importer's proof plan needs one workflow gating every task exactly once (importer.ts:664-675)");
     }
   }

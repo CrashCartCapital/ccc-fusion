@@ -1,4 +1,4 @@
-import { posix } from "node:path";
+import { posix, win32 } from "node:path";
 import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node, type Pair } from "yaml";
 import {
   cccPlanningPathComparisonKey,
@@ -24,7 +24,9 @@ Errata E12 item 1 (card GGz), rule `closure-path-git-literal`. The custody check
 FNXC:CccPlanningProofCommands 2026-10-14-23:14:
 Errata E12 item 3 (card GGz), rule `candidate-in-running-task-paths`, which replaces `candidate-in-own-write-roots`. The custody check does not hydrate a proof once per task: it runs once per proof with every route's owned paths and write roots as the model write roots (importer.ts:1509-1517, hydrateProof), so it admits a candidate inside any of them. IB1 makes a proof's candidates the owned paths of the tasks that name it (proposal.ts:261), which for a proof two tasks share is the union of both, and for an owned directory is the directory itself, outside any narrower write root. The rule G4 applies is the custody rule restricted to the proof's own tasks: each candidate lies, by exact spelling, inside an owned path or write root of at least one task that runs the proof. A candidate that matches one only on the comparison key is refused, because the custody check compares exact strings.
 FNXC:CccPlanningProofCommands 2026-10-15-00:02:
-Card GGz repair 1, rule `closure-path-git-literal` extended to Unicode normalization (the sibling of E12 item 1, raised by the adversary). `git init` on the I2 host's APFS volume writes core.precomposeunicode=true into the repository's own config, which the custody check still reads because it scrubs only the global and system config, so git composes a decomposed (NFD) `ls-tree -- <path>` argument to NFC. A bundle B1 commits through the working tree holds the NFC name, so the listed entry differs from the path asked (semantic-proof-custody.ts:150, :164-167); one that kept the NFD name through plumbing lists nothing. Either way the custody check refuses, while K1's bundle validator, IB1 and every earlier G4 rule accept the NFD path. A closure path whose NFC form differs from its spelling is therefore refused here. Git precomposes only on Darwin, so on Linux this refuses a path the custody check would admit: a fail-closed over-refusal, consistent with K1's Darwin-first comparison key. RED and NFC control are pinned against the real custody hydration in the parity test.
+Card GGz repair 1, rule `closure-path-git-literal` extended to Unicode normalization (the sibling of E12 item 1, raised by the adversary). `git init` on the I2 host's APFS volume writes core.precomposeunicode=true into the repository's own config, which the custody check still reads because it scrubs only the global and system config, so git composes a decomposed (NFD) `ls-tree -- <path>` argument to NFC. VP builds B1 with plumbing (D20), and the custody check refuses the NFD path however the bundle is committed: a working-tree commit, and plumbing that takes the path as an argument (`update-index --cacheinfo`, which git composes too), store the NFC name, so the one entry listed differs from the path asked (semantic-proof-custody.ts:150, :164-167); plumbing that reads paths from stdin (`update-index -z --index-info`) keeps the NFD name, and ls-tree lists nothing (errata E16 item 4, probed with both commit styles on the I2 host). K1's bundle validator, IB1 and every earlier G4 rule accept the NFD path, so a closure path whose NFC form differs from its spelling is refused here. The rule over-refuses in two places, both fail-closed and accepted like K1's I/ı residual: on Linux, where git does not precompose at all, and on Darwin for names that NFC changes but git's precompose leaves alone, which the custody check admits there (U+212B ANGSTROM SIGN, U+2126 OHM SIGN, U+212A KELVIN SIGN, the CJK compatibility ideograph U+F900, and decomposed Kaithi U+110A5 U+110BA). RED and NFC control are pinned against the real custody hydration in the parity test.
+FNXC:CccPlanningProofCommands 2026-10-15-00:53:
+Card GGz repair 2 (errata E16 items 1 and 2), two more closure paths G4 admitted that a later step refuses. (1) Rule `closure-path-git-literal` also refuses a path that is not well-formed Unicode (an unpaired UTF-16 surrogate, `!path.isWellFormed()`): Node writes the surrogate as U+FFFD when it encodes the custody check's `git ls-tree` argument, so git lists another spelling and the custody check refuses (semantic-proof-custody.ts:150, :164-167) on every platform and for both commit styles. (2) Rule `closure-path-canonical` also mirrors the compiler's `isCanonicalRootRelativeSource` (engine ccc-prd/compiler.ts:93-105), which IB2's compile applies to every verifier closure entry (:515) before import: it refuses a path that is empty or not trimmed, holds a backslash or NUL, starts with `file:` in any letter case, is absolute on posix or win32, or has an empty, `.` or `..` segment. K1's bundle validator and the custody rules admit `File:data.json` and padded names, so G4 used to pass them to review and the compile refused the plan. One diagnostic per path: the custody spelling problem is reported when there is one, else the compiler's. The compiler applies the same predicate to candidate inputs (:538); G4 needs no separate mirror there, because every candidate must equal a token of the Taskfile target (`target-candidates-match-proof`), whose grammar (`TARGET_COMMAND_TOKEN`, letters, digits, `.`, `_`, `/` and `-`, canonical) admits none of those shapes. Both items are pinned against the real custody hydration and the real compile in the parity test.
 */
 
 export type CccPlanningProofDefinition = Readonly<{
@@ -109,6 +111,20 @@ function canonicalPathProblem(path: string): string | null {
     || path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
   ) {
     return "is not a canonical target-relative path";
+  }
+  return null;
+}
+
+/** The compiler's `isCanonicalRootRelativeSource` (compiler.ts:93-105), which it applies to every verifier closure path (:515). */
+function compilerSourceProblem(path: string): string | null {
+  if (
+    typeof path !== "string" || path.trim().length === 0 || path !== path.trim()
+    || path.includes("\\") || path.includes("\0") || path.toLowerCase().startsWith("file:")
+    || posix.isAbsolute(path) || win32.isAbsolute(path)
+    || path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    return "is not a canonical root-relative source (empty or untrimmed, a backslash or NUL, a file: prefix in any letter case, absolute,"
+      + " or an empty, . or .. segment); the compiler refuses the proof as CCC_PRD_PROOF_INVALID (compiler.ts:93-105 isCanonicalRootRelativeSource, applied to the verifier closure at :515)";
   }
   return null;
 }
@@ -304,7 +320,7 @@ export function checkCccPlanningProofCommands(
     const closure = proof.verifierClosure;
     const closureKeys = new Map<string, string>();
     for (const entry of closure) {
-      const problem = canonicalPathProblem(entry.path);
+      const problem = canonicalPathProblem(entry.path) ?? compilerSourceProblem(entry.path);
       if (problem) add("closure-path-canonical", subject, entry.path, problem);
       if (typeof entry.path === "string" && entry.path.startsWith(":")) {
         add("closure-path-git-literal", subject, entry.path,
@@ -313,6 +329,10 @@ export function checkCccPlanningProofCommands(
       if (typeof entry.path === "string" && entry.path.normalize("NFC") !== entry.path) {
         add("closure-path-git-literal", subject, entry.path,
           "is not in Unicode NFC (composed) form; the I2 host's repository sets core.precomposeunicode, so git composes the custody check's `git ls-tree` argument, lists another spelling or nothing, and the custody check refuses the proof (semantic-proof-custody.ts:150, :164-167)");
+      }
+      if (typeof entry.path === "string" && !entry.path.isWellFormed()) {
+        add("closure-path-git-literal", subject, entry.path,
+          "is not well-formed Unicode (it holds an unpaired surrogate); Node writes it as U+FFFD in the custody check's `git ls-tree` argument, so git lists another spelling and the custody check refuses the proof (semantic-proof-custody.ts:150, :164-167)");
       }
       const key = cccPlanningPathComparisonKey(entry.path);
       const first = closureKeys.get(key);
