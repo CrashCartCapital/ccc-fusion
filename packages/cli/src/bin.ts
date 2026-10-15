@@ -719,6 +719,14 @@ async function main() {
   before plan.ts ever saw it. It also runs before onboarding and the handler load, so a JSON line is never preceded by
   anything else. The exit goes through process.exitCode (never process.exit), and runPlanCommand never throws, so bin's
   catch, which maps a unique violation to FUSION_NON_RETRYABLE_EXIT_CODE, is not involved.
+
+  FNXC:CccPlanningCli 2026-10-14-23:16:
+  The early return skips the shutdown tail below, so the route closes the global settings revision layers itself
+  (CL1 repair 1): the default openLayer runs resolveProject(undefined), whose stale-default-project path
+  (clearDefaultProject -> GlobalSettingsStore.updateSettings -> getRevisionLayer) caches a CentralCore with embedded
+  PostgreSQL that only closeDirectGlobalRevisionLayers closes, and without it `fn plan status RUN` never exits on its own.
+  It runs in a finally so every outcome (success, usage error, refusal, a throwing deps factory) closes once, and it is
+  best effort: a failing close never changes the exit code or what was printed.
   */
   if (process.argv[2] === "plan") {
     try {
@@ -727,6 +735,13 @@ async function main() {
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
       process.exitCode = 1;
+    } finally {
+      try {
+        const { closeDirectGlobalRevisionLayers } = await import("@fusion/core");
+        await closeDirectGlobalRevisionLayers();
+      } catch {
+        // Best effort: closing never changes the exit code of a command that already finished.
+      }
     }
     return;
   }

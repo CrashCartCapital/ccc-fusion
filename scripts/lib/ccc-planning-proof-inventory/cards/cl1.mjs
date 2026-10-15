@@ -2,9 +2,12 @@
 FNXC:CccPlanningProof 2026-10-14-22:58:
 Proof inventory for request-to-code v3 card CL1 (`fn plan` CLI: CONTRACT-v3.5 section 2.19, D35, D49, errata E2-4/E4-6). One module per card keeps the inventory files disjoint; `index.mjs` loads `cards/*.mjs` in sorted order and rejects duplicate command ids.
 
-TARGETED is file-closed over the card's two check files and OFFLINE is name-closed over the same two files: the names below are exactly their tests, built the way `assertionName` in `scripts/lib/ccc-closed-vitest-results.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Both run in the @runfusion/fusion package's single Vitest project, which aliases @fusion/core and @fusion/engine to source, so no build runs. Neither file reaches PostgreSQL (the L1 store operations are injected spies and bin.ts is driven through its `plan` route, which returns before any store opens), so `needsPostgres` is false and the runner sets the PostgreSQL skip flag for the command; the files do not name the flag.
+TARGETED is file-closed over the card's two check files and OFFLINE is name-closed over the same two files: the names below are exactly their tests, built the way `assertionName` in `scripts/lib/ccc-closed-vitest-results.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Both run in the @runfusion/fusion package's single Vitest project, which aliases @fusion/core and @fusion/engine to source, so no build runs. Neither file reaches PostgreSQL (the L1 store operations are injected spies, and bin.ts is driven through its `plan` route with the default deps factory swapped for a fail-closed tripwire fake whose store-facing deps trip a flag and reject, so a parser regression fails an assertion instead of starting the operator's embedded PostgreSQL; the route's close of the global settings revision layers is counted through a partial mock of @fusion/core), so `needsPostgres` is false and the runner sets the PostgreSQL skip flag for the command; the files do not name the flag.
 
-Measured on the M5 Max under parallel-agent load (load average 11.5 on the 1 minute figure): about 3 s wall for the two files (27 tests), from a cold transform cache about 8 s. The 120 s command timeout is a hang bound over that measurement; no test timeout is raised anywhere. The 27 names below are exactly the passing names of a JSON reporter run of the card command: 22 in plan.test.ts and 5 in bin-plan-routing.test.ts.
+Measured on the M5 Max under parallel-agent load (load average 11.5 on the 1 minute figure): about 3 s wall for the two files (27 tests), from a cold transform cache about 8 s. The 120 s command timeout is a hang bound over that measurement; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProof 2026-10-14-23:17:
+Repair 1 (CL1 review findings) adds two bin tests for the plan route's close of the global settings revision layers, so the card now has 29 tests: 22 in plan.test.ts and 7 in bin-plan-routing.test.ts. The 29 names below are exactly the passing names of a JSON reporter run of the card command (re-measured at repair 1 under a load average of 8.3: about 2 s wall, 29 passed; the cold-cache figure above is the original measurement). The five existing bin test names are unchanged.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -68,6 +71,8 @@ export const OFFLINE = Object.freeze([
       `${BIN} > fn plan status with no --project resolves the project from the run row through bin and exits 0 with kind status`,
       `${BIN} > the --project given to fn plan reaches plan.ts untouched: bin does not strip it`,
       `${BIN} > an unexpected error inside fn plan exits 1 with CCC_PLANNING_INTERNAL_ERROR, never the non-retryable exit bin gives a unique violation`,
+      `${BIN} > bin closes the global revision layers exactly once after every fn plan outcome: a usage error, a success, an unexpected error and a throwing deps factory`,
+      `${BIN} > a failing close of the global revision layers never changes the fn plan exit code or its one JSON line`,
     ]),
     platform: "any",
     needsPostgres: false,

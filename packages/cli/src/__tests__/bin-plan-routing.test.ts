@@ -1,6 +1,9 @@
 /*
 FNXC:CccPlanningCli 2026-10-14-22:41:
-Card CL1 (CONTRACT-v3.5 section 2.19, D35): `fn plan` is routed by bin.ts BEFORE the bin-level `--project` parse, so plan.ts owns exit 2 and the JSON usage errors. These tests drive bin's own entry with injected argv (bin.ts is re-evaluated per import, the way bin.test.ts does) and read the process exit code bin leaves behind; the plan module is the real one, with only its default deps factory swapped for a spy-backed fake so no PostgreSQL is reached.
+Card CL1 (CONTRACT-v3.5 section 2.19, D35): `fn plan` is routed by bin.ts BEFORE the bin-level `--project` parse, so plan.ts owns exit 2 and the JSON usage errors. These tests drive bin's own entry with injected argv (bin.ts is re-evaluated per import, the way bin.test.ts does) and read the process exit code bin leaves behind; the plan module is the real one, with only its default deps factory swapped.
+
+FNXC:CccPlanningCli 2026-10-14-23:16:
+Repair 1 (CL1 review findings). (1) The swapped factory falls back to a fail-closed tripwire fake, never to the real default deps: the real `openLayer` runs resolveProject and then CentralCore.init(), which starts the operator's embedded PostgreSQL under ~/.fusion, so a parser regression (or a half-edited plan.ts) must fail an assertion here without ever reaching a store. Every store-facing dep of the fake sets `planState.tripped` and rejects; the tests that rely on the parser refusing before any dep assert `tripped` stays false. (2) The plan route must close the global settings revision layers (`closeDirectGlobalRevisionLayers`) the way bin's own shutdown tail does, because the default `openLayer` can start one through resolveProject's stale-default-project path and nothing else closes it, so the process would never exit; @fusion/core is partially mocked to count that call.
 */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FUSION_NON_RETRYABLE_EXIT_CODE, type AsyncDataLayer, type CccPlanningRunStatusV1 } from "@fusion/core";
@@ -8,10 +11,32 @@ import type { PlanCommandDeps } from "../commands/plan.js";
 
 const RUN = "ccc-plan:0123456789abcdef01234567";
 
-const planState = vi.hoisted(() => ({
-  injected: undefined as unknown,
-  defaultFactoryCalls: 0,
-}));
+const planState = vi.hoisted(() => {
+  const state = {
+    injected: undefined as unknown,
+    defaultFactoryCalls: 0,
+    /** Set by any store-facing dep of the fail-closed fake: a test that expects no store access asserts this stays false. */
+    tripped: false,
+    /** When set, the swapped factory throws it instead of returning deps (bin's catch branch for the plan route). */
+    factoryError: undefined as Error | undefined,
+    closeLayers: vi.fn(async (): Promise<void> => {}),
+    tripwireDeps: undefined as unknown as () => unknown,
+  };
+  const trip = async (): Promise<never> => {
+    state.tripped = true;
+    throw new Error("bin-plan-routing: store access attempted");
+  };
+  state.tripwireDeps = () => ({
+    ledger: { resolveRunProject: trip, inspectRun: trip, requestControl: trip, answerDecision: trip },
+    openLayer: trip,
+    applyBuildControl: trip,
+    readTextFile: trip,
+    osUserName: () => "operator-user",
+    stdout: (line: string) => { console.log(line); },
+    stderr: (line: string) => { console.error(line); },
+  });
+  return state;
+});
 
 vi.mock("../commands/plan.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../commands/plan.js")>();
@@ -19,10 +44,16 @@ vi.mock("../commands/plan.js", async (importOriginal) => {
     ...actual,
     createDefaultPlanCommandDeps: () => {
       planState.defaultFactoryCalls += 1;
-      return (planState.injected as PlanCommandDeps | undefined) ?? actual.createDefaultPlanCommandDeps();
+      if (planState.factoryError) throw planState.factoryError;
+      return (planState.injected as PlanCommandDeps | undefined) ?? (planState.tripwireDeps() as PlanCommandDeps);
     },
   };
 });
+
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@fusion/core")>()),
+  closeDirectGlobalRevisionLayers: planState.closeLayers,
+}));
 
 const originalArgv = process.argv;
 const originalExit = process.exit;
@@ -33,13 +64,14 @@ const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 const exitSpy = vi.fn();
 
-type BinOutcome = Readonly<{ exitCode: number | string | undefined; thrown: unknown; stdout: string[]; stderr: string[] }>;
+type BinOutcome = Readonly<{ exitCode: number | string | undefined; thrown: unknown; stdout: string[]; stderr: string[]; closeCalls: number }>;
 
 async function runBin(args: string[]): Promise<BinOutcome> {
   process.argv = ["node", "bin.ts", ...args];
   process.exitCode = undefined;
   logSpy.mockClear();
   errorSpy.mockClear();
+  planState.closeLayers.mockClear();
   importCounter += 1;
   let thrown: unknown;
   try {
@@ -54,6 +86,7 @@ async function runBin(args: string[]): Promise<BinOutcome> {
     thrown,
     stdout: logSpy.mock.calls.map((call) => call.join(" ")),
     stderr: errorSpy.mock.calls.map((call) => call.join(" ")),
+    closeCalls: planState.closeLayers.mock.calls.length,
   };
 }
 
@@ -90,6 +123,10 @@ describe("bin routes fn plan before the bin-level --project parse (card CL1, D35
     process.exit = exitSpy as unknown as typeof process.exit;
     planState.injected = undefined;
     planState.defaultFactoryCalls = 0;
+    planState.tripped = false;
+    planState.factoryError = undefined;
+    planState.closeLayers.mockReset();
+    planState.closeLayers.mockImplementation(async () => {});
     process.env.FUSION_SKIP_ONBOARDING = "1";
   });
 
@@ -112,6 +149,7 @@ describe("bin routes fn plan before the bin-level --project parse (card CL1, D35
     expect(JSON.parse(outcome.stdout[0]!)).toMatchObject({ schema: "ccc-planning.cli.v1", kind: "usage_error", code: "CCC_PLANNING_CLI_USAGE" });
     expect(exitSpy).not.toHaveBeenCalled();
     expect(planState.defaultFactoryCalls).toBe(1);
+    expect(planState.tripped, "a usage error must never reach a store dep").toBe(false);
 
     planState.defaultFactoryCalls = 0;
     const control = await runBin(["task", "list", "--project", "a", "--project", "b"]);
@@ -123,11 +161,13 @@ describe("bin routes fn plan before the bin-level --project parse (card CL1, D35
 
   it("a missing RUN_ID and an unknown subcommand through bin exit 2 with a JSON usage_error line; the twin with the id does not", async () => {
     const missing = await runBin(["plan", "status", "--json"]);
+    expect(planState.tripped, "a missing RUN_ID must never reach a store dep").toBe(false);
     expect(missing.exitCode).toBe(2);
     expect(missing.stdout).toHaveLength(1);
     expect(JSON.parse(missing.stdout[0]!)).toMatchObject({ kind: "usage_error" });
 
     const unknown = await runBin(["plan", "frobnicate", "--json"]);
+    expect(planState.tripped, "an unknown subcommand must never reach a store dep").toBe(false);
     expect(unknown.exitCode).toBe(2);
     expect(JSON.parse(unknown.stdout[0]!)).toMatchObject({ kind: "usage_error" });
 
@@ -169,5 +209,51 @@ describe("bin routes fn plan before the bin-level --project parse (card CL1, D35
     expect(exitSpy).not.toHaveBeenCalled();
     expect(fake.out).toHaveLength(1);
     expect(JSON.parse(fake.out[0]!)).toMatchObject({ kind: "refusal", code: "CCC_PLANNING_INTERNAL_ERROR" });
+  });
+
+  it("bin closes the global revision layers exactly once after every fn plan outcome: a usage error, a success, an unexpected error and a throwing deps factory", async () => {
+    const usage = await runBin(["plan", "status", "--json"]);
+    expect(usage.exitCode).toBe(2);
+    expect(usage.closeCalls).toBe(1);
+
+    const fake = fakeDeps();
+    planState.injected = fake.deps;
+    const ok = await runBin(["plan", "status", RUN, "--json"]);
+    expect(ok.exitCode).toBe(0);
+    expect(ok.closeCalls).toBe(1);
+
+    const broken = fakeDeps({ inspect: async () => { throw new Error("store went away"); } });
+    planState.injected = broken.deps;
+    const refusal = await runBin(["plan", "status", RUN, "--json"]);
+    expect(refusal.exitCode).toBe(1);
+    expect(refusal.closeCalls).toBe(1);
+
+    planState.injected = undefined;
+    planState.factoryError = new Error("deps factory failed");
+    const factory = await runBin(["plan", "status", RUN, "--json"]);
+    expect(factory.exitCode).toBe(1);
+    expect(factory.stderr).toEqual(["Error: deps factory failed"]);
+    expect(factory.closeCalls).toBe(1);
+    expect(planState.tripped).toBe(false);
+  });
+
+  it("a failing close of the global revision layers never changes the fn plan exit code or its one JSON line", async () => {
+    planState.closeLayers.mockRejectedValue(new Error("close failed"));
+
+    const usage = await runBin(["plan", "status", "--json"]);
+    expect(usage.thrown).toBeUndefined();
+    expect(usage.closeCalls).toBe(1);
+    expect(usage.exitCode).toBe(2);
+    expect(usage.stdout).toHaveLength(1);
+    expect(JSON.parse(usage.stdout[0]!)).toMatchObject({ kind: "usage_error" });
+
+    const fake = fakeDeps();
+    planState.injected = fake.deps;
+    const ok = await runBin(["plan", "status", RUN, "--json"]);
+    expect(ok.thrown).toBeUndefined();
+    expect(ok.closeCalls).toBe(1);
+    expect(ok.exitCode).toBe(0);
+    expect(fake.out).toHaveLength(1);
+    expect(JSON.parse(fake.out[0]!)).toMatchObject({ kind: "status" });
   });
 });
