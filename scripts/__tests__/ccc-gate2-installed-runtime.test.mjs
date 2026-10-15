@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 async function loadInstalledRuntime() {
   try {
@@ -405,6 +406,116 @@ test("PRD:GATE2-09 failed installed-runtime pack restores the CLI package manife
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const gate2RepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+/*
+FNXC:CccPlanningInstalledRuntime 2026-10-14-18:48:
+Card IP extracts the build, pack, manifest-restore and install sequence of `prepareGate2InstalledRuntime` into scripts/lib/ccc-installed-cli.mjs (`packAndInstallFusionCli`). The two tests below are the regression guard the card names: the first pins where the sequence lives (it fails on the pre-extraction bytes), the second drives the whole successful path through fake `corepack` and `npm` executables and pins the exact step order and arguments Gate 2 has always used, so the extraction cannot quietly add an offline flag, a cache override or a different HOME. The failing-pack path is the existing GATE2-09 test above, unchanged.
+*/
+test("PRD:GATE2-10 the pack, restore and install sequence lives in the shared installed-cli module", async () => {
+  const gate2 = await readFile(path.join(gate2RepoRoot, "scripts/lib/ccc-gate2-installed-runtime.mjs"), "utf8");
+  const shared = await readFile(path.join(gate2RepoRoot, "scripts/lib/ccc-installed-cli.mjs"), "utf8");
+  assert.match(gate2, /from "\.\/ccc-installed-cli\.mjs"/u);
+  assert.match(gate2, /packAndInstallFusionCli\(/u);
+  for (const step of ["clean npm install", "fresh CLI package build", "restore CLI package manifest after pack", "pnpm pack"]) {
+    assert.ok(!gate2.includes(step), `${step} no longer lives in the Gate 2 module`);
+    assert.ok(shared.includes(step), `${step} lives in the shared module`);
+  }
+});
+
+test("PRD:GATE2-10 a successful prepare returns the Gate 2 receipt through the shared sequence with the unchanged npm arguments", async () => {
+  const { prepareGate2InstalledRuntime } = await loadInstalledRuntime();
+  assert.equal(typeof prepareGate2InstalledRuntime, "function");
+  const root = await mkdtemp(path.join(tmpdir(), "ccc-gate2-prepare-success-"));
+  const installRoot = path.join(root, "installed");
+  const cliRoot = path.join(root, "cli");
+  const fakeBin = path.join(root, "bin");
+  const logPath = path.join(root, "calls.jsonl");
+  const originalPath = process.env.PATH;
+  const originalLog = process.env.FAKE_GATE2_LOG;
+  const controllerSource = "export async function runPrdCommand() { return 0; }\n";
+  const runtimeSource = [
+    "export class CentralCore {}",
+    "export class TaskStore {}",
+    "export class InProcessRuntime {}",
+    "export const __resetWorkflowExtensionRegistryForTests = () => undefined;",
+    "export const bootstrapCccCampaignProofAdmissionHost = async () => undefined;",
+    "export const readCustomProviders = () => [];",
+    "export const computeCccCampaignOperatorControlConfirmation = () => 'confirmation';",
+    "export const resolveCccPrdSemanticProofToolchainPaths = () => ({});",
+    "",
+  ].join("\n");
+  try {
+    await mkdir(installRoot);
+    await mkdir(path.join(cliRoot, "scripts"), { recursive: true });
+    await mkdir(fakeBin, { recursive: true });
+    await writeFile(logPath, "");
+    await writeFile(path.join(cliRoot, "scripts/prepare-publish-manifest.mjs"), [
+      "import { appendFileSync } from 'node:fs';",
+      "appendFileSync(process.env.FAKE_GATE2_LOG, JSON.stringify({ tool: 'postpack', args: process.argv.slice(2) }) + '\\n');",
+      "",
+    ].join("\n"));
+    await writeFile(path.join(fakeBin, "corepack"), [
+      "#!/usr/bin/env node",
+      "const fs = require('fs'); const path = require('path');",
+      "const a = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.FAKE_GATE2_LOG, JSON.stringify({ tool: 'corepack', args: a, cwd: process.cwd(), home: process.env.HOME }) + '\\n');",
+      "if (a[0] === 'pnpm' && a[1] === 'run' && a[2] === 'build:package') process.exit(0);",
+      "if (a[0] === 'pnpm' && a[1] === 'pack') { fs.writeFileSync(path.join(a[a.indexOf('--pack-destination') + 1], 'runfusion-fusion-1.2.3.tgz'), 'sealed-tarball\\n'); process.exit(0); }",
+      "process.exit(2);",
+      "",
+    ].join("\n"));
+    await writeFile(path.join(fakeBin, "npm"), [
+      "#!/usr/bin/env node",
+      "const fs = require('fs'); const path = require('path');",
+      "const a = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.FAKE_GATE2_LOG, JSON.stringify({ tool: 'npm', args: a, cwd: process.cwd(), home: process.env.HOME }) + '\\n');",
+      "const modules = path.join(process.cwd(), 'node_modules'); const pkg = path.join(modules, '@runfusion', 'fusion');",
+      "fs.mkdirSync(path.join(pkg, 'dist'), { recursive: true }); fs.mkdirSync(path.join(modules, '.bin'), { recursive: true });",
+      "fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ name: '@runfusion/fusion', version: '1.2.3' }));",
+      `fs.writeFileSync(path.join(pkg, 'dist', 'ccc-prd-controller.js'), ${JSON.stringify(controllerSource)});`,
+      `fs.writeFileSync(path.join(pkg, 'dist', 'ccc-gate2-runtime-host.js'), ${JSON.stringify(runtimeSource)});`,
+      "fs.writeFileSync(path.join(modules, '.bin', 'fn'), '#!/bin/sh\\necho 1.2.3\\n', { mode: 0o755 });",
+      "",
+    ].join("\n"));
+    await chmod(path.join(fakeBin, "corepack"), 0o755);
+    await chmod(path.join(fakeBin, "npm"), 0o755);
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ""}`;
+    process.env.FAKE_GATE2_LOG = logPath;
+
+    const receipt = await prepareGate2InstalledRuntime({ root: installRoot, cliRoot });
+
+    assert.equal(receipt.schema, "ccc-gate2.installed-runtime.v1");
+    assert.equal(receipt.packageName, "@runfusion/fusion");
+    assert.equal(receipt.packageVersion, "1.2.3");
+    assert.equal(receipt.versionOutput, "1.2.3");
+    assert.equal(receipt.tarballPath, path.join(installRoot, "pack", "runfusion-fusion-1.2.3.tgz"));
+    assert.equal(receipt.installedRoot, path.join(installRoot, "install", "node_modules/@runfusion/fusion"));
+    assert.equal(receipt.executablePath, path.join(installRoot, "install", "node_modules/.bin/fn"));
+    assert.equal(receipt.tarballSha256, createHash("sha256").update("sealed-tarball\n").digest("hex"));
+    assert.equal(receipt.controllerModuleSha256, createHash("sha256").update(controllerSource).digest("hex"));
+    assert.equal(receipt.runtimeModuleSha256, createHash("sha256").update(runtimeSource).digest("hex"));
+    const calls = (await readFile(logPath, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((call) => `${call.tool}:${call.args.join(" ")}`), [
+      "corepack:pnpm run build:package",
+      `corepack:pnpm pack --pack-destination ${path.join(installRoot, "pack")}`,
+      "postpack:postpack",
+      `npm:install --no-audit --no-fund --ignore-scripts ${receipt.tarballPath}`,
+    ]);
+    for (const call of calls.filter((entry) => entry.tool === "corepack" || entry.tool === "npm")) {
+      assert.equal(call.home, path.join(installRoot, "home"), `${call.tool} runs under the isolated home`);
+    }
+    assert.equal(calls.find((call) => call.tool === "npm").cwd, await realpath(path.join(installRoot, "install")));
+    assert.equal(JSON.parse(await readFile(path.join(installRoot, "install", "package.json"), "utf8")).name, "ccc-gate2-installed-runtime");
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalLog === undefined) delete process.env.FAKE_GATE2_LOG;
+    else process.env.FAKE_GATE2_LOG = originalLog;
     await rm(root, { recursive: true, force: true });
   }
 });

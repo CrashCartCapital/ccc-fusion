@@ -1,23 +1,13 @@
 import { createHash } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { packAndInstallFusionCli, runCheckedCommand } from "./ccc-installed-cli.mjs";
+
 async function sha256File(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
-}
-
-function run(command, args, options) {
-  const result = spawnSync(command, args, {
-    cwd: options.cwd,
-    encoding: "utf8",
-    env: options.env,
-  });
-  if (result.status !== 0 || (!options.allowStderr && result.stderr !== "")) {
-    throw new Error(`${options.label} failed (exit ${result.status})\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
-  }
-  return result.stdout.trim();
 }
 
 export async function runGate2InstalledPrdCommand(input) {
@@ -171,7 +161,7 @@ export async function captureGate2InstalledRuntimeReceipt(input) {
   if (packageJson.name !== "@runfusion/fusion" || typeof packageJson.version !== "string") {
     throw new Error("installed Gate 2 package identity is invalid");
   }
-  const versionOutput = run(input.executablePath, ["--version"], {
+  const versionOutput = runCheckedCommand(input.executablePath, ["--version"], {
     cwd: input.home,
     env: { ...process.env, HOME: input.home, NO_COLOR: "1" },
     label: "installed fn --version",
@@ -218,56 +208,17 @@ export async function captureGate2InstalledRuntimeReceipt(input) {
   };
 }
 
+/**
+ * FNXC:CccPlanningInstalledRuntime 2026-10-14-18:55: the build, pack, manifest-restore and install sequence moved to
+ * `packAndInstallFusionCli` (card IP); Gate 2 keeps its receipt, its schema and the default arguments of that sequence.
+ */
 export async function prepareGate2InstalledRuntime(input) {
-  const root = path.resolve(input.root);
-  if ((await readdir(root)).length > 0) throw new Error("installed runtime root is not empty");
-  const packRoot = path.join(root, "pack");
-  const installRoot = path.join(root, "install");
-  const home = path.join(root, "home");
-  await mkdir(packRoot, { recursive: true });
-  await mkdir(installRoot, { recursive: true });
-  await writeFile(path.join(installRoot, "package.json"), `${JSON.stringify({
-    name: "ccc-gate2-installed-runtime",
-    version: "0.0.0",
-    private: true,
-  }, null, 2)}\n`);
-  const env = { ...process.env, HOME: home, NO_COLOR: "1" };
-  run("corepack", ["pnpm", "run", "build:package"], {
-    cwd: path.resolve(input.cliRoot), env, label: "fresh CLI package build", allowStderr: true,
+  const { tarballPath, installedRoot, executablePath, home } = await packAndInstallFusionCli({
+    root: input.root,
+    cliRoot: input.cliRoot,
+    env: process.env,
+    installProjectName: "ccc-gate2-installed-runtime",
   });
-  let packFailure = null;
-  let restoreFailure = null;
-  try {
-    run("corepack", ["pnpm", "pack", "--pack-destination", packRoot], {
-      cwd: path.resolve(input.cliRoot), env, label: "pnpm pack",
-    });
-  } catch (error) {
-    packFailure = error;
-  } finally {
-    try {
-      run(process.execPath, ["./scripts/prepare-publish-manifest.mjs", "postpack"], {
-        cwd: path.resolve(input.cliRoot), env, label: "restore CLI package manifest after pack", allowStderr: true,
-      });
-    } catch (error) {
-      restoreFailure = error;
-    }
-  }
-  if (packFailure && restoreFailure) {
-    throw new Error(`${packFailure.message}\npostpack restore failed:\n${restoreFailure.message}`, {
-      cause: restoreFailure,
-    });
-  }
-  if (restoreFailure) throw restoreFailure;
-  if (packFailure) throw packFailure;
-  const tarballs = (await readdir(packRoot)).filter((name) =>
-    name.startsWith("runfusion-fusion-") && name.endsWith(".tgz"));
-  if (tarballs.length !== 1) throw new Error(`expected one packed Fusion tarball, received ${tarballs.length}`);
-  const tarballPath = path.join(packRoot, tarballs[0]);
-  run("npm", ["install", "--no-audit", "--no-fund", "--ignore-scripts", tarballPath], {
-    cwd: installRoot, env, label: "clean npm install", allowStderr: true,
-  });
-  const installedRoot = path.join(installRoot, "node_modules/@runfusion/fusion");
-  const executablePath = path.join(installRoot, "node_modules/.bin/fn");
   return captureGate2InstalledRuntimeReceipt({
     tarballPath, installedRoot, executablePath, home,
   });
