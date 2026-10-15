@@ -712,6 +712,25 @@ function readOwnCliVersion(): string | undefined {
 }
 
 async function main() {
+  /*
+  FNXC:CccPlanningCli 2026-10-14-22:43:
+  `fn plan` is routed before the bin-level `--project` parse (CONTRACT-v3.5 section 2.19, D35): plan.ts owns its grammar, its
+  positional RUN_ID, its exit 2 and its JSON usage errors, and extractGlobalProjectFlag would throw on a duplicate `--project`
+  before plan.ts ever saw it. It also runs before onboarding and the handler load, so a JSON line is never preceded by
+  anything else. The exit goes through process.exitCode (never process.exit), and runPlanCommand never throws, so bin's
+  catch, which maps a unique violation to FUSION_NON_RETRYABLE_EXIT_CODE, is not involved.
+  */
+  if (process.argv[2] === "plan") {
+    try {
+      const { runPlanCommand, createDefaultPlanCommandDeps } = await import("./commands/plan.js");
+      process.exitCode = await runPlanCommand(process.argv.slice(3), createDefaultPlanCommandDeps());
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   const { cleanedArgs: args, projectName, skipOnboarding } = extractGlobalProjectFlag(process.argv.slice(2));
 
   // Print version and exit before any application imports. This is what the
