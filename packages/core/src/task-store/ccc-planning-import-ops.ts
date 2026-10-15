@@ -29,6 +29,18 @@ Decisions worth stating where the code is (each is the narrowest reading of the 
   work item and L1 takes the work item before the anchor, so this order agrees with both.
 - A caller bug (a malformed intent, an intent for another run, receipt or key, a link before any intent or before the
   importer committed its row) refuses CCC_PLANNING_INTERNAL_ERROR before any write, as AD1 does.
+
+FNXC:CccPlanningImportLink 2026-10-14-23:48 (repair 2, errata E13):
+The bounds are tied to the bundle that is actually imported (the adversary's X1: the limits were checked against one
+bundle while the intent named, and the importer ran, another). So:
+- the intent records only when the published bundle artifact is the bundle it names: the bundle's own `bundleHash`
+  equals `intent.bundleHash` (required), and its `sourceHash` and `sidecarHash`, wherever the bundle carries them,
+  equal `intent.packetHash` and `intent.sidecarHash`; else IMPORT_IDENTITY_DRIFT before the CAS;
+- the link reads `ccc_prd_imports.canonical_bundle->'bounds'`, the budget the importer actually runs with, and refuses
+  IMPORT_IDENTITY_DRIFT before the UPDATE unless it canonically equals the intent's three bundle-bound fields, so
+  `implementation_transferred` is provably the linked campaign's bound;
+- only an artifact whose envelope status is `complete` may be the bounds source: a bundle or admission_facts artifact
+  published as refused, blocked or infeasible is IMPORT_IDENTITY_DRIFT.
 */
 import { createHash } from "node:crypto";
 import { sql, type SQL } from "drizzle-orm";
@@ -328,11 +340,15 @@ function storedJson(row: { key: string; content: string; content_type: string | 
   return { ref: { artifactKey: row.key, digest: row.output_digest }, value: JSON.parse(row.content) as unknown };
 }
 
-/** The one published artifact of `kind` for the revision; none, or more than one, is drift. */
+/** The one published artifact of `kind` for the revision; none, or more than one, or one whose envelope status is not
+ *  `complete` (E13 item 2: only a complete artifact may be the bounds source), is drift. */
 async function readImportArtifact(tx: DbTransaction, anchor: AnchorRow, kind: CccPlanningArtifactKind, revision: number):
   Promise<StoredArtifact> {
-  const found = await rows<{ key: string; content: string; content_type: string | null; output_digest: string | null }>(tx, sql`
-    SELECT key, content, metadata->>'contentType' AS content_type, metadata->>'outputDigest' AS output_digest
+  const found = await rows<{
+    key: string; content: string; content_type: string | null; output_digest: string | null; status: string | null;
+  }>(tx, sql`
+    SELECT key, content, metadata->>'contentType' AS content_type, metadata->>'outputDigest' AS output_digest,
+           metadata->>'status' AS status
       FROM project.task_documents
      WHERE project_id = ${anchor.project_id} AND task_id = ${anchor.planning_task_id} AND key LIKE 'cccplan-%'
        AND metadata->>'kind' = ${kind} AND metadata->>'runRevision' = ${String(revision)}
@@ -342,11 +358,43 @@ async function readImportArtifact(tx: DbTransaction, anchor: AnchorRow, kind: Cc
     refuse("CCC_PLANNING_IMPORT_IDENTITY_DRIFT",
       `revision ${revision} of run ${anchor.run_id} has ${found.length} published ${kind} artifacts, not exactly one`, kind);
   }
-  return storedJson(found[0]!);
+  const stored = storedJson(found[0]!);
+  if (found[0]!.status !== "complete") {
+    refuse("CCC_PLANNING_IMPORT_IDENTITY_DRIFT",
+      `${stored.ref.artifactKey} is published with status ${String(found[0]!.status)}; only a complete ${kind} is a bounds source`, kind);
+  }
+  return stored;
+}
+
+function objectOf(value: unknown): Row | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Row) : undefined;
 }
 
 function boundsOf(value: unknown): unknown {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Row).bounds : undefined;
+  return objectOf(value)?.bounds;
+}
+
+/** The three fields of the limits that a bundle's `bounds` (`CccPrdExecutionBounds`) carries. */
+function bundleBoundsOf(limits: CccPlanningImportIntentV1["limits"]): object {
+  return { maxRequests: limits.maxRequests, maxDurationMs: limits.maxDurationMs, maxConcurrency: limits.maxConcurrency };
+}
+
+/** E13 item 1(a): the published bundle artifact is the bundle the intent names. Its own bundleHash is required to equal
+ *  the intent's; its sourceHash (the packet hash) and sidecarHash are compared wherever the bundle carries them. */
+function requireNamedBundle(bundle: StoredArtifact, intent: CccPlanningImportIntentV1): void {
+  const value = objectOf(bundle.value) ?? {};
+  const pairs = [
+    { field: "bundleHash", expected: intent.bundleHash, intentField: "bundleHash", required: true },
+    { field: "sourceHash", expected: intent.packetHash, intentField: "packetHash", required: false },
+    { field: "sidecarHash", expected: intent.sidecarHash, intentField: "sidecarHash", required: false },
+  ] as const;
+  for (const { field, expected, intentField, required } of pairs) {
+    if (!required && !Object.prototype.hasOwnProperty.call(value, field)) continue;
+    if (value[field] !== expected) {
+      refuse("CCC_PLANNING_IMPORT_IDENTITY_DRIFT",
+        `${bundle.ref.artifactKey} is not the bundle the intent names: its ${field} differs from intent.${intentField}`, `bundle.${field}`);
+    }
+  }
 }
 
 /** D16: the stored bounds and the intent's must be the same value, compared as canonical JSON. */
@@ -415,7 +463,9 @@ function requireImportingBuild(anchor: AnchorRow, what: string): void {
 
 /** One tx: require intent.limits deep-equal to the published bundle artifact's bounds and to admission_facts.bounds
  *  (else IMPORT_IDENTITY_DRIFT); CAS anchor importing (intent digest null) with import_intent_digest =
- *  sha256(canonical(intent)) and import_idempotency_key = intent.idempotencyKey; AND publish the import_intent artifact. */
+ *  sha256(canonical(intent)) and import_idempotency_key = intent.idempotencyKey; AND publish the import_intent artifact.
+ *  E13: both artifacts must be `complete`, and the bundle must be the one the intent names (bundleHash, and sourceHash
+ *  and sidecarHash wherever it carries them), else IMPORT_IDENTITY_DRIFT before the CAS. */
 export async function recordCccPlanningImportIntent(layer: AsyncDataLayer, i: Readonly<{
   runId: string; intent: CccPlanningImportIntentV1; fence: CccPlanningWorkItemFence;
   hooks?: Readonly<{ beforeArtifact?: () => Promise<void> }> }>): Promise<Readonly<{ intentDigest: string; replayed: boolean }>> {
@@ -453,10 +503,9 @@ export async function recordCccPlanningImportIntent(layer: AsyncDataLayer, i: Re
     const facts = await readImportArtifact(tx, anchor, "admission_facts", intent.runRevision);
     const bundle = await readImportArtifact(tx, anchor, "bundle", intent.runRevision);
     requireSameBounds("admission_facts", boundsOf(facts.value), intent.limits);
-    requireSameBounds("bundle", boundsOf(bundle.value), {
-      maxRequests: intent.limits.maxRequests, maxDurationMs: intent.limits.maxDurationMs,
-      maxConcurrency: intent.limits.maxConcurrency,
-    });
+    requireSameBounds("bundle", boundsOf(bundle.value), bundleBoundsOf(intent.limits));
+    // E13 item 1(a): and that bundle is the one the intent names, so the importer runs the bounds checked here.
+    requireNamedBundle(bundle, intent);
 
     const now = await databaseNow(tx);
     const updated = await rows(tx, sql`
@@ -493,7 +542,9 @@ export async function recordCccPlanningImportIntent(layer: AsyncDataLayer, i: Re
 }
 
 /** One tx: read ccc_prd_imports by idempotency key, require bundle hash = intent, set import_id and
- *  implementation_transferred, publish import_receipt. State moves to building or awaiting_execution_authority later (AU2). */
+ *  implementation_transferred, publish import_receipt. State moves to building or awaiting_execution_authority later (AU2).
+ *  E13: the row's canonical_bundle->'bounds' must canonically equal the intent's maxRequests, maxDurationMs and
+ *  maxConcurrency, else IMPORT_IDENTITY_DRIFT before the UPDATE. */
 export async function linkCccPlanningImport(layer: AsyncDataLayer, i: Readonly<{
   runId: string; fence: CccPlanningWorkItemFence; release: CccPlanningImportReceiptV1["release"] }>): Promise<CccPlanningImportReceiptV1> {
   const runId = requireRunId(i.runId);
@@ -507,8 +558,8 @@ export async function linkCccPlanningImport(layer: AsyncDataLayer, i: Readonly<{
     }
     const importKey = anchor.import_idempotency_key!;
     const { ref: intentRef, intent } = await readIntent(tx, anchor);
-    const imported = await rows<{ import_id: string; bundle_hash: string }>(tx, sql`
-      SELECT import_id, bundle_hash FROM project.ccc_prd_imports
+    const imported = await rows<{ import_id: string; bundle_hash: string; bounds: unknown }>(tx, sql`
+      SELECT import_id, bundle_hash, canonical_bundle->'bounds' AS bounds FROM project.ccc_prd_imports
        WHERE project_id = ${anchor.project_id} AND idempotency_key = ${importKey}
        FOR SHARE
     `);
@@ -520,6 +571,9 @@ export async function linkCccPlanningImport(layer: AsyncDataLayer, i: Readonly<{
       refuse("CCC_PLANNING_IMPORT_IDENTITY_DRIFT",
         `import ${row.import_id} holds bundle ${row.bundle_hash}, the intent names ${intent.bundleHash}`, "bundleHash");
     }
+    // E13 item 1(b): the imported campaign runs with its canonical bundle's bounds, so the transferred budget recorded
+    // below must be exactly those bounds (a missing bounds key reads as SQL NULL and is drift too).
+    requireSameBounds("ccc_prd_imports.canonical_bundle", row.bounds ?? undefined, bundleBoundsOf(intent.limits));
     const linkedBefore = anchor.import_id !== null;
     if (linkedBefore && anchor.import_id !== row.import_id) {
       refuse("CCC_PLANNING_IMPORT_LINK_WRITE_ONCE", `run ${anchor.run_id} is linked to import ${anchor.import_id}`, "importId");

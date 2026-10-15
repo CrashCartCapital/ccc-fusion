@@ -20,6 +20,15 @@
  *   hook order;
  * - bounds: the drifted intent carries exactly the limits stored in `admission_facts`, so only an implementation that
  *   reads the published bundle artifact refuses it.
+ *
+ * FNXC:CccPlanningImportLink 2026-10-14-23:48 (card IM1, repair 2, errata E13):
+ * The bounds are tied to the bundle that is actually imported (the adversary's X1). The fixture bundle now carries its
+ * own bundleHash, sourceHash and sidecarHash, equal to the intent's bundleHash, packetHash and sidecarHash, as a real
+ * semantic bundle does, and the importer row carries `canonical_bundle.bounds` equal to the intent's limits. The new
+ * REDs: an intent naming another bundle than the published one (or another packet or sidecar, or a bundle with no
+ * bundleHash) is refused at record; a link whose import row's canonical bounds differ from the intent's limits is
+ * refused although its bundle hash matches; and a bundle or admission_facts artifact whose envelope status is not
+ * `complete` is never the bounds source. Each refusal's control differs in that one fact and is accepted.
  */
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -35,7 +44,11 @@ import { createConnectionSetFromUrl, type PostgresConnections } from "../../post
 import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
 import { cccPlanningRuns } from "../../postgres/schema/ccc-planning.js";
 import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
-import type { CccPlanningArtifactPolicy, CccPlanningArtifactRef } from "../../ccc-planning/artifacts.js";
+import type {
+  CccPlanningArtifactPolicy,
+  CccPlanningArtifactRef,
+  CccPlanningArtifactStatus as ArtifactStatus,
+} from "../../ccc-planning/artifacts.js";
 import { CccPlanningRefusal, type CccPlanningRefusalCode } from "../../ccc-planning/errors.js";
 import { cccPlanningEventId, cccPlanningImportKey } from "../../ccc-planning/policy.js";
 import type { CccPlanningWorkItemFence } from "../../ccc-planning/types.js";
@@ -79,6 +92,13 @@ function sha(label: string): string {
 
 function bundleBoundsOf(limits: Limits): Bounds {
   return { maxRequests: limits.maxRequests, maxDurationMs: limits.maxDurationMs, maxConcurrency: limits.maxConcurrency };
+}
+
+type BundleIdentity = Readonly<{ bundleHash?: string; sourceHash?: string; sidecarHash?: string }>;
+
+/** The published bundle's own identity, equal to what `intentFor` names by default (sourceHash is the packet hash). */
+function bundleIdentityOf(runId: string): BundleIdentity {
+  return { bundleHash: sha(`bundle:${runId}`), sourceHash: sha(`packet:${runId}`), sidecarHash: sha(`sidecar:${runId}`) };
 }
 
 function syntheticRef(artifactKey: string): CccPlanningArtifactRef {
@@ -165,8 +185,10 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
   }
 
   /** A Build run in `importing` (or `spec_ready`), its planning work item leased, and both import-stage artifacts published. */
-  async function seedRun(options: { bundleBounds?: Bounds; factsBounds?: Limits; state?: "importing" | "spec_ready" } = {}):
-    Promise<Run> {
+  async function seedRun(options: {
+    bundleBounds?: Bounds; factsBounds?: Limits; state?: "importing" | "spec_ready";
+    bundleIdentity?: (runId: string) => BundleIdentity; bundleStatus?: ArtifactStatus; factsStatus?: ArtifactStatus;
+  } = {}): Promise<Run> {
     ordinal += 1;
     const taskId = `R2C-IM1-${ordinal}`;
     const runId = `ccc-plan:${sha(`r2c-im1-run-${ordinal}`).slice(0, 24)}`;
@@ -197,17 +219,20 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
     }
     const lease = { kind: "work_item_lease", workItemId, leaseOwner: LEASE_OWNER, attempt: 1, runId } as const;
     const common = { planningTaskId: taskId, runId, inputs: [], producer: CONTROLLER, policy: NO_POLICY,
-      status: "complete", fence: lease, now: NOW } as const;
+      fence: lease, now: NOW } as const;
     const facts = await publishCccPlanningArtifact(layer, {
-      ...common, slot: { runRevision: 1, stageId: "import", slot: "facts", version: 1 }, kind: "admission_facts",
+      ...common, status: options.factsStatus ?? "complete",
+      slot: { runRevision: 1, stageId: "import", slot: "facts", version: 1 }, kind: "admission_facts",
       contentSchema: "ccc-planning.admission-facts.v1",
       content: { type: "json", value: { schema: "ccc-planning.admission-facts.v1", targetRepository: TARGET,
         bounds: options.factsBounds ?? LIMITS } },
     });
     const bundle = await publishCccPlanningArtifact(layer, {
-      ...common, slot: { runRevision: 1, stageId: "import", slot: "bundle", version: 1 }, kind: "bundle",
+      ...common, status: options.bundleStatus ?? "complete",
+      slot: { runRevision: 1, stageId: "import", slot: "bundle", version: 1 }, kind: "bundle",
       contentSchema: "ccc-prd.semantic-bundle.v2",
-      content: { type: "json", value: { schemaVersion: 2, bounds: options.bundleBounds ?? bundleBoundsOf(LIMITS), tasks: [] } },
+      content: { type: "json", value: { schemaVersion: 2, ...(options.bundleIdentity ?? bundleIdentityOf)(runId),
+        bounds: options.bundleBounds ?? bundleBoundsOf(LIMITS), tasks: [] } },
     });
     return {
       runId, taskId, workItemId,
@@ -217,8 +242,17 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
     };
   }
 
-  /** The importer's own row for the run's import key, as `importCccPrdBundle` leaves it, with the given bundle hash. */
-  async function seedImportRow(run: Run, bundleHash: string): Promise<string> {
+  /** The importer's canonical bundle for the run's import key holds `bounds`, or no bounds at all when undefined. */
+  async function setImportBounds(run: Run, bounds: unknown): Promise<void> {
+    await db.execute(sql`
+      UPDATE project.ccc_prd_imports SET canonical_bundle = ${JSON.stringify(bounds === undefined ? {} : { bounds })}::jsonb
+       WHERE project_id = ${PROJECT} AND idempotency_key = ${cccPlanningImportKey(run.runId, 1)}
+    `);
+  }
+
+  /** The importer's own row for the run's import key, as `importCccPrdBundle` leaves it, with the given bundle hash and
+   *  the run's bounds in its canonical bundle (the importer's budget comes from `canonical_bundle.bounds`). */
+  async function seedImportRow(run: Run, bundleHash: string, bounds: unknown = bundleBoundsOf(LIMITS)): Promise<string> {
     const importId = `r2c-im1-import-${run.taskId}`;
     const digest = sha(`import:${importId}`);
     await db.execute(sql`
@@ -230,7 +264,7 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
       ) VALUES (
         ${PROJECT}, ${cccPlanningImportKey(run.runId, 1)}, ${importId}, ${digest}, ${bundleHash}, ${digest}, ${digest},
         'v1', ${TARGET}, ${"c".repeat(40)}, '/private/tmp/r2c-im1-root', 'stage', 'active', 1,
-        '{}'::jsonb, '{}'::jsonb, ${digest}, ${NOW}, ${NOW},
+        ${JSON.stringify({ bounds })}::jsonb, '{}'::jsonb, ${digest}, ${NOW}, ${NOW},
         '{}'::jsonb, '{}'::jsonb, ${digest}, ${NOW}, ${FAR}
       )
     `);
@@ -411,6 +445,67 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
     await expect(record(twin, intentFor(twin))).resolves.toMatchObject({ replayed: false });
   });
 
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:48 (card IM1, repair 2, errata E13 item 1(a)):
+   * The adversary's X1, first half: the published bundle artifact is bundle A and its bounds equal the intent's limits,
+   * but the intent names bundle B. Before E13 the intent recorded, so the limits could be checked against one bundle and
+   * the importer run another. The control is the same run with the intent that names bundle A.
+   */
+  it("refuses an intent that names another bundle than the published bundle artifact's own bundleHash with IMPORT_IDENTITY_DRIFT although its limits equal that bundle's bounds; the same run records the intent that names it", async () => {
+    const run = await seedRun();
+    const other = intentFor(run, LIMITS, { bundleHash: sha(`bundle-B-never-published:${run.runId}`) });
+
+    await expectRefusal(record(run, other), "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+    await expectNoIntent(run);
+
+    const named = intentFor(run);
+    expect(named.bundleHash).toBe(bundleIdentityOf(run.runId).bundleHash);
+    await expect(record(run, named)).resolves.toEqual({ intentDigest: digestOf(named), replayed: false });
+  });
+
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:48 (card IM1, repair 2, errata E13 item 1(a)):
+   * The same identity rule for the bundle's sourceHash (the intent's packetHash) and sidecarHash, which a real semantic
+   * bundle carries, and the bundleHash is required: a bundle that names no bundleHash cannot be the one the intent names.
+   */
+  it("refuses an intent whose packetHash or sidecarHash differs from the published bundle's sourceHash or sidecarHash, or whose bundle carries no bundleHash, with IMPORT_IDENTITY_DRIFT; the same run records the intent that agrees", async () => {
+    const run = await seedRun();
+    for (const overrides of [
+      { packetHash: sha(`another packet:${run.runId}`) },
+      { sidecarHash: sha(`another sidecar:${run.runId}`) },
+    ]) {
+      await expectRefusal(record(run, intentFor(run, LIMITS, overrides)), "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+      await expectNoIntent(run);
+    }
+
+    const unnamed = await seedRun({
+      bundleIdentity: (runId) => ({ sourceHash: sha(`packet:${runId}`), sidecarHash: sha(`sidecar:${runId}`) }),
+    });
+    await expectRefusal(record(unnamed, intentFor(unnamed)), "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+    await expectNoIntent(unnamed);
+
+    await expect(record(run, intentFor(run))).resolves.toMatchObject({ replayed: false });
+  });
+
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:48 (card IM1, repair 2, errata E13 item 2):
+   * Only a complete artifact may be the bounds source. Each refused fixture is identical to the control except for the
+   * envelope status of one artifact.
+   */
+  it("refuses an intent whose bundle or admission_facts artifact has an envelope status other than complete with IMPORT_IDENTITY_DRIFT; the same bundle with status complete records", async () => {
+    for (const status of ["refused", "blocked", "infeasible"] as const) {
+      const run = await seedRun({ bundleStatus: status });
+      await expectRefusal(record(run, intentFor(run)), "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+      await expectNoIntent(run);
+    }
+    const facts = await seedRun({ factsStatus: "refused" });
+    await expectRefusal(record(facts, intentFor(facts)), "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+    await expectNoIntent(facts);
+
+    const twin = await seedRun({ bundleStatus: "complete", factsStatus: "complete" });
+    await expect(record(twin, intentFor(twin))).resolves.toMatchObject({ replayed: false });
+  });
+
   it("refuses an intent on a run that has not reached importing with STATE_TRANSITION_REFUSED; the same run records once it is importing", async () => {
     const run = await seedRun({ state: "spec_ready" });
 
@@ -477,6 +572,44 @@ pgDescribe("ccc planning import intent and link (card IM1, PostgreSQL)", () => {
     const importId = await seedImportRow(twin, twinIntent.bundleHash);
     await expect(linkCccPlanningImport(layer, { runId: twin.runId, fence: twin.fence, release: "awaiting_operator" }))
       .resolves.toMatchObject({ importId, release: "awaiting_operator", replayed: false });
+  });
+
+  /**
+   * FNXC:CccPlanningImportLink 2026-10-14-23:48 (card IM1, repair 2, errata E13 item 1(b)):
+   * The adversary's X1, second half: the import row for the run's key holds the intent's bundle hash, but its canonical
+   * bundle runs with bounds {10000, 86400000, 1}. Before E13 the link resolved and recorded implementation_transferred
+   * 3072, a budget the linked campaign does not run with. Each drift below (X1's values, then one field at a time, then
+   * no bounds) is refused and writes nothing; the control is the same row with the intent's bounds.
+   */
+  it("refuses a link whose ccc_prd_imports canonical bundle bounds differ from the intent's limits with IMPORT_IDENTITY_DRIFT and writes nothing although its bundle hash matches; the same row with the intent's bounds links", async () => {
+    const run = await seedRun();
+    const intent = intentFor(run);
+    await record(run, intent);
+    const x1 = { maxRequests: 10_000, maxDurationMs: 86_400_000, maxConcurrency: 1 };
+    const importId = await seedImportRow(run, intent.bundleHash, x1);
+    const exact = bundleBoundsOf(LIMITS);
+    const drifts: unknown[] = [
+      x1,
+      { ...exact, maxRequests: exact.maxRequests - 1 },
+      { ...exact, maxDurationMs: exact.maxDurationMs + 1 },
+      { ...exact, maxConcurrency: 2 },
+      undefined,
+    ];
+
+    for (const bounds of drifts) {
+      await setImportBounds(run, bounds);
+      await expectRefusal(linkCccPlanningImport(layer, { runId: run.runId, fence: run.fence, release: "released" }),
+        "CCC_PLANNING_IMPORT_IDENTITY_DRIFT");
+      expect(await anchor(run)).toMatchObject({ import_intent_digest: digestOf(intent), import_id: null, implementation_transferred: null });
+      expect(await documents(run, RECEIPT_KEY)).toHaveLength(0);
+      expect(await events(run, "ccc-planning:import-linked")).toHaveLength(0);
+    }
+
+    await setImportBounds(run, exact);
+    await expect(linkCccPlanningImport(layer, { runId: run.runId, fence: run.fence, release: "released" })).resolves.toMatchObject({
+      importId, implementationTransferred: LIMITS.maxRequests, maxDurationMs: LIMITS.maxDurationMs, replayed: false,
+    });
+    expect(await anchor(run)).toMatchObject({ import_id: importId, implementation_transferred: LIMITS.maxRequests });
   });
 
   it("reports none before the intent, intent-only with the stored intent after it, and linked with the receipt after the link", async () => {
