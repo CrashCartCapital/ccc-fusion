@@ -22,6 +22,14 @@ Repair 2 (errata E7-L, the final L1 repair) adds 10 tests: items 3a, 3b, 5, 7, 8
 items 1, 2, 4 and 9 in the control file. The name list is 60 names, exactly the passing names of a JSON reporter run
 of the card command. Measured at load average about 11 (1 min): about 4 s wall for the four files. The 180 s timeouts
 stay hang bounds.
+
+FNXC:CccPlanningProof 2026-10-14-20:54:
+Card L1z (errata E8-L, successor owner) renames the E7-L item 4 deferral test (a deferral row is now keyed by its
+ordinal, item 3) and adds 10 tests: items 4 (r02) and 5 in the ledger file, items 1 (four tests), 2, 3 and 4 (r03, r05)
+in the control file. The name list is 70 names, exactly the passing names of a JSON reporter run of the card command
+(0 skipped), checked by loading this inventory through index.mjs. Measured on the M5 Max at load averages 8.7 to 11.5
+(1 min) with other agents running suites: 3.4 to 4.5 s vitest duration, 4 to 6 s wall for the four files, over five
+runs. The 180 s timeouts stay hang bounds, 30 times the worst run.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -94,6 +102,8 @@ export const OFFLINE = Object.freeze([
       `${LEDGER} > refuses the next call of a continuing turn on a superseded lineage and charges nothing; the dispatched call still settles (E7-L item 7)`,
       `${LEDGER} > refuses a split child whose id is another role's fixed lineage and writes nothing; a fresh child id is accepted (E7-L item 8a)`,
       `${LEDGER} > refuses a campaign-fence lineage named like a planning fixed lineage, since dispatch counters are keyed by lineage id alone; review:T-1 is admitted (E7-L item 8b)`,
+      `${LEDGER} > refuses a split child named research:leaf-1 on a 1536 run, whose leaf cap is 0, and writes nothing; a fresh child id is accepted (E8-L item 4, r02)`,
+      `${LEDGER} > bounds split lineage ids and research-fetch node ids at CCC_PLANNING_AUDIT_STRING_MAX: one character more refuses INTERNAL_ERROR before any write, the bound itself is accepted (E8-L item 5)`,
       `${CONTROL} > pause while running sets control_request and the next dispatch is refused control-pending; an unpaused run admits`,
       `${CONTROL} > answering the awaited decision moves the run to running and the held work item to runnable in one transaction`,
       `${CONTROL} > resume from paused moves the run to running and the held work item to runnable; resume of a running run is refused`,
@@ -117,8 +127,16 @@ export const OFFLINE = Object.freeze([
       `${CONTROL} > resolves a run of another project through the runtime role with row-level security live (E5-L1 item 14)`,
       `${CONTROL} > refuses pause in admitted with STATE_TRANSITION_REFUSED and writes nothing; admitted -> running then succeeds and a running pause stays pending (E7-L item 1)`,
       `${CONTROL} > refuses running -> paused with CONTROL_PENDING once a cancel replaced the pending pause; running -> cancelling then succeeds (E7-L item 2)`,
-      `${CONTROL} > a deferred direct completion records its reason once per control_seq and reason; a changed reason adds one row and a repeat adds none (E7-L item 4)`,
+      `${CONTROL} > a deferred direct completion records its reason when it differs from the latest deferral of the control_seq; a changed reason adds one row and a repeat adds none (E7-L item 4, E8-L item 3)`,
       `${CONTROL} > the within-transaction completion joins the caller's transaction: a rollback leaves the run cancelling; the committed form ends cancelled (E7-L item 9)`,
+      `${CONTROL} > the within-transaction transition joins the caller's transaction: building -> accepted is visible inside, and a rollback leaves the anchor and audit untouched (E8-L item 1)`,
+      `${CONTROL} > with a pending Build cancel the within transition building -> accepted refuses CONTROL_PENDING and writes nothing even when the caller commits; an uncancelled twin moves (E8-L item 1)`,
+      `${CONTROL} > the within transition refuses cancelling -> cancelled with STATE_TRANSITION_REFUSED; building -> cancelling within, then the within completion, ends cancelled in one caller transaction (E8-L item 1)`,
+      `${CONTROL} > a committed within transition equals the direct form: the same custody, anchor and state audit rows on twin runs (E8-L item 1)`,
+      `${CONTROL} > lastControl reports only operator control rows: a generic running -> cancelling with no operator control and a deferred completion leave it null; an operator pause is still reported (E8-L item 2)`,
+      `${CONTROL} > a deferral reason that flips back is recorded again: live-lease, descendants-unsettled, then live-lease under one control_seq writes three rows and the latest says live-lease; a repeat writes none (E8-L item 3)`,
+      `${CONTROL} > the within-transaction completion writes its own deferral row inside the caller's transaction: a rollback leaves none, a commit leaves one and a repeat adds none (E8-L item 4, r03)`,
+      `${CONTROL} > both within forms refuse a malformed run id with RUN_NOT_FOUND before any read, so the caller's transaction stays usable; a well-formed unknown id is read and not found (E8-L item 4, r05)`,
       `${RETENTION} > keeps an old ccc-plan: audit row and deletes an equally old non-planning row on the same task`,
       `${PARITY} > K1 and the SQL function agree on all 400 pairs, and exactly 65 non-identity pairs are allowed`,
       `${PARITY} > refuses a pair outside the table before any write and applies an allowed pair with a state event`,

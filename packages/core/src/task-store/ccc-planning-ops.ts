@@ -210,6 +210,13 @@ function requireRunId(runId: string): void {
   }
 }
 
+/** A within-transaction form has no layer, so its caller names the project; a blank one is a caller bug. */
+function requireProjectId(projectId: unknown): void {
+  if (typeof projectId !== "string" || projectId.trim().length === 0) {
+    refuse("CCC_PLANNING_INTERNAL_ERROR", "projectId must be a non-blank string", "projectId");
+  }
+}
+
 /** E2-4/E3-3: the CLI refuses first, so an actor that reaches L1 out of range is a caller bug. */
 function requireActor(actor: unknown): string {
   const trimmed = typeof actor === "string" ? actor.trim() : "";
@@ -1091,9 +1098,10 @@ export async function settleCccPlanningCall(layer: AsyncDataLayer,
 
 // ---------------------------------------------------------------- lineages, repair chunks and review epochs (D13, D31)
 
+/** FNXC:CccPlanningLedger 2026-10-14-20:52: errata E8-L item 5: one bound for every audit id, K1's constant. */
 function requireLineageId(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 256) {
-    refuse("CCC_PLANNING_INTERNAL_ERROR", `${label} must be a lineage id of 1 to 256 characters`, label);
+  if (typeof value !== "string" || value.length === 0 || value.length > CCC_PLANNING_AUDIT_STRING_MAX) {
+    refuse("CCC_PLANNING_INTERNAL_ERROR", `${label} must be a lineage id of 1 to ${CCC_PLANNING_AUDIT_STRING_MAX} characters`, label);
   }
   return value;
 }
@@ -1416,7 +1424,7 @@ export async function reserveCccPlanningResearchFetch(layer: AsyncDataLayer, i: 
   runId: string; nodeId: string; nodeAttempt: number; maxRawBytes: number; fence: CccPlanningWorkItemFence }>):
   Promise<Readonly<{ grantKey: string }>> {
   const policy = CCC_PLANNING_SOURCE_POLICY_I2;
-  if (typeof i.nodeId !== "string" || i.nodeId.length === 0 || i.nodeId.length > 256
+  if (typeof i.nodeId !== "string" || i.nodeId.length === 0 || i.nodeId.length > CCC_PLANNING_AUDIT_STRING_MAX
     || !Number.isSafeInteger(i.nodeAttempt) || i.nodeAttempt < 1
     || !Number.isSafeInteger(i.maxRawBytes) || i.maxRawBytes < 1 || i.maxRawBytes > policy.maxRawBytesPerFetch) {
     refuse("CCC_PLANNING_INTERNAL_ERROR", "fetch needs a node id, a node attempt >= 1 and 1..1 MiB of raw bytes");
@@ -1554,16 +1562,32 @@ why, so the reason the run is still cancelling is never only the stale one the c
 `ccc-planning:control` row, subject `cancel-deferred:<reason>`, with an event id derived from the run, the current
 control_seq and the reason: repeating the same deferral replays that row and writes nothing new, a changed reason
 writes one new row. The row is not a control request, so status reads skip it and `lastControl` stays the operator's.
+FNXC:CccPlanningControl 2026-10-14-20:52:
+Errata E8-L item 3 (ADV2-A): a reason that flips back (live-lease, descendants-unsettled, live-lease) must be recorded
+again, or the latest row names a blocker that has already cleared. The event id is now derived from (run id,
+control_seq, deferral ordinal), the ordinal being one more than the deferral rows of that control_seq, and a row is
+written only when the latest of them (highest `deferralOrdinal`, which the metadata carries because a caller-supplied
+`now` can repeat a timestamp) has a different reason, or none exists. Repeating the latest reason writes nothing. The
+anchor row is locked first, so two completions of one run count the rows one after the other.
 */
 async function recordCancellationDeferral(tx: DbTransaction, anchor: AnchorRow, blocked: CancellationBlock, now: string):
   Promise<void> {
-  const subject = `cancel-deferred:${blocked.reason}`;
+  const prior = (await rows<{ metadata: Row }>(tx, sql`
+    SELECT metadata FROM project.run_audit_events
+     WHERE project_id = ${anchor.project_id} AND run_id = ${anchor.run_id} AND mutation_type = 'ccc-planning:control'
+       AND target LIKE 'cancel-deferred:%'
+  `)).map((row) => row.metadata).filter((metadata) => Number(metadata.controlSeq) === anchor.control_seq);
+  const latest = prior.reduce<Row | undefined>((best, metadata) =>
+    best === undefined || Number(metadata.deferralOrdinal) > Number(best.deferralOrdinal) ? metadata : best, undefined);
+  if (latest !== undefined && latest.reason === blocked.reason) return;
+  const deferralOrdinal = prior.length + 1;
   await appendEvent(tx, anchor, {
-    mutationType: "ccc-planning:control", subject, idSubject: `${subject}@control:${anchor.control_seq}`,
+    mutationType: "ccc-planning:control", subject: `cancel-deferred:${blocked.reason}`,
+    idSubject: `cancel-deferred@control:${anchor.control_seq}:${deferralOrdinal}`,
     agentId: CONTROLLER_AGENT, timestamp: now,
     metadata: {
       schema: "ccc-planning-cancel-deferred/v1", runId: anchor.run_id, controlSeq: anchor.control_seq, reason: blocked.reason,
-      ...("code" in blocked ? { code: blocked.code } : {}),
+      deferralOrdinal, ...("code" in blocked ? { code: blocked.code } : {}),
     },
   });
 }
@@ -1810,9 +1834,7 @@ caller names the project, because the transaction carries no layer.
 export async function completeCccPlanningCancellationWithin(tx: DbTransaction, i: Readonly<{
   projectId: string; runId: string; now?: string }>): Promise<Readonly<{ completed: boolean }>> {
   requireCompletionNow(i.now);
-  if (typeof i.projectId !== "string" || i.projectId.trim().length === 0) {
-    refuse("CCC_PLANNING_INTERNAL_ERROR", "projectId must be a non-blank string", "projectId");
-  }
+  requireProjectId(i.projectId);
   requireRunId(i.runId);
   try {
     const found = await rows(tx, sql`
@@ -1845,15 +1867,12 @@ export async function completeCccPlanningCancellation(layer: AsyncDataLayer, i: 
   });
 }
 
-/*
-FNXC:CccPlanningLedger 2026-10-14-14:05:
-The generic CAS transition used by H1 and the stage host. Moving to awaiting_intent derives awaiting_decision_id from the
-newest decision_request artifact of the current revision, because the frozen signature carries no decision id and the
-anchor CHECK requires one; with no such artifact the move is refused and nothing is written.
-*/
-export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: Readonly<{
+type CccPlanningTransitionInput = Readonly<{
   runId: string; from: CccPlanningRunState; to: CccPlanningRunState; stateCode: string | null;
-  fence: CccPlanningWorkItemFence | null }>): Promise<CccPlanningRunCustody> {
+  fence: CccPlanningWorkItemFence | null }>;
+
+/** The refusals of the generic transition that need no read; both forms run them before anything else. */
+function requireTransitionInput(i: CccPlanningTransitionInput): void {
   if (!RUN_STATES.has(i.from) || !RUN_STATES.has(i.to)) refuse("CCC_PLANNING_INTERNAL_ERROR", "from and to must be run states", "state");
   if (i.stateCode !== null && (typeof i.stateCode !== "string" || !STATE_CODE_PATTERN.test(i.stateCode))) {
     refuse("CCC_PLANNING_INTERNAL_ERROR", "stateCode must match CCC_[A-Z0-9_]{1,120}", "stateCode");
@@ -1870,8 +1889,33 @@ export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: Re
   if (i.to === "cancelled") {
     refuse("CCC_PLANNING_STATE_TRANSITION_REFUSED", "only completeCccPlanningCancellation moves a run to cancelled", "to");
   }
-  return inTransaction(layer, async (tx) => {
-    const located = await locateRun(tx, layer, i.runId);
+}
+
+/*
+FNXC:CccPlanningLedger 2026-10-14-14:05:
+The generic CAS transition used by H1 and the stage host. Moving to awaiting_intent derives awaiting_decision_id from the
+newest decision_request artifact of the current revision, because the frozen signature carries no decision id and the
+anchor CHECK requires one; with no such artifact the move is refused and nothing is written.
+FNXC:CccPlanningControl 2026-10-14-20:52:
+Errata E8-L item 1 (E8-0 B-1): the within-transaction form for BF, whose D43 rows that do not end in cancelled (and
+the -> cancelling step before completeCccPlanningCancellationWithin) move the run inside the campaign transaction's
+savepoint. It has the same refusals, the same pending-control CAS predicate (E7-L item 2) and the same state event as
+the direct form, which only opens the transaction and calls it, so there is one transition path. It writes nothing
+outside `tx`, so a caller that rolls back leaves the run as it was. The caller names the project, because the
+transaction carries no layer (as completeCccPlanningCancellationWithin does). A malformed run id is refused before any
+read, so it never aborts the caller's transaction.
+*/
+export async function transitionCccPlanningRunStateWithin(tx: DbTransaction, i: Readonly<{ projectId: string }>
+  & CccPlanningTransitionInput): Promise<CccPlanningRunCustody> {
+  requireTransitionInput(i);
+  requireProjectId(i.projectId);
+  requireRunId(i.runId);
+  try {
+    const found = await rows(tx, sql`
+      SELECT ${ANCHOR_COLUMNS} FROM project.ccc_planning_runs WHERE project_id = ${i.projectId} AND run_id = ${i.runId}
+    `);
+    if (found.length !== 1) refuse("CCC_PLANNING_RUN_NOT_FOUND", `run ${i.runId} not found`, "runId");
+    const located = normalizeAnchor(found[0]!);
     if (i.fence !== null) await lockFence(tx, located, i.fence, "either");
     const anchor = await lockAnchor(tx, located.project_id, located.run_id);
     if (TERMINAL_STATES.has(anchor.state)) refuse("CCC_PLANNING_RUN_TERMINAL", `run ${anchor.run_id} is ${anchor.state}`);
@@ -1896,6 +1940,19 @@ export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: Re
       to: i.to, stateCode: i.stateCode, now, agentId: CONTROLLER_AGENT, respectControl: true, ...(decisionId ? { decisionId } : {}),
     });
     return custodyOf(moved);
+  } catch (error) {
+    throw mapDatabaseError(error);
+  }
+}
+
+export async function transitionCccPlanningRunState(layer: AsyncDataLayer, i: CccPlanningTransitionInput):
+  Promise<CccPlanningRunCustody> {
+  requireTransitionInput(i);
+  return inTransaction(layer, async (tx) => {
+    const located = await locateRun(tx, layer, i.runId);
+    return transitionCccPlanningRunStateWithin(tx, {
+      projectId: located.project_id, runId: located.run_id, from: i.from, to: i.to, stateCode: i.stateCode, fence: i.fence,
+    });
   });
 }
 

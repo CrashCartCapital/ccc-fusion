@@ -20,6 +20,7 @@ import {
 import type { AsyncDataLayer } from "../../postgres/data-layer.js";
 import { cccPlanningRuns, type CccPlanningRunInsert } from "../../postgres/schema/ccc-planning.js";
 import {
+  CCC_PLANNING_AUDIT_STRING_MAX,
   CCC_PLANNING_MAX_REPAIR_CHUNKS,
   cccPlanningBindingHash,
   cccPlanningRole,
@@ -947,5 +948,53 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
 
     await commit(await admit(request(run, reviewer("review:T-1"), 1, 1, { fence: run.campaignFence })));
     expect(await anchor(run.runId)).toMatchObject({ review_proof_spent: 1 });
+  });
+
+  /*
+  FNXC:CccPlanningLedger 2026-10-14-20:46:
+  Errata E8-L (card L1z). Item 4 pins the split-child check's stricter cap (mutant r02, E8a'): every research:leaf-N
+  counts as fixed for a split child, even on a run whose own leaf cap is 0, so a later allocation can never collide
+  with an earlier child. Item 5 bounds split lineage ids and research-fetch node ids with K1's one audit-string constant.
+  */
+  it("refuses a split child named research:leaf-1 on a 1536 run, whose leaf cap is 0, and writes nothing; a fresh child id is accepted (E8-L item 4, r02)", async () => {
+    const run = await seedRun();
+    const leaf1: Lineage = { stageId: "research", roleId: "extraction-leaf", lineageId: "research:leaf-1" };
+    // The fixture's leaf cap really is 0: research:leaf-1 takes no call on this run.
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, leaf1, 1, 1)), /lineage-not-admitted/u);
+    const split = (child: string) => recordCccPlanningLineageSplit(layer, {
+      runId: run.runId, parentLineageId: RESEARCHER.lineageId, childLineageIds: [child], fence: run.fence,
+    });
+    await expectRouteRefusal(split(leaf1.lineageId), /split child research:leaf-1 is a fixed lineage id/u);
+    expect(await events(run.runId, "ccc-planning:lineage:created")).toHaveLength(0);
+
+    await split("research:researcher-split-leafcap");
+    expect((await events(run.runId, "ccc-planning:lineage:created")).map((row) => row.metadata)).toEqual([
+      expect.objectContaining({ kind: "split", lineageId: "research:researcher-split-leafcap", parentLineageId: RESEARCHER.lineageId,
+        roleId: "researcher", stageId: "research", inheritedDispatchAttempts: 0 }),
+    ]);
+  });
+
+  it("bounds split lineage ids and research-fetch node ids at CCC_PLANNING_AUDIT_STRING_MAX: one character more refuses INTERNAL_ERROR before any write, the bound itself is accepted (E8-L item 5)", async () => {
+    const run = await seedRun();
+    const over = "s".repeat(CCC_PLANNING_AUDIT_STRING_MAX + 1);
+    const at = "s".repeat(CCC_PLANNING_AUDIT_STRING_MAX);
+    const split = (parentLineageId: string, child: string) => recordCccPlanningLineageSplit(layer, {
+      runId: run.runId, parentLineageId, childLineageIds: [child], fence: run.fence,
+    });
+    const fetch = (nodeId: string) => reserveCccPlanningResearchFetch(layer, {
+      runId: run.runId, nodeId, nodeAttempt: 1, maxRawBytes: 1024, fence: run.fence,
+    });
+    await expectRefusal(split(RESEARCHER.lineageId, over), "CCC_PLANNING_INTERNAL_ERROR", /childLineageIds must be a lineage id of 1 to 256/u);
+    await expectRefusal(split(over, "research:researcher-split-bound"), "CCC_PLANNING_INTERNAL_ERROR",
+      /parentLineageId must be a lineage id of 1 to 256/u);
+    await expectRefusal(fetch(over), "CCC_PLANNING_INTERNAL_ERROR", /node id/u);
+    expect(await events(run.runId, "ccc-planning:lineage:created")).toHaveLength(0);
+    expect(await events(run.runId, "ccc-planning:fetch:reserved")).toHaveLength(0);
+    expect(await anchor(run.runId)).toMatchObject({ research_fetch_spent: 0 });
+
+    await split(RESEARCHER.lineageId, at);
+    expect((await events(run.runId, "ccc-planning:lineage:created")).map((row) => row.target)).toEqual([at]);
+    expect((await fetch(at)).grantKey).toBe(`${run.runId}:f1`);
+    expect(await anchor(run.runId)).toMatchObject({ research_fetch_spent: 1 });
   });
 });
