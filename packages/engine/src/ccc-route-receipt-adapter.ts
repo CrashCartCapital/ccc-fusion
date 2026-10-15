@@ -42,12 +42,25 @@ export type CccTerminalRouteObservedValues = Readonly<{
   model: readonly string[];
 }>;
 
+/*
+FNXC:CccRouteReceiptFailureMarker 2026-10-14-20:46:
+Errata E8-P items 1 and 2 (card P1z). Two failures leave the route unverified without the parser ever judging a receipt: a body that fails to process after [DONE], and an HTTP 200 that is not text/event-stream, which is never read. Each is marked cccRouteFailure "receipt-missing", so the planning seam settles one route refusal and never retries, and the event also carries cccRouteFailureDetail naming which of the two it was. The parser's own failures carry no detail.
+*/
+type CccTerminalRouteFailureDetail = "receipt-not-terminal" | "non-sse-response";
+
 function terminalRouteFailure(
   kind: CccTerminalRouteFailureKind,
   message: string,
   observed?: CccTerminalRouteObservedValues,
+  detail?: CccTerminalRouteFailureDetail,
+  cause?: unknown,
 ): Error {
-  return Object.assign(new Error(message), { cccRouteFailure: kind }, observed ? { cccRouteObserved: observed } : {});
+  return Object.assign(
+    cause === undefined ? new Error(message) : new Error(message, { cause }),
+    { cccRouteFailure: kind },
+    observed ? { cccRouteObserved: observed } : {},
+    detail ? { cccRouteFailureDetail: detail } : {},
+  );
 }
 
 function takeCompleteSseLines(value: string, final = false): {
@@ -248,8 +261,15 @@ async function runCccTerminalRouteReceiptRequest(
     if (!response.ok) {
       throw new Error(`CCC terminal route receipt provider returned HTTP ${response.status}`);
     }
+    // A non-2xx status above stays the upstream's own error; a 200 that is not SSE is never read, so its route is
+    // unverified (E8-P item 2).
     if (!(response.headers.get("content-type") ?? "").toLowerCase().includes("text/event-stream")) {
-      throw new Error("CCC terminal route receipt provider did not return text/event-stream");
+      throw terminalRouteFailure(
+        "receipt-missing",
+        "CCC terminal route receipt provider did not return text/event-stream",
+        undefined,
+        "non-sse-response",
+      );
     }
     if (!response.body) {
       throw new Error("CCC terminal route receipt provider returned no response body");
@@ -290,12 +310,17 @@ async function runCccTerminalRouteReceiptRequest(
     const timedOut = requestController.signal.aborted && !callerAborted;
     const routeFailure = (error as { cccRouteFailure?: unknown } | null)?.cccRouteFailure;
     const routeObserved = (error as { cccRouteObserved?: unknown } | null)?.cccRouteObserved;
+    const routeFailureDetail = (error as { cccRouteFailureDetail?: unknown } | null)?.cccRouteFailureDetail;
     const marker = callerAborted
       ? {}
       : transport.failed || timedOut
         ? { cccTransportFailure: true as const }
         : typeof routeFailure === "string"
-          ? { cccRouteFailure: routeFailure, ...(routeObserved === undefined ? {} : { cccRouteObserved: routeObserved }) }
+          ? {
+            cccRouteFailure: routeFailure,
+            ...(routeObserved === undefined ? {} : { cccRouteObserved: routeObserved }),
+            ...(routeFailureDetail === undefined ? {} : { cccRouteFailureDetail: routeFailureDetail }),
+          }
           : {};
     let abortReason = error;
     if (responseBody && !responseBody.locked) {
@@ -598,12 +623,25 @@ async function consumeReceiptAdapterSse(
   FNXC:CccRouteReceiptFailureMarker 2026-10-14-18:38:
   Errata E7-P item 1. Any error raised while the body is being processed, before [DONE] was seen, means the adapter abandoned a stream whose outcome it never learned: a last data line cut mid-JSON at a clean end, a malformed data line mid-stream, or any other parse failure. It is marked as a transport failure before it is rethrown, so a planning session leaves the attempt dispatched_unknown instead of settling it as the upstream's own error. An upstream-reported error never passes through here: finish_reason error is recorded on the output and thrown only after [DONE].
   */
+  /*
+  FNXC:CccRouteReceiptFailureMarker 2026-10-14-20:46:
+  Errata E8-P item 1 (card P1z). After [DONE] the upstream has answered, so a processing failure is no lost connection, but it is no upstream error either: it throws before the terminal receipt is checked, so the route was never verified. It is marked as a route failure (receipt-missing, detail receipt-not-terminal) and the planning seam settles one route refusal with no retry, as it does for a data line after a receipt. The message is the processing error's own and the original error is kept as the cause. Before [DONE] the transport rule above still applies.
+  */
   const processBeforeDone = (process: () => void): void => {
     try {
       process();
     } catch (processError) {
-      if (!sawDone) transport.failed = true;
-      throw processError;
+      if (!sawDone) {
+        transport.failed = true;
+        throw processError;
+      }
+      throw terminalRouteFailure(
+        "receipt-missing",
+        processError instanceof Error ? processError.message : String(processError),
+        undefined,
+        "receipt-not-terminal",
+        processError,
+      );
     }
   };
 

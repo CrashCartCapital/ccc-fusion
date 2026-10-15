@@ -31,6 +31,10 @@ Repair 1 (errata E5-P1). The refused slot is remembered before the settlement is
 FNXC:CccPlanningProviderSeam 2026-10-14-18:32:
 Repair 2 (errata E7-P, final). Through the real adapter, any error raised after the body began and before [DONE] is a transport failure: a cut inside the last data line, a clean end with no [DONE] and no receipt, a refused connection and a malformed data line mid-stream all leave the attempt dispatched_unknown, with one upstream request (items 1 and 2). A finish_reason error whose terminal receipt names another model refuses receipt-mismatch and never retries; the same error with the bound model's receipt still settles provider-error-event (item 3, E7-0). A conflicting receipt keeps the conflicting provider and model, bounded, in its receipt-mismatch evidence (item 4). The item-7 refusal of a dispatch permit settles the reserved call once with no upstream request, so the slot is left neither reserved nor dispatched_unknown (item 6). The adapter's own timeout is a transport failure even when it fires after the body completed (item 8, fake timers, fetch stubbed to a body the adapter's abort cannot touch).
 */
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-20:44:
+Card P1z (errata E8-P items 1-3). A body that fails to process after [DONE] (a data line cut mid-JSON, or a malformed one) and an HTTP 200 whose content type is not text/event-stream both leave the route unverified: no terminal receipt was ever checked. Through the real adapter each settles exactly one route refusal (receipt-missing), never provider-error-event, so the session never reaches pi-stream:2 and the upstream sees one request (probes B1, B2, B3 and A7). Each RED has a control on the same fixture without the failure: B0 (the drifted receipt of B1 with a clean end) settles receipt-mismatch, B5 (a valid data line after [DONE]) settles receipt-missing as before, the missing-receipt case above is B2 without its cut line, the E7-P item 3 case above is B3 without its malformed line, and the HTTP 500 control above is A7 with a non-2xx status, which stays provider-error-event.
+*/
 
 vi.mock("../skill-resolver.js", () => ({
   resolveSessionSkills: vi.fn(),
@@ -1206,5 +1210,176 @@ describe("an error before [DONE] is a transport failure through the real receipt
         fetchSpy.mockRestore();
       }
     });
+  });
+});
+
+describe("a body failure after [DONE] and a non-SSE 200 refuse the route through the real receipt adapter (E8-P, card P1z)", () => {
+  beforeEach(() => {
+    vi.mocked(ModelRuntime.create).mockReset();
+  });
+
+  const DRIFTED = { provider: "minimax", model: "MiniMax-M2.7" } as const;
+  const DRIFTED_RECEIPT = receiptComments(DRIFTED.provider, DRIFTED.model);
+  const CUT_DATA_LINE = 'data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"wor';
+
+  /** Content, a finish_reason, the receipt tail and [DONE], then the given bytes after [DONE] and a clean end. */
+  function afterDoneReply(tail: string, finishReason: string, afterDone: string): LoopbackReply {
+    return (_request, response) => {
+      response.writeHead(200, SSE_HEADERS);
+      response.write(CONTENT_CHUNK);
+      response.write(finishChunk(finishReason));
+      response.write(`${tail}data: [DONE]\n\n`);
+      response.end(afterDone);
+    };
+  }
+
+  /**
+   * A stream and its re-entry on one planning session, and what section 2.12 settles on for them. The real adapter's own
+   * events are recorded on their way to pi.ts, because a route refusal reaches the caller as pi.ts's error event, which
+   * carries no adapter marker.
+   */
+  async function observeStreamAndReentry(reply: LoopbackReply) {
+    let run: {
+      first: Awaited<ReturnType<typeof drain>>;
+      second: Awaited<ReturnType<typeof drain>>;
+      adapterEvents: any[][];
+      settlements: any[];
+      distinctKeys: string[];
+      upstreamRequests: number;
+    } | undefined;
+    await withLoopback(reply, async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const adapter = realAdapterStream(baseUrl);
+      const adapterEvents: any[][] = [];
+      const providerStream = vi.fn((...args: Parameters<typeof adapter>) => {
+        const inner = adapter(...args);
+        const recorded: any[] = [];
+        adapterEvents.push(recorded);
+        return {
+          result: () => inner.result(),
+          async *[Symbol.asyncIterator]() {
+            for await (const event of inner) {
+              recorded.push(event);
+              yield event;
+            }
+          },
+        };
+      });
+      const agent = await createPlanningAgent({ controller, providerStream });
+      const first = await drain(agent.stream());
+      const second = await drain(agent.stream());
+      run = {
+        first,
+        second,
+        adapterEvents,
+        settlements: controller.reconcile.mock.calls.map(([input]) => input),
+        distinctKeys: distinctDispatchKeys(controller),
+        upstreamRequests: requests(),
+      };
+    });
+    return run!;
+  }
+
+  /** The error event the real adapter emitted for the first dispatch. */
+  const firstAdapterErrorEvent = (run: Awaited<ReturnType<typeof observeStreamAndReentry>>) =>
+    run.adapterEvents[0]?.find((event) => event?.type === "error");
+
+  /** The four facts every P1z RED pins, in one value, so a RED shows all of them at once. */
+  const settlementSummary = (run: Awaited<ReturnType<typeof observeStreamAndReentry>>) => ({
+    refusedWithRouteError: outcomeError(run.first.outcome) instanceof CccProviderRouteReceiptError,
+    settlements: run.settlements.map((input) => ({
+      dispatchKey: input.dispatchKey,
+      outcome: input.outcome,
+      refusalReason: input.refusalReason,
+    })),
+    distinctKeys: run.distinctKeys,
+    upstreamRequests: run.upstreamRequests,
+  });
+
+  const ROUTE_REFUSAL_CASES = [
+    {
+      name: "B1: a drifted receipt, [DONE], then a data line cut mid-JSON at a clean end",
+      reply: afterDoneReply(DRIFTED_RECEIPT, "stop", CUT_DATA_LINE),
+      detail: "receipt-not-terminal",
+      message: /JSON/,
+    },
+    {
+      name: "B2: no receipt, [DONE], then a data line cut mid-JSON at a clean end",
+      reply: afterDoneReply("", "stop", CUT_DATA_LINE),
+      detail: "receipt-not-terminal",
+      message: /JSON/,
+    },
+    {
+      name: "B3: a drifted receipt after finish_reason error, [DONE], then a malformed data line",
+      reply: afterDoneReply(DRIFTED_RECEIPT, "error", "data: {not-json}\n\n"),
+      detail: "receipt-not-terminal",
+      message: /JSON/,
+    },
+    {
+      name: "A7: an HTTP 200 whose content type is application/json, never read",
+      reply: ((_request, response) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "nope" }));
+      }) as LoopbackReply,
+      detail: "non-sse-response",
+      message: /did not return text\/event-stream/,
+    },
+  ];
+
+  for (const { name, reply, detail, message } of ROUTE_REFUSAL_CASES) it(`${name}, settles one receipt-missing route refusal and never provider-error-event: keys [pi-stream:1], one upstream request`, async () => {
+    const run = await observeStreamAndReentry(reply);
+
+    expect(settlementSummary(run)).toEqual({
+      refusedWithRouteError: true,
+      settlements: [{ dispatchKey: "pi-stream:1", outcome: "proved_failed", refusalReason: "receipt-missing" }],
+      distinctKeys: ["pi-stream:1"],
+      upstreamRequests: 1,
+    });
+    expect(run.settlements.some((input) => input.refusalReason === "provider-error-event")).toBe(false);
+    expect(run.settlements[0]).toMatchObject({ evidenceDigest: refusalDigest("receipt-missing", null), observerId: "pi" });
+    expect(run.settlements[0]).not.toHaveProperty("effectiveRoute");
+    expect(outcomeError(run.first.outcome)).toMatchObject({ reason: "receipt-missing", requested: REQUESTED_UPSTREAM, observed: null });
+    expect(outcomeError(run.second.outcome)).toBeInstanceOf(CccProviderRouteReceiptError);
+    expect(run.first.events.some((event) => event?.type === "done")).toBe(false);
+    // The adapter's marker: a route failure with its detail, never a transport failure; the message is unchanged.
+    expect(run.adapterEvents).toHaveLength(1);
+    const errorEvent = firstAdapterErrorEvent(run);
+    expect(errorEvent).toMatchObject({ type: "error", reason: "error", cccRouteFailure: "receipt-missing", cccRouteFailureDetail: detail });
+    expect(errorEvent).not.toHaveProperty("cccTransportFailure");
+    expect(errorEvent.error.errorMessage).toMatch(message);
+  });
+
+  it("control B0: the drifted receipt of B1 and [DONE] with a clean end settles one receipt-mismatch refusal, keys [pi-stream:1], one upstream request", async () => {
+    const run = await observeStreamAndReentry(afterDoneReply(DRIFTED_RECEIPT, "stop", ""));
+
+    expect(settlementSummary(run)).toEqual({
+      refusedWithRouteError: true,
+      settlements: [{ dispatchKey: "pi-stream:1", outcome: "proved_failed", refusalReason: "receipt-mismatch" }],
+      distinctKeys: ["pi-stream:1"],
+      upstreamRequests: 1,
+    });
+    expect(run.settlements[0]).toMatchObject({ evidenceDigest: refusalDigest("receipt-mismatch", DRIFTED) });
+    expect(outcomeError(run.first.outcome)).toMatchObject({ reason: "receipt-mismatch", observed: DRIFTED });
+    // The adapter completed the stream; pi.ts refused the receipt it delivered.
+    expect(run.adapterEvents[0]!.some((event) => event?.type === "done")).toBe(true);
+    expect(firstAdapterErrorEvent(run)).toBeUndefined();
+  });
+
+  it("control B5: the drifted receipt of B1, [DONE], then a valid data line still settles one receipt-missing refusal through the unchanged non-terminal marker, keys [pi-stream:1], one upstream request", async () => {
+    const run = await observeStreamAndReentry(
+      afterDoneReply(DRIFTED_RECEIPT, "stop", `data: ${JSON.stringify({ id: "c1", choices: [] })}\n\n`),
+    );
+
+    expect(settlementSummary(run)).toEqual({
+      refusedWithRouteError: true,
+      settlements: [{ dispatchKey: "pi-stream:1", outcome: "proved_failed", refusalReason: "receipt-missing" }],
+      distinctKeys: ["pi-stream:1"],
+      upstreamRequests: 1,
+    });
+    expect(run.settlements[0]).toMatchObject({ evidenceDigest: refusalDigest("receipt-missing", null) });
+    const errorEvent = firstAdapterErrorEvent(run);
+    expect(errorEvent).toMatchObject({ type: "error", reason: "error", cccRouteFailure: "receipt-not-terminal" });
+    expect(errorEvent).not.toHaveProperty("cccRouteFailureDetail");
+    expect(errorEvent).not.toHaveProperty("cccTransportFailure");
   });
 });
