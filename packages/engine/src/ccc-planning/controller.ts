@@ -50,6 +50,12 @@ const CODE_WORKFLOW_IR_DRIFT = "CCC_PLANNING_WORKFLOW_IR_DRIFT";
 const CODE_UNRECONCILED_DISPATCH = "CCC_PLANNING_UNRECONCILED_DISPATCH";
 const CODE_INTERNAL_ERROR = "CCC_PLANNING_INTERNAL_ERROR";
 const CODE_PROVIDER_PIN_DRIFT = "CCC_PROVIDER_PIN_DRIFT";
+/*
+FNXC:CccPlanningHost 2026-10-15-00:04:
+W3 repair 2 (E14 item 4): section 2.3 requires this state code for awaiting_intent. L1's STATE_CODE_REQUIRED does not
+list awaiting_intent, so L1 would persist a null code; recorded as a defence-in-depth follow-up for the next core card.
+*/
+const CODE_AWAITING_INTENT = "CCC_PLANNING_AWAITING_INTENT";
 const STATE_CODE_PATTERN = /^CCC_[A-Z0-9_]{1,120}$/u;
 
 /** States in which the next stage may start. Every other non-terminal state is a rest the operator or a reconcile ends. */
@@ -439,7 +445,7 @@ export function createCccPlanningStageHandler(i: Readonly<{ stages: Readonly<Rec
       case "skipped":
         return { outcome: "success", value: outcome.kind };
       case "awaiting-intent":
-        return park(after.state, "awaiting_intent", null, outcome.decisionId);
+        return park(after.state, "awaiting_intent", CODE_AWAITING_INTENT, outcome.decisionId);
       case "blocked":
         return park(after.state, outcome.state, STATE_CODE_PATTERN.test(outcome.code) ? outcome.code : CODE_INTERNAL_ERROR);
       case "unknown-effect":

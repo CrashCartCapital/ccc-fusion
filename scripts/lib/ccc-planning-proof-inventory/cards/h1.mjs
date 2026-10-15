@@ -22,6 +22,12 @@ W3 repair 1 adds the unit names 12b-12e, 18b, 8c, 8d and the in-process runtime 
 PostgreSQL names 16, 16b, 17, 17b, 18, 19 and 15 (15 runs last in its file because the file shares one database).
 Re-measured at load average about 7.6 (1 min, parallel agents): unit command 5 s wall (2 files, 63 tests), PostgreSQL
 command 7 s wall (13 tests). The 180 s hang bounds stay.
+
+FNXC:CccPlanningProof 2026-10-15-00:04:
+W3 repair 2 (errata E14) adds the unit names 1b, 2b, 12f, 12g, 24, 24b, 13b and its 5-item control, renames 11b (the
+swallowing session now sits in the last IR stage), and adds the PostgreSQL names 20, 21, 22, 23 with its Spec control,
+and 18c (15 still runs last). Re-measured at load average about 16 (1 min, parallel agents): unit command 7 s wall
+(2 files, 71 tests), PostgreSQL command 8 s wall (19 tests). The 180 s hang bounds stay.
 */
 
 const UNIT_FILE = "src/__tests__/ccc-planning-host.test.ts";
@@ -76,8 +82,10 @@ export const OFFLINE = Object.freeze([
       `${UNREGISTERED} > H1 RED 6b: an unregistered runtime digest parks an admitted run in blocked_prerequisite before any stage`,
       `${UNREGISTERED} > H1 runtime digest: a source run (distRoot null) registers nothing`,
       `${REGISTERED} > H1 RED 1: a planning item runs the twelve stages in order under one lease`,
+      `${REGISTERED} > H1 RED 1b: a workflow that completes with its run still running concludes the run instead of succeeding behind it`,
       `${REGISTERED} > H1 control: the same planning fixture claimed under campaign custody still fails as campaign custody missing`,
       `${REGISTERED} > H1 RED 2: lease loss mid-stage aborts and settles in the order cancelAll, flush, release, completeCancellation`,
+      `${REGISTERED} > H1 RED 2b: the descendant registry's cancelAll stays pending until every handle's cancel has settled`,
       `${REGISTERED} > H1 RED 4: a dispatched_unknown call moves the run to unknown_effect at the next stage start and is never re-dispatched`,
       `${REGISTERED} > H1 RED 5: a pending pause is applied at the next stage boundary`,
       `${REGISTERED} > H1 RED 5b: a pending cancel at a stage boundary settles the run and L1 completes the cancellation`,
@@ -90,14 +98,20 @@ export const OFFLINE = Object.freeze([
       `${REGISTERED} > H1 RED 12d: a host failure while a cancel is pending settles the cancel and L1 completes it`,
       `${REGISTERED} > H1 RED 12e: when L1 cannot be reached to fail the run, the item is released to runnable, never failed or held`,
       `${REGISTERED} > H1 RED 18b: a park whose pair the host may not take from a startable state fails the run instead of holding it`,
+      `${REGISTERED} > H1 RED 12f: an attempt bump that throws concludes the run under the lease instead of failing the item behind it`,
+      `${REGISTERED} > H1 RED 12g: a store that cannot read the planning task concludes the run instead of failing the item behind it`,
+      `${REGISTERED} > H1 RED 24: a stage that rejects fails the run with its code, one state event, and no later stage is entered`,
+      `${REGISTERED} > H1 RED 24b: a rejection with an invalid code fails the run with CCC_PLANNING_INTERNAL_ERROR`,
       `${WATCHDOG} > H1 RED 8a: a stage that runs four 20-minute sessions is not killed`,
       `${WATCHDOG} > H1 RED 8b: a single 31-minute session attempt is killed at 30 minutes`,
       `${WATCHDOG} > H1 RED 8c: a session open that hangs past 30 minutes is killed at 30 minutes and its late session disposed`,
       `${WATCHDOG} > H1 RED 8d: control, a 20-minute session open is not killed and the stage runs`,
       `${ROUTE} > H1 RED 11: a session that throws CccProviderRouteReceiptError after settlement yields blocked with one state event`,
-      `${ROUTE} > H1 RED 11b: a stage that swallows the route refusal still yields blocked with one state event`,
+      `${ROUTE} > H1 RED 11b: a last stage that swallows the route refusal still yields blocked with one state event`,
       `${DIGEST} > H1 runtime digest: sha256 of canonical sorted [relPath, sha256] over dist/**/*.js`,
       `${WIRING} > H1 RED 13: the drain dispatches a lease-expired planning item behind 25 older lease-expired running items under planning custody`,
+      `${WIRING} > H1 RED 13b: the drain dispatches a runnable planning item behind 25 older runnable items of paused tasks`,
+      `${WIRING} > H1 control: a runnable planning item behind 5 older runnable items of paused tasks is dispatched`,
       `${WIRING} > H1 RED 14: start() registers its own runtime digest and runs planning recovery with the wired linked-outcome ports`,
     ]),
   }),
@@ -120,6 +134,12 @@ export const OFFLINE = Object.freeze([
       `${PG} > H1 RED 17b: a deleted workflow definition fails the run with WORKFLOW_IR_DRIFT`,
       `${PG} > H1 RED 18: a refused awaiting-intent park fails the run instead of holding the item behind a running run`,
       `${PG} > H1 RED 19: an operator cancel landing between the park and the item release ends cancelled without a restart`,
+      `${PG} > H1 RED 20: a run lookup that throws once releases the item to runnable and a later operator cancel completes`,
+      `${PG} > H1 RED 21: a getTask read that throws once concludes the run under the lease, never a failed item behind a running run`,
+      `${PG} > H1 RED 22: a held write that fails once leaves the item leased, the next claim re-holds it and a cancel completes`,
+      `${PG} > H1 RED 23: an operator cancel racing the final succeeded write ends cancelled, not cancelling`,
+      `${PG} > H1 control: the same Spec run without the race ends spec_ready with the item succeeded`,
+      `${PG} > H1 RED 18c: an admitted awaiting-intent park rests the run with CCC_PLANNING_AWAITING_INTENT and holds the item`,
       `${PG} > H1 RED 15: one run refused at engine start does not stop recovery of the runs after it`,
     ]),
   }),

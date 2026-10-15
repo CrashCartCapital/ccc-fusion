@@ -33,7 +33,7 @@ import {
 import { CccProviderRouteReceiptError } from "../pi.js";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 import { CCC_PLANNING_HOLD_CONTEXT_KEY, WorkflowTaskRuntime } from "../workflow-task-runtime.js";
-import { createCccPlanningStageHandler } from "../ccc-planning/controller.js";
+import { createCccPlanningDescendantRegistry, createCccPlanningStageHandler } from "../ccc-planning/controller.js";
 import {
   computeCccRuntimeDistManifestSha256,
   registerCccRunningRuntimeAtEngineStart,
@@ -252,12 +252,23 @@ function createWorld(options: {
 type World = ReturnType<typeof createWorld>;
 type StageCall = Readonly<{ stageId: CccPlanningIrStageId; fence: CccPlanningWorkItemFence; state: CccPlanningRunState }>;
 
+/*
+FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 2):
+The fake stages end the run the way the real ones do: `specready` moves a running run to spec_ready through the bound
+ledger under the stage's fence (PRD section 9, D53), and the host now concludes a run that is still admitted or running
+when the workflow completes instead of succeeding the item behind it.
+*/
 function recordingStages(world: World, overrides: Partial<Record<CccPlanningIrStageId, CccPlanningStageFn>> = {}) {
   const calls: StageCall[] = [];
   const stages = Object.fromEntries(CCC_PLANNING_IR_STAGES.map((stageId) => [stageId, async (ctx: CccPlanningStageContext) => {
     calls.push({ stageId: ctx.stageId, fence: ctx.fence, state: ctx.run.state });
     const override = overrides[stageId];
     if (override) return override(ctx);
+    if (stageId === "specready" && ctx.run.state === "running") {
+      await ctx.ledger.transitionCccPlanningRunState({
+        runId: ctx.run.runId, from: "running", to: "spec_ready", stateCode: null, fence: ctx.fence,
+      });
+    }
     world.run.committed.add(stageId);
     return { kind: "committed", artifactKeys: [`cccplan-r001-${stageId}-x-v01`] };
   }])) as Record<CccPlanningIrStageId, CccPlanningStageFn>;
@@ -352,10 +363,35 @@ describe("ccc planning host with a registered runtime", () => {
     expect(world.store.acquireWorkflowWorkItemLease).toHaveBeenCalledTimes(1);
     const fence = { kind: "planning", workItemId: WORK_ITEM_ID, runId: RUN_ID, attempt: 1, leaseOwner: LEASE_OWNER, originTaskId: TASK_ID };
     for (const call of calls) expect(call.fence).toEqual(fence);
-    expect(calls.every((call) => call.state === "running")).toBe(true);
-    expect(world.stateEvents).toEqual([{ from: "admitted", to: "running", stateCode: null }]);
+    // Every stage starts on a running run; the import stage starts after specready moved it to spec_ready.
+    expect(calls.map((call) => call.state)).toEqual([...Array.from({ length: 11 }, () => "running"), "spec_ready"]);
+    expect(world.stateEvents).toEqual([
+      { from: "admitted", to: "running", stateCode: null },
+      { from: "running", to: "spec_ready", stateCode: null },
+    ]);
     expect(world.workItem).toMatchObject({ state: "succeeded", attempt: 1, leaseOwner: null });
     expect(result.runtime).toMatchObject({ disposition: "completed" });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 2):
+  A workflow that completes while its run is still admitted or running would leave the run behind a succeeded item,
+  where nothing moves it again. The host reads the run back under the still-live fence and concludes it (failed /
+  CCC_PLANNING_INTERNAL_ERROR, or its pending control) instead. RED 1 is the control: the run reached spec_ready.
+  */
+  it("H1 RED 1b: a workflow that completes with its run still running concludes the run instead of succeeding behind it", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world, {
+      specready: async () => ({ kind: "committed", artifactKeys: [] }),
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls.map((call) => call.stageId)).toEqual([...CCC_PLANNING_IR_STAGES]);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" }]);
+    expect(world.workItem).toMatchObject({ state: "failed", leaseOwner: null });
+    expect(result.runtime?.disposition).toBe("failed");
   });
 
   it("H1 control: the same planning fixture claimed under campaign custody still fails as campaign custody missing", async () => {
@@ -410,6 +446,38 @@ describe("ccc planning host with a registered runtime", () => {
     expect(world.stateEvents).toEqual([]);
     expect(world.workItem).toMatchObject({ state: "runnable", leaseOwner: null });
     expect(result.runtime?.disposition).not.toBe("completed");
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 6):
+  Section 2.16 freezes "cancelAll resolves only after every handle settled". RED 2's flush step awaits the runtime,
+  which hides a cancelAll that does not wait, so the registry is pinned on its own: with one handle still cancelling,
+  cancelAll stays pending; a handle whose cancel rejects still counts as settled.
+  */
+  it("H1 RED 2b: the descendant registry's cancelAll stays pending until every handle's cancel has settled", async () => {
+    const registry = createCccPlanningDescendantRegistry();
+    const settled: string[] = [];
+    let finishSlow: (() => void) | undefined;
+    registry.register({ id: "fast", cancel: async () => { settled.push("fast"); } });
+    registry.register({ id: "failing", cancel: async () => { settled.push("failing"); throw new Error("cancel refused"); } });
+    registry.register({
+      id: "slow",
+      cancel: () => new Promise<void>((resolve) => {
+        finishSlow = () => { settled.push("slow"); resolve(); };
+      }),
+    });
+    let done = false;
+    const cancelling = registry.cancelAll(new Error("h1-cancel-all")).then(() => { done = true; });
+    for (let turn = 0; turn < 5; turn += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(settled).toEqual(["fast", "failing"]);
+    expect(finishSlow).toBeTypeOf("function");
+    expect(done).toBe(false);
+
+    finishSlow!();
+    await cancelling;
+    expect(done).toBe(true);
+    expect(settled).toEqual(["fast", "failing", "slow"]);
   });
 
   it("H1 RED 4: a dispatched_unknown call moves the run to unknown_effect at the next stage start and is never re-dispatched", async () => {
@@ -662,6 +730,77 @@ describe("ccc planning host with a registered runtime", () => {
     expect(result.runtime?.disposition).toBe("failed");
   });
 
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 1):
+  The planning claim is total. A throw from the attempt bump, or a store that cannot read the planning task, is
+  concluded on the run under the still-live lease; it never reaches the shared catch, which would fail the item and
+  leave the run running where nothing moves it again.
+  */
+  it("H1 RED 12f: an attempt bump that throws concludes the run under the lease instead of failing the item behind it", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world);
+    world.store.transitionWorkflowWorkItem.mockImplementationOnce(async () => {
+      throw new Error("ECONNRESET (simulated attempt bump failure)");
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls).toEqual([]);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" }]);
+    expect(world.workItem).toMatchObject({ state: "failed", attempt: 0, leaseOwner: null });
+    expect(result.runtime?.reason ?? "").toContain("ECONNRESET");
+  });
+
+  it("H1 RED 12g: a store that cannot read the planning task concludes the run instead of failing the item behind it", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world);
+    const store = { ...world.store, getTask: undefined };
+
+    const result = await processDueWorkflowWorkItem(store as never, planningRuntime(world, stages), undefined, {
+      leaseOwner: LEASE_OWNER, leaseDurationMs: 60_000, custody: "planning",
+    });
+
+    expect(calls).toEqual([]);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.workItem).toMatchObject({ state: "failed", leaseOwner: null });
+    expect(result.runtime?.reason ?? "").toContain("requires getTask");
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 7):
+  The frozen `rejected` outcome is terminal failed: a G3/G4 gate rejection must never let the run go on to import.
+  */
+  it("H1 RED 24: a stage that rejects fails the run with its code, one state event, and no later stage is entered", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world, {
+      design: async () => ({ kind: "rejected", code: "CCC_PLANNING_GRAPH_INADMISSIBLE" }),
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls.map((call) => call.stageId)).toEqual(["preflight", "intent", "research", "design"]);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_GRAPH_INADMISSIBLE" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_GRAPH_INADMISSIBLE" }]);
+    expect(world.workItem).toMatchObject({ state: "failed", leaseOwner: null });
+    expect(result.runtime?.disposition).toBe("failed");
+  });
+
+  it("H1 RED 24b: a rejection with an invalid code fails the run with CCC_PLANNING_INTERNAL_ERROR", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world, {
+      design: async () => ({ kind: "rejected", code: "graph inadmissible" }),
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls.map((call) => call.stageId)).toEqual(["preflight", "intent", "research", "design"]);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" }]);
+    expect(world.workItem).toMatchObject({ state: "failed", leaseOwner: null });
+    expect(result.runtime?.disposition).toBe("failed");
+  });
+
   describe("session watchdog (D40)", () => {
     function timedSessions(durationsMs: readonly number[]) {
       const opened: Array<{ signal: AbortSignal; openedAt: number; abortedAfterMs: number | null; disposed: number }> = [];
@@ -818,9 +957,10 @@ describe("ccc planning host with a registered runtime", () => {
           binding: {} as CccPlanningSession["binding"],
           run: async () => {
             // The fake L1 settlement: one transition, in the refusing call's own transaction.
+            const from = world.run.state;
             world.run.state = "blocked_provider";
             world.run.stateCode = "CCC_PROVIDER_PIN_DRIFT";
-            world.stateEvents.push({ from: "running", to: "blocked_provider", stateCode: "CCC_PROVIDER_PIN_DRIFT" });
+            world.stateEvents.push({ from, to: "blocked_provider", stateCode: "CCC_PROVIDER_PIN_DRIFT" });
             throw new CccProviderRouteReceiptError("receipt-mismatch", { provider: "ccc-glm", model: "glm/glm-5.3" }, null);
           },
           dispose: async () => undefined,
@@ -855,10 +995,16 @@ describe("ccc planning host with a registered runtime", () => {
       expect(world.workItem.state).toBe("held");
     });
 
-    it("H1 RED 11b: a stage that swallows the route refusal still yields blocked with one state event", async () => {
-      const world = createWorld({ state: "running" });
+    /*
+    FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 5):
+    The swallowing session sits in the last IR stage (specready, in a Spec run), so no later stage start can notice the
+    blocked_provider run by accident: only the refusing stage's own watch can hold the item. Without it the graph
+    completes and the item would succeed behind a blocked_provider run.
+    */
+    it("H1 RED 11b: a last stage that swallows the route refusal still yields blocked with one state event", async () => {
+      const world = createWorld({ mode: "spec", state: "running" });
       const { stages, calls } = recordingStages(world, {
-        preflight: async (ctx) => {
+        specready: async (ctx) => {
           const session = await openPlanningSession(ctx, 0);
           try {
             await session.run("route").catch(() => undefined);
@@ -871,9 +1017,17 @@ describe("ccc planning host with a registered runtime", () => {
 
       const result = await processPlanning(world, planningRuntime(world, stages, refusingSessions(world)));
 
-      expect(calls.map((call) => call.stageId)).toEqual(["preflight"]);
-      expect(world.stateEvents).toHaveLength(1);
-      expect(result.runtime?.context[CCC_PLANNING_HOLD_CONTEXT_KEY]).toMatchObject({ runState: "blocked_provider" });
+      const specStages = CCC_PLANNING_IR_STAGES.filter((stageId) => stageId !== "import");
+      expect(specStages.at(-1)).toBe("specready");
+      expect(calls.map((call) => call.stageId)).toEqual(specStages);
+      expect(world.stateEvents).toEqual([{ from: "running", to: "blocked_provider", stateCode: "CCC_PROVIDER_PIN_DRIFT" }]);
+      expect(world.ledger.transitionCccPlanningRunState).not.toHaveBeenCalled();
+      expect(result.runtime?.context[CCC_PLANNING_HOLD_CONTEXT_KEY]).toMatchObject({
+        disposition: "held", runState: "blocked_provider", code: "CCC_PROVIDER_PIN_DRIFT",
+      });
+      // The hold comes from the refusing node itself.
+      expect(result.runtime?.context["node:specready:outcome"]).toBe("failure");
+      expect(result.runtime?.disposition).toBe("manual-required");
       expect(world.workItem.state).toBe("held");
     });
   });
@@ -962,6 +1116,56 @@ describe("ccc planning host with a registered runtime", () => {
       expect(executor.tryBeginAuthoritativeWorkflowExecution).toHaveBeenCalledWith(TASK_ID);
       expect(releaseExecution).toHaveBeenCalledTimes(1);
       expect(executor.execute).not.toHaveBeenCalled();
+    });
+
+    /*
+    FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 3):
+    Fresh planning items (admission) and every resume or answer requeue are `runnable`. Runnable continuation items of
+    ordinary paused tasks are skipped by the drain and never cleared, so a first page of the oldest 20 can hide every
+    planning item. Planning items are found apart from that page, as lease-expired ones already are.
+    */
+    async function drainWithParked(parkedCount: number) {
+      const world = createWorld({ state: "admitted" });
+      const { stages, calls } = recordingStages(world);
+      const parked = Array.from({ length: parkedCount }, (_, index) => ({
+        id: `parked-${index}`, runId: `wf-parked-${index}`, taskId: `T-PARKED-${index}`, nodeId: "n", kind: "task",
+        state: "runnable", attempt: 0, leaseOwner: null, leaseExpiresAt: null, waitReason: "planning",
+        stableWorkflowRunId: `wf-parked-${index}`, createdAt: "2020-01-01T00:00:00.000Z",
+      }));
+      // The due query's order (created_at FIFO): every parked item is older than the planning item.
+      const listDueWorkflowWorkItems = vi.fn(async (filter: { states?: string[]; limit?: number } = {}) => {
+        const planning = world.workItem.state === "runnable" ? [{ ...world.workItem }] : [];
+        const due = [...parked, ...planning].filter((item) => !filter.states || filter.states.includes(item.state));
+        return filter.limit === undefined ? due : due.slice(0, filter.limit);
+      });
+      const runtime = bareRuntime();
+      runtime.setCccPlanningHost({ stages, sessions: unusedSessions() });
+      runtime.status = "active";
+      runtime.taskStore = { ...world.store, listDueWorkflowWorkItems, getSettings: async () => ({}), getAsyncLayer: () => null };
+      const executor = { execute: vi.fn(), tryBeginAuthoritativeWorkflowExecution: vi.fn(() => vi.fn()) };
+      runtime.executor = executor;
+      runtime.cccPlanningWorkflowRuntime = planningRuntime(world, stages);
+      for (let pass = 0; pass < 3; pass += 1) {
+        await runtime.drainWorkflowContinuations();
+        await runtime.settleWorkflowContinuations();
+      }
+      return { world, calls, executor };
+    }
+
+    it("H1 RED 13b: the drain dispatches a runnable planning item behind 25 older runnable items of paused tasks", async () => {
+      const { world, calls, executor } = await drainWithParked(25);
+
+      expect(calls.map((call) => call.stageId)).toEqual([...CCC_PLANNING_IR_STAGES]);
+      expect(world.workItem).toMatchObject({ state: "succeeded", attempt: 1, leaseOwner: null });
+      expect(world.run.state).toBe("spec_ready");
+      expect(executor.execute).not.toHaveBeenCalled();
+    });
+
+    it("H1 control: a runnable planning item behind 5 older runnable items of paused tasks is dispatched", async () => {
+      const { world, calls } = await drainWithParked(5);
+
+      expect(calls.map((call) => call.stageId)).toEqual([...CCC_PLANNING_IR_STAGES]);
+      expect(world.workItem).toMatchObject({ state: "succeeded", attempt: 1, leaseOwner: null });
     });
 
     it("H1 RED 14: start() registers its own runtime digest and runs planning recovery with the wired linked-outcome ports", async () => {

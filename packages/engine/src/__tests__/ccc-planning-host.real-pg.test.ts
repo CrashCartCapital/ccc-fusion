@@ -16,10 +16,12 @@ import {
   buildCccPlanningWorkflowIr,
   CCC_PLANNING_IR_STAGES,
   cccPlanningBindingHash,
+  cccPlanningDecisionId,
   cccPlanningRole,
   cccPlanningTurnKey,
   cccPlanningWorkflowIrHash,
   drizzleSql as sql,
+  getCccPlanningRunForTask,
   registerCccRunningRuntimeDistManifest,
   requestCccPlanningControl,
   type CccPlanningCallRequest,
@@ -88,25 +90,28 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
   }
 
   /** A Build run with its task, K1 workflow, selection and planning work item, as admission (AD1) leaves them. */
-  async function seedRun(options: { path?: readonly string[]; lease: "live" | "expired"; owner?: string; label?: string }): Promise<Run> {
+  async function seedRun(options: { path?: readonly string[]; lease: "live" | "expired"; owner?: string; label?: string;
+    mode?: "build" | "spec" }): Promise<Run> {
     ordinal += 1;
     const taskId = `R2C-H1-${ordinal}`;
     const runId = `ccc-plan:${sha(options.label ?? `r2c-h1-run-${ordinal}`).slice(0, 24)}`;
     const workItemId = `${runId.replace(":", "-")}--planning`;
     const workflowId = `${runId.replace(":", "-")}--workflow`;
-    const ir = buildCccPlanningWorkflowIr("build");
+    const ir = buildCccPlanningWorkflowIr(options.mode ?? "build");
     const owner = options.owner ?? DEAD_ENGINE;
     await db.execute(sql`
       INSERT INTO project.tasks (project_id, id, description, "column", lineage_id, created_at, updated_at)
       VALUES (${PROJECT}, ${taskId}, ${`request-to-code fixture ${taskId}`}, 'todo', ${runId}, ${NOW}, ${NOW})
     `);
     await db.insert(cccPlanningRuns).values({
-      projectId: PROJECT, runId, planningTaskId: taskId, mode: "build", budgetProfile: "standard", roleProfile: "full-v2",
+      projectId: PROJECT, runId, planningTaskId: taskId, mode: options.mode ?? "build", budgetProfile: "standard", roleProfile: "full-v2",
       policyVersion: "ccc-planning.budget-policy.v1", policyDigest: sha("policy"), requestDigest: sha(`request:${runId}`),
       requestBytes: 512, targetRepository: "/private/tmp/r2c-h1-target", admittedBase: "b".repeat(40),
       grantDigest: sha(`grant:${runId}`), authorityReceiptSha256: sha(`receipt:${runId}`),
       authorityReceiptJson: JSON.stringify({ runId }), runtimeDistManifestSha256: RUNTIME_DIGEST, state: "admitted",
-      deadlineAt: FAR, planningAllocation: 1536, implementationAllocation: 20, reviewProofAllocation: 10,
+      deadlineAt: FAR, planningAllocation: 1536,
+      // The anchor CHECK: a Spec run carries no implementation or review-proof allocation.
+      implementationAllocation: options.mode === "spec" ? 0 : 20, reviewProofAllocation: options.mode === "spec" ? 0 : 10,
       researchFetchAllocation: 5, researchBytesAllocation: 1_048_576, createdAt: NOW, updatedAt: NOW,
     });
     await db.execute(sql`
@@ -215,9 +220,22 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
       const mine = status.stages.find((stage) => stage.stageId === ctx.stageId);
       if (mine?.status === "committed") return { kind: "committed", artifactKeys: mine.artifactKeys };
       calls.push({ stageId: ctx.stageId, fence: ctx.fence });
+      await sealSpecReady(ctx);
       return { kind: "committed", artifactKeys: [] };
     }])) as Record<CccPlanningIrStageId, CccPlanningStageFn>;
     return { stages, calls, entered };
+  }
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 2):
+  Like the real specready stage (PRD section 9, D53), the fixture moves a running run to spec_ready under the stage's
+  fence: the host now concludes a run that is still admitted or running when the workflow completes.
+  */
+  async function sealSpecReady(ctx: CccPlanningStageContext): Promise<void> {
+    if (ctx.stageId !== "specready" || ctx.run.state !== "running") return;
+    await ctx.ledger.transitionCccPlanningRunState({
+      runId: ctx.run.runId, from: "running", to: "spec_ready", stateCode: null, fence: ctx.fence,
+    });
   }
 
   function planningRuntime(stages: Record<CccPlanningIrStageId, CccPlanningStageFn>,
@@ -267,7 +285,7 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
       expect(call.fence).toEqual({ ...run.fence, leaseOwner: LIVE_ENGINE });
     }
     expect(await workItem(run)).toMatchObject({ state: "succeeded", attempt: 1, lease_owner: null });
-    expect(await anchor(run)).toMatchObject({ state: "running" });
+    expect(await anchor(run)).toMatchObject({ state: "spec_ready" });
   });
 
   it("H1 control: a live lease held by another engine is not reclaimed and no stage runs", async () => {
@@ -373,7 +391,10 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
   */
   function plainStages(overrides: Partial<Record<CccPlanningIrStageId, CccPlanningStageFn>> = {}) {
     return Object.fromEntries(CCC_PLANNING_IR_STAGES.map((stageId) => [
-      stageId, overrides[stageId] ?? (async () => ({ kind: "committed", artifactKeys: [] })),
+      stageId, overrides[stageId] ?? (async (ctx: CccPlanningStageContext) => {
+        await sealSpecReady(ctx);
+        return { kind: "committed", artifactKeys: [] };
+      }),
     ])) as Record<CccPlanningIrStageId, CccPlanningStageFn>;
   }
 
@@ -508,6 +529,201 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
     expect(cancel).toMatchObject({ appliedDirectly: true });
     expect(await anchor(run)).toMatchObject({ state: "cancelled" });
     expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 1):
+  The planning claim is total. Before this repair a throw from the processor's own run lookup, its getTask read or its
+  `held` write reached the shared catch, which failed the item and left the run running (or resting) where nothing
+  moves it again: an operator cancel then stayed pending forever. Each case injects one transient failure the way the
+  reviewers reproduced it and follows the run to an end an operator can see.
+  */
+  function proxiedStore(override: (key: PropertyKey) => unknown): PgTestHarness["store"] {
+    return new Proxy(harness.store, {
+      get(target, key) {
+        const replaced = override(key);
+        if (replaced !== undefined) return replaced;
+        const value = Reflect.get(target, key, target) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+  }
+
+  async function stateEventCount(run: Pick<Run, "runId">): Promise<number> {
+    const rows = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM project.run_audit_events
+       WHERE project_id = ${PROJECT} AND run_id = ${run.runId} AND mutation_type = 'ccc-planning:state'
+    `)) as unknown as Array<{ n: number }>;
+    return rows[0]!.n;
+  }
+
+  it("H1 RED 20: a run lookup that throws once releases the item to runnable and a later operator cancel completes", async () => {
+    const run = await seedRun({ lease: "expired" });
+    let failures = 0;
+    const flaky = proxiedStore((key) => key === "getCccPlanningRunForTask"
+      ? async (taskId: string) => {
+        failures += 1;
+        if (failures === 1) throw new Error("ECONNRESET (simulated transient run lookup failure)");
+        return getCccPlanningRunForTask(harness.layer, taskId);
+      }
+      : undefined);
+    const { stages, entered } = recordingStages();
+
+    const first = await processRun(run, planningRuntime(stages), flaky);
+
+    expect(first.claimed).toBe(true);
+    expect(first.runtime?.reason ?? "").toContain("ECONNRESET");
+    expect(entered).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "running", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 1, lease_owner: null });
+
+    const cancel = await operatorCancel(run);
+    expect(cancel.appliedDirectly).toBe(false);
+    const second = await processRun(run, planningRuntime(stages));
+
+    expect(second.claimed).toBe(true);
+    expect(entered).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  it("H1 RED 21: a getTask read that throws once concludes the run under the lease, never a failed item behind a running run", async () => {
+    const run = await seedRun({ lease: "expired" });
+    let failures = 0;
+    const flaky = proxiedStore((key) => key === "getTask"
+      ? async (taskId: string) => {
+        failures += 1;
+        if (failures === 1) throw new Error("ECONNRESET (simulated transient getTask failure)");
+        return harness.store.getTask(taskId);
+      }
+      : undefined);
+    const { stages, entered } = recordingStages();
+
+    const result = await processRun(run, planningRuntime(stages), flaky);
+
+    expect(result.claimed).toBe(true);
+    expect(result.runtime?.reason ?? "").toContain("ECONNRESET");
+    expect(entered).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_INTERNAL_ERROR", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "failed", lease_owner: null });
+    // The run has ended, so no operator cancel is left waiting on it.
+    await expect(operatorCancel(run)).rejects.toMatchObject({ code: "CCC_PLANNING_RUN_TERMINAL" });
+  });
+
+  it("H1 RED 22: a held write that fails once leaves the item leased, the next claim re-holds it and a cancel completes", async () => {
+    const run = await seedRun({ lease: "expired" });
+    let failures = 0;
+    const flaky = proxiedStore((key) => key === "transitionWorkflowWorkItem"
+      ? async (...args: Parameters<PgTestHarness["store"]["transitionWorkflowWorkItem"]>) => {
+        if (args[1] === "held") {
+          failures += 1;
+          if (failures === 1) throw new Error("ECONNRESET (simulated transient held write failure)");
+        }
+        return harness.store.transitionWorkflowWorkItem(...args);
+      }
+      : undefined);
+    const stages = plainStages({
+      preflight: async () => ({ kind: "blocked", state: "blocked_prerequisite", code: "CCC_PLANNING_SANDBOX_UNAVAILABLE" }),
+    });
+
+    await processRun(run, planningRuntime(stages), flaky);
+
+    expect(await anchor(run)).toMatchObject({ state: "blocked_prerequisite", state_code: "CCC_PLANNING_SANDBOX_UNAVAILABLE" });
+    // Never failed: the item stays leased until its lease expires and the acquire path reclaims it.
+    expect(await workItem(run)).toMatchObject({ state: "running", attempt: 1, lease_owner: LIVE_ENGINE });
+
+    await expireLease(run);
+    const { stages: again, entered } = recordingStages();
+    const second = await processRun(run, planningRuntime(again));
+    expect(second.claimed).toBe(true);
+    expect(entered).toEqual([]);
+    expect(await workItem(run)).toMatchObject({ state: "held", attempt: 1, lease_owner: null });
+
+    await operatorCancel(run);
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 2, D45):
+  The success twin of RED 19. In a Spec run the last stage moves the run to spec_ready; an operator cancel that lands
+  before the item's `succeeded` write is applied directly (spec_ready -> cancelling) and deferred live-lease by L1.
+  After the write the host asks L1 to complete it, so the run ends cancelled, not cancelling until a restart.
+  */
+  it("H1 RED 23: an operator cancel racing the final succeeded write ends cancelled, not cancelling", async () => {
+    const run = await seedRun({ lease: "expired", mode: "spec" });
+    let cancel: Awaited<ReturnType<typeof operatorCancel>> | undefined;
+    const racing = proxiedStore((key) => key === "transitionWorkflowWorkItem"
+      ? async (...args: Parameters<PgTestHarness["store"]["transitionWorkflowWorkItem"]>) => {
+        if (args[1] === "succeeded" && cancel === undefined) cancel = await operatorCancel(run);
+        return harness.store.transitionWorkflowWorkItem(...args);
+      }
+      : undefined);
+
+    const result = await processRun(run, planningRuntime(plainStages()), racing);
+
+    expect(result.runtime?.disposition).toBe("completed");
+    expect(cancel).toMatchObject({ appliedDirectly: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "succeeded", lease_owner: null });
+  });
+
+  it("H1 control: the same Spec run without the race ends spec_ready with the item succeeded", async () => {
+    const run = await seedRun({ lease: "expired", mode: "spec" });
+
+    const result = await processRun(run, planningRuntime(plainStages()));
+
+    expect(result.runtime?.disposition).toBe("completed");
+    expect(await anchor(run)).toMatchObject({ state: "spec_ready", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "succeeded", lease_owner: null });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-15-00:04 (W3 repair 2, E14 item 4):
+  The positive control for RED 18. With a published decision_request, L1 admits the park; the run rests in
+  awaiting_intent with the state code section 2.3 requires, CCC_PLANNING_AWAITING_INTENT.
+  */
+  it("H1 RED 18c: an admitted awaiting-intent park rests the run with CCC_PLANNING_AWAITING_INTENT and holds the item", async () => {
+    const run = await seedRun({ lease: "live" });
+    const key = "cccplan-r001-intent-question1-v01";
+    const content = JSON.stringify({ schema: "ccc-planning.decision-request.v1", question: "which target branch?" });
+    const metadata = {
+      schema: "ccc-planning.artifact-envelope.v1", artifactKey: key, runId: run.runId, runRevision: 1, stageId: "intent",
+      slot: "question1", version: 1, kind: "decision_request", contentType: "application/json",
+      contentSchema: "ccc-planning.decision-request.v1", inputs: [],
+      producer: { kind: "controller", roleId: "controller", instanceId: "controller:1" },
+      policy: { promptVersion: "none", promptDigest: "none", toolPolicyVersion: "none", toolPolicyDigest: "none" },
+      outputDigest: sha(content), status: "complete",
+      fence: { kind: "work_item_lease", workItemId: run.workItemId, leaseOwner: run.fence.leaseOwner, attempt: 1, runId: run.runId },
+      identityDigest: sha(`identity:${run.runId}:${key}`), publishedAt: NOW,
+    };
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('fusion.ccc_planning_publication', 'on', true)`);
+      await tx.execute(sql`
+        INSERT INTO project.task_documents
+          (project_id, id, task_id, key, content, revision, author, metadata, created_at, updated_at)
+        VALUES (${PROJECT}, ${`doc-${run.taskId}-${key}`}, ${run.taskId}, ${key}, ${content}, 1,
+                'ccc-planning:controller', ${JSON.stringify(metadata)}::jsonb, ${NOW}, ${NOW})
+      `);
+    });
+    await expireLease(run);
+    const decisionId = cccPlanningDecisionId({ revision: 1, questionDigest: sha(content) });
+    const stages = plainStages({ intent: async () => ({ kind: "awaiting-intent", decisionId }) });
+
+    const result = await processRun(run, planningRuntime(stages));
+
+    expect(result.runtime?.disposition).toBe("manual-required");
+    expect(await anchor(run)).toMatchObject({ state: "awaiting_intent", state_code: "CCC_PLANNING_AWAITING_INTENT" });
+    const rows = (await db.execute(sql`
+      SELECT r.awaiting_decision_id, w.state, w.lease_owner, w.blocked_reason
+        FROM project.ccc_planning_runs r JOIN project.workflow_work_items w
+          ON w.project_id = r.project_id AND w.id = ${run.workItemId}
+       WHERE r.project_id = ${PROJECT} AND r.run_id = ${run.runId}
+    `)) as unknown as Row[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ awaiting_decision_id: decisionId, state: "held", lease_owner: null });
+    expect(String(rows[0]!.blocked_reason)).toContain(decisionId);
+    expect(await stateEventCount(run)).toBe(1);
   });
 
   // Last in the file: run A stays running with a pending pause, which every later recovery would report as failed.

@@ -127,8 +127,8 @@ export type CccPlanningHostWiring = Readonly<{
   linkedOutcomePorts?: CccPlanningLinkedOutcomePorts;
 }>;
 
-/** W3 repair 1: lease-expired planning items offered per drain pass, applied after the planning filter. */
-const CCC_PLANNING_EXPIRED_DRAIN_LIMIT = 20;
+/** W3 repairs 1 and 2: planning items offered per drain pass, applied after the planning filter. */
+const CCC_PLANNING_DRAIN_LIMIT = 20;
 
 /** A request-to-code planning work item: the run's single task item, keyed by its `ccc-plan:` run id (D1). */
 function isCccPlanningWorkItem(item: WorkflowWorkItem): boolean {
@@ -2361,10 +2361,19 @@ export class InProcessRuntime
       `running` campaign or ordinary task items, so a first page of the oldest 20 can hold none of the planning items
       and the D3 reclaim would never happen. The whole lease-expired list is read, filtered to planning items, and only
       the planning subset is capped.
+
+      FNXC:CccPlanningHost 2026-10-15-00:04:
+      W3 repair 2 (E14 item 3): the same holds for `runnable` and `retrying` planning items (a fresh admission, every
+      resume or answer requeue). Runnable continuation items of ordinary paused tasks are skipped below and never
+      cleared, so 20 of them hide every planning item from the shared first page. Planning items of every due state are
+      therefore read apart from that page, filtered first and capped after; one already on the page is not added twice.
       */
       if (this.cccPlanningHost) {
-        const expiredRunning = await this.taskStore.listDueWorkflowWorkItems({ kinds: ["task"], states: ["running"] });
-        items.push(...expiredRunning.filter(isCccPlanningWorkItem).slice(0, CCC_PLANNING_EXPIRED_DRAIN_LIMIT));
+        const onPage = new Set(items.map((item) => item.id));
+        const due = await this.taskStore.listDueWorkflowWorkItems({ kinds: ["task"], states: ["runnable", "retrying", "running"] });
+        items.push(...due
+          .filter((item) => isCccPlanningWorkItem(item) && !onPage.has(item.id))
+          .slice(0, CCC_PLANNING_DRAIN_LIMIT));
       }
       for (const item of items) {
         let task: Task | undefined;

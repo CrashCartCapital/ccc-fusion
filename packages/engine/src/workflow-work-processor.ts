@@ -5,6 +5,7 @@ import {
   isTaskMoveDisposalActive,
   registerTaskMoveDisposer,
   type CccPlanningRunCustody,
+  type CccPlanningRunState,
   type Settings,
   type TaskDetail,
   type TaskStore,
@@ -187,7 +188,8 @@ export async function processDueWorkflowWorkItem(
     : undefined;
   try {
     if (custody === "planning") {
-      runtimeResult = await runPlanningWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController, diagnostics);
+      runtimeResult = await runPlanningWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController,
+        diagnostics, (current) => { dispatch.workItem = current; });
       return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
     }
     const importedCampaignWorkItem = isImportedCccCampaignWorkItem(dispatch.workItem);
@@ -253,6 +255,17 @@ export async function processDueWorkflowWorkItem(
       runtimeResult = await runtime.runWorkItem(dispatch.workItem, settings);
     }
   } catch (err) {
+    /*
+    FNXC:CccPlanningHost 2026-10-15-00:04:
+    W3 repair 2 (E14 item 1), defence in depth. runPlanningWorkflowWorkItem is total, so a planning claim should never
+    get here. If one ever does, its item goes back to `runnable` for the next stage start (the L1-unreachable rule),
+    never to `failed`: a failed item behind a run that could still run strands the run, and neither the campaign
+    cancellation branch nor the ordinary failure below applies to planning custody.
+    */
+    if (custody === "planning") {
+      runtimeResult = await releasePlanningClaimAfterError(store, opts, dispatch.workItem, err, diagnostics);
+      return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
+    }
     if (err instanceof WorkflowCampaignTerminalTransitionError) {
       campaignCompletionError = err.cause instanceof Error ? err.cause : err;
       throw campaignCompletionError;
@@ -350,6 +363,17 @@ export async function processDueWorkflowWorkItem(
  * cannot be reached the item goes back to `runnable`, as on lease loss, so the next stage start runs its checks and
  * pending controls again. Every hold also asks L1 to complete a cancellation (D45): an operator cancel that lands after
  * the park and before the release is deferred live-lease by L1, and nothing else would finish it before a restart.
+ *
+ * FNXC:CccPlanningHost 2026-10-15-00:04:
+ * W3 repair 2 (E14 items 1 and 2). The claim is total: no throw leaves this function for the shared catch, and the item
+ * is never written `failed` behind a run that could still run. A run lookup that throws releases the item to
+ * `runnable` (L1 unreachable, as RED 16b). Once the run is known, the attempt bump, the planning task read and a store
+ * that cannot read the task are concluded on the run under the still-live lease. Every item write is quiet: a `held`,
+ * `failed` or `succeeded` write that fails leaves the item leased, and the existing acquire path reclaims it after the
+ * lease expires, so the next stage start re-holds or re-concludes it. Anything else releases the item to `runnable`.
+ * On completion the run is read back while the fence is still live (the `succeeded` write ends it): a run still
+ * admitted or running is concluded, because nothing would move it again behind a succeeded item; otherwise the item
+ * succeeds and L1 is asked to complete a cancellation that landed before the write (D45), as every hold already does.
  */
 async function runPlanningWorkflowWorkItem(
   store: WorkflowWorkProcessorStore,
@@ -359,8 +383,10 @@ async function runPlanningWorkflowWorkItem(
   claimed: WorkflowWorkItem,
   abortController: AbortController,
   diagnostics: string[],
+  track: (workItem: WorkflowWorkItem) => void,
 ): Promise<WorkflowTaskRuntimeResult> {
   let workItem = claimed;
+  const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
   const failed = (reason: string): WorkflowTaskRuntimeResult => ({
     disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason,
   });
@@ -373,85 +399,66 @@ async function runPlanningWorkflowWorkItem(
     leaseOwner: null,
     leaseExpiresAt: null,
   });
-  const transition = async (state: WorkflowWorkItemState, patch: { lastError?: string | null; blockedReason?: string | null }) => {
-    await store.transitionWorkflowWorkItem!(workItem.id, state, { ...casPatch(), ...patch });
-  };
-  const releaseQuietly = async (state: WorkflowWorkItemState, patch: { lastError?: string | null; blockedReason?: string | null }) => {
+  /** Write the item under this claim's lease; a refused or failed write is left to the lease. True when written. */
+  const releaseQuietly = async (state: WorkflowWorkItemState,
+    patch: { lastError?: string | null; blockedReason?: string | null }): Promise<boolean> => {
     try {
-      await transition(state, patch);
+      await store.transitionWorkflowWorkItem!(workItem.id, state, { ...casPatch(), ...patch });
+      return true;
     } catch (error) {
-      // The lease is gone (another engine reclaimed it) or the item moved: there is nothing of ours left to release.
-      diagnostics.push(`ccc planning release to ${state} skipped: ${error instanceof Error ? error.message : String(error)}`);
+      // The lease is gone, the item moved, or the write failed: the acquire path reclaims a still-leased item later.
+      diagnostics.push(`ccc planning release to ${state} skipped: ${message(error)}`);
+      return false;
     }
   };
   const completer = cccPlanningCancellationCompleter(store);
-  const completeCancellation = async () => {
+  /** D45: L1 completes a due cancellation; a failure is left to engine-start recovery. */
+  const completeCancellationQuietly = async (): Promise<void> => {
     if (!completer) {
       diagnostics.push(`ccc planning cancellation completion is unwired for run ${workItem.runId}`);
       return;
     }
-    await completer(workItem.runId);
-  };
-  const completeCancellationQuietly = async () => {
     try {
-      await completeCancellation();
+      await completer(workItem.runId);
     } catch (error) {
-      // Engine-start recovery completes it later (D45); the item is already released.
-      diagnostics.push(`ccc planning cancellation completion deferred: ${error instanceof Error ? error.message : String(error)}`);
+      diagnostics.push(`ccc planning cancellation completion deferred: ${message(error)}`);
     }
   };
-  const failWorkItem = async (reason: string): Promise<WorkflowTaskRuntimeResult> => {
-    await transition("failed", { lastError: reason });
-    return failed(reason);
-  };
-
-  const lookup = cccPlanningRunLookup(store);
-  if (!lookup) return failWorkItem("workflow planning custody lookup is unwired");
-  const planningRun = await lookup(workItem.taskId);
-  if (!planningRun || planningRun.runId !== workItem.runId || planningRun.planningTaskId !== workItem.taskId) {
-    return failWorkItem("workflow required planning custody is missing");
-  }
-  if (typeof store.renewWorkflowWorkItemLease !== "function") {
-    return failWorkItem("workflow planning processor requires renewWorkflowWorkItemLease");
-  }
-  if (typeof store.getTask !== "function") return failWorkItem("workflow planning processor requires getTask");
-  if (workItem.attempt === 0) {
-    workItem = await store.transitionWorkflowWorkItem!(workItem.id, "running", {
-      now: opts.now,
-      expectedState: "running",
-      expectedLeaseOwner: opts.leaseOwner,
-      expectedAttempt: 0,
-      attempt: 1,
-      leaseOwner: opts.leaseOwner,
-    });
-  }
   const descendants = createCccPlanningDescendantRegistry();
   const signal = abortController.signal;
-  const settleAbort = async (flush: () => Promise<void>, why?: Error): Promise<WorkflowTaskRuntimeResult> => {
-    const reason = why ?? (signal.reason instanceof Error ? signal.reason : new Error("workflow-aborted"));
-    await settleCccPlanningRun({
+  const settle = (release: () => Promise<boolean>, reason: Error, flush: () => Promise<void> = async () => undefined) =>
+    settleCccPlanningRun({
       descendants,
       flush,
-      release: () => releaseQuietly("runnable", { lastError: reason.message }),
-      completeCancellation,
+      release: async () => { await release(); },
+      completeCancellation: completeCancellationQuietly,
       reason,
     });
+  /** L1 cannot conclude the run on this claim: release the item so the next stage start runs its checks again. */
+  const releaseUnconcluded = async (why: Error): Promise<WorkflowTaskRuntimeResult> => {
+    await settle(() => releaseQuietly("runnable", { lastError: why.message }), why);
+    return failed(why.message);
+  };
+  const failWorkItem = async (reason: string): Promise<WorkflowTaskRuntimeResult> => {
+    await releaseQuietly("failed", { lastError: reason });
+    return failed(reason);
+  };
+  const settleAbort = async (flush: () => Promise<void>, why?: Error): Promise<WorkflowTaskRuntimeResult> => {
+    const reason = why ?? (signal.reason instanceof Error ? signal.reason : new Error("workflow-aborted"));
+    await settle(() => releaseQuietly("runnable", { lastError: reason.message }), reason, flush);
     return failed(reason.message);
   };
   /** A held or cancelling run: hold the item, then let L1 complete a cancellation if one is due (D45). */
-  const holdWorkItem = async (hold: CccPlanningHoldContext, release: typeof transition): Promise<void> => {
+  const holdWorkItem = async (hold: CccPlanningHoldContext): Promise<void> => {
     const blockedReason = hold.disposition === "cancel"
       ? "ccc-planning:cancelling"
       : ["ccc-planning", hold.runState, hold.code, hold.decisionId]
         .filter((part): part is string => typeof part === "string" && part.length > 0)
         .join(":");
-    await settleCccPlanningRun({
-      descendants,
-      flush: async () => undefined,
-      release: () => release("held", { blockedReason, lastError: null }),
-      completeCancellation: hold.disposition === "cancel" ? completeCancellation : completeCancellationQuietly,
-      reason: new Error(hold.disposition === "cancel" ? "ccc-planning-cancelling" : `ccc-planning-held:${hold.runState}`),
-    });
+    await settle(
+      () => releaseQuietly("held", { blockedReason, lastError: null }),
+      new Error(hold.disposition === "cancel" ? "ccc-planning-cancelling" : `ccc-planning-held:${hold.runState}`),
+    );
   };
   /** Conclude a failure that is not a hold before the work item moves (W3 repair 1). */
   const concludeFailure = async (base: WorkflowTaskRuntimeResult, reason: string): Promise<WorkflowTaskRuntimeResult> => {
@@ -472,19 +479,12 @@ async function runPlanningWorkflowWorkItem(
         code: CCC_PLANNING_INTERNAL_ERROR_CODE,
       });
     } catch (error) {
-      const why = new Error(`${reason}; run not concluded: ${error instanceof Error ? error.message : String(error)}`);
-      await settleCccPlanningRun({
-        descendants,
-        flush: async () => undefined,
-        release: () => releaseQuietly("runnable", { lastError: why.message }),
-        completeCancellation: completeCancellationQuietly,
-        reason: why,
-      });
-      return { ...base, disposition: "failed", outcome: "failure", reason: why.message };
+      const released = await releaseUnconcluded(new Error(`${reason}; run not concluded: ${message(error)}`));
+      return { ...base, disposition: "failed", outcome: "failure", reason: released.reason };
     }
     if (conclusion.kind === "ended") {
       await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
-      await transition("failed", { lastError: reason });
+      await releaseQuietly("failed", { lastError: reason });
       return { ...base, disposition: "failed", outcome: "failure", reason };
     }
     const { hold } = conclusion;
@@ -498,12 +498,78 @@ async function runPlanningWorkflowWorkItem(
       await settleAbort(async () => undefined, new Error("ccc-planning-fence-stale"));
       return { ...concluded, disposition: "failed" };
     }
-    await holdWorkItem(hold, releaseQuietly);
+    await holdWorkItem(hold);
     return { ...concluded, disposition: hold.disposition === "cancel" ? "cancelled" : "manual-required" };
   };
-  const renewal = startWorkflowLeaseRenewal(store, workItem, opts, abortController);
+  /** The workflow completed: conclude a run still admitted or running under the live fence, else succeed (D45). */
+  const concludeCompletion = async (result: WorkflowTaskRuntimeResult): Promise<WorkflowTaskRuntimeResult> => {
+    await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
+    let runState: CccPlanningRunState;
+    try {
+      const ledger = cccPlanningHostLedger(store);
+      if (!ledger) throw new Error("ccc planning ledger is unwired");
+      runState = (await ledger.inspectCccPlanningRun(workItem.runId)).state;
+    } catch (error) {
+      return releaseUnconcluded(new Error(`workflow planning completed but its run was not read back: ${message(error)}`));
+    }
+    if (runState === "admitted" || runState === "running") {
+      const reason = `workflow-planning-completed-with-run-${runState}`;
+      return concludeFailure({ ...result, disposition: "failed", outcome: "failure", reason }, reason);
+    }
+    if (!(await releaseQuietly("succeeded", { lastError: null }))) {
+      return { ...result, disposition: "failed", outcome: "failure", reason: "ccc-planning-success-not-recorded" };
+    }
+    await completeCancellationQuietly();
+    return result;
+  };
+
+  let renewal: ReturnType<typeof setInterval> | undefined;
   try {
-    const task = await store.getTask(workItem.taskId) as TaskDetail | undefined;
+    const lookup = cccPlanningRunLookup(store);
+    if (!lookup) return await failWorkItem("workflow planning custody lookup is unwired");
+    let planningRun: CccPlanningRunCustody | null;
+    try {
+      planningRun = await lookup(workItem.taskId);
+    } catch (error) {
+      return await releaseUnconcluded(new Error(`workflow planning custody lookup failed: ${message(error)}`));
+    }
+    if (!planningRun || planningRun.runId !== workItem.runId || planningRun.planningTaskId !== workItem.taskId) {
+      return await failWorkItem("workflow required planning custody is missing");
+    }
+    // From here the run behind this item is known: every failure is concluded on it under the still-live lease.
+    if (typeof store.renewWorkflowWorkItemLease !== "function") {
+      const reason = "workflow planning processor requires renewWorkflowWorkItemLease";
+      return await concludeFailure(failed(reason), reason);
+    }
+    if (typeof store.getTask !== "function") {
+      const reason = "workflow planning processor requires getTask";
+      return await concludeFailure(failed(reason), reason);
+    }
+    if (workItem.attempt === 0) {
+      try {
+        workItem = await store.transitionWorkflowWorkItem!(workItem.id, "running", {
+          now: opts.now,
+          expectedState: "running",
+          expectedLeaseOwner: opts.leaseOwner,
+          expectedAttempt: 0,
+          attempt: 1,
+          leaseOwner: opts.leaseOwner,
+        });
+        track(workItem);
+      } catch (error) {
+        const reason = `workflow planning attempt bump failed: ${message(error)}`;
+        return await concludeFailure(failed(reason), reason);
+      }
+    }
+    renewal = startWorkflowLeaseRenewal(store, workItem, opts, abortController);
+    let task: TaskDetail | undefined;
+    try {
+      task = await store.getTask(workItem.taskId) as TaskDetail | undefined;
+    } catch (error) {
+      if (signal.aborted) return await settleAbort(async () => undefined);
+      const reason = `workflow planning task read failed: ${message(error)}`;
+      return await concludeFailure(failed(reason), reason);
+    }
     if (signal.aborted) return await settleAbort(async () => undefined);
     if (!task) return await concludeFailure(failed("workflow planning task is missing"), "workflow planning task is missing");
     const running = runtime.run(task, settings, {
@@ -531,7 +597,7 @@ async function runPlanningWorkflowWorkItem(
     ]);
     if (first === "aborted") return await settleAbort(() => settled);
     if ("error" in first) {
-      const reason = `workflow-work-item-runtime-error:${first.error instanceof Error ? first.error.message : String(first.error)}`;
+      const reason = `workflow-work-item-runtime-error:${message(first.error)}`;
       return await concludeFailure(failed(reason), reason);
     }
     const result = first.result;
@@ -542,18 +608,47 @@ async function runPlanningWorkflowWorkItem(
       return result;
     }
     if (hold?.disposition === "cancel" || hold?.disposition === "held") {
-      await holdWorkItem(hold, transition);
+      await holdWorkItem(hold);
       return result;
     }
-    if (result.disposition === "completed") {
-      await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
-      await transition("succeeded", { lastError: null });
-      return result;
-    }
+    if (result.disposition === "completed") return await concludeCompletion(result);
     return await concludeFailure(result, result.reason ?? "workflow-planning-failed");
+  } catch (error) {
+    // Nothing above should throw; if something does, the item goes back for the next stage start, never `failed`.
+    return await releaseUnconcluded(new Error(`workflow planning claim error: ${message(error)}`));
   } finally {
     if (renewal) clearInterval(renewal);
   }
+}
+
+/**
+ * FNXC:CccPlanningHost 2026-10-15-00:04:
+ * W3 repair 2 (E14 item 1): the shared catch's planning branch (defence in depth). The item goes back to `runnable`
+ * under this claim's lease, never `failed`; a refused write leaves it to the lease and the acquire path.
+ */
+async function releasePlanningClaimAfterError(
+  store: WorkflowWorkProcessorStore,
+  opts: WorkflowWorkProcessorOptions,
+  workItem: WorkflowWorkItem,
+  error: unknown,
+  diagnostics: string[],
+): Promise<WorkflowTaskRuntimeResult> {
+  const reason = `workflow-work-item-runtime-error:${error instanceof Error ? error.message : String(error)}`;
+  try {
+    await store.transitionWorkflowWorkItem!(workItem.id, "runnable", {
+      now: opts.now,
+      expectedState: "running",
+      expectedLeaseOwner: opts.leaseOwner,
+      expectedAttempt: workItem.attempt,
+      attempt: workItem.attempt,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: reason,
+    });
+  } catch (releaseError) {
+    diagnostics.push(`ccc planning release to runnable skipped: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`);
+  }
+  return { disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason };
 }
 
 function claimedProcessorResult(
