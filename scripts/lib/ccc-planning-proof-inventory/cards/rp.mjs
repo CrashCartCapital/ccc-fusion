@@ -4,7 +4,9 @@ Proof inventory for request-to-code v3 card RP (versioned role prompts for every
 
 TARGETED is file-closed over the card's one check file. OFFLINE is name-closed over the same file: the names below are exactly its tests, built the way `assertionName` in `scripts/run-ccc-pg-proof.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. The engine command is pinned to `engine-default`, whose aliases point @fusion/core at source, so no build runs. The file is pure: no PostgreSQL, no network, no process spawn; `needsPostgres` is false and `platform` is any. The names stay ASCII so they compare byte for byte.
 
-Measured on the M5 Max with other agents running heavy suites (load average about 10): 3 s wall for the whole Vitest command and 2.1 s of Vitest time, 23 tests, 0 failed, 0 skipped. The 60 s command timeout is a hang bound at 20 times that; no test timeout is raised anywhere.
+Measured on the M5 Max with other agents running heavy suites (load average about 10): 2 to 3 s wall for the whole Vitest command (three runs) and 2.0 to 2.4 s of Vitest time, 26 tests, 0 failed, 0 skipped. The 60 s command timeout is a hang bound at 20 times the slowest wall; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProofInventory 2026-10-14-21:09: repair 1, errata E9. The file grew from 23 to 26 tests: one pin for the planner (writers own only src/ and bin/ paths, so a plan is never asked for a test, fixture or Taskfile.yml path), one for the implementation writer (it owns no test path and may read and run, never edit, the independent checks) and one for the data rule (only the implementation writer and the extraction leaf carry out one named packet input). The three new names sit just before the ASCII test, in file order.
 */
 
 const FILE = "src/__tests__/ccc-planning-prompts.test.ts";
@@ -54,6 +56,9 @@ export const OFFLINE = Object.freeze([
       `${SUITE} > keeps the two designers blind to each other and gives each design reviewer exactly one design input`,
       `${SUITE} > makes each probe prompt exercise exactly one tool and end after one call`,
       `${SUITE} > sizes planner tasks to the call cap and names fn_complete_phase only in the implementation writer prompt`,
+      `${SUITE} > tells the planner that writers own only source paths and never a test, fixture or Taskfile path`,
+      `${SUITE} > tells the implementation writer it owns no test path and may read and run, never edit, the independent checks`,
+      `${SUITE} > lets only the implementation writer and the extraction leaf carry out one named input and keeps the data rule whole elsewhere`,
       `${SUITE} > keeps every template ASCII with LF line ends and shows critics no earlier verdict`,
     ]),
   }),
