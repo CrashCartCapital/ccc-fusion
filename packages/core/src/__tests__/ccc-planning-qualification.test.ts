@@ -12,6 +12,8 @@ import {
 /*
 FNXC:CccPlanningQualification 2026-10-14-13:45:
 Card K2 RED for the pre-qualification rule (D24, PRD section 7, critic 11). Until I6 the qualification port finds no certificate, so G0 admits only an owned disposable target named by a receipt. Each refusal has a control on the same fixture that differs in one field and is admitted, so a refuse-everything decision fails too. The receipt fixtures only need the fields the decision reads; an `admitted_repository` receipt cannot be expressed in the I1 receipt type, so it is cast, exactly as a future widened receipt would arrive.
+FNXC:CccPlanningQualification 2026-10-14-17:16:
+Repair 1 (errata E5-K2 item 5): a certificate of another schema, or whose profile scope omits full-v2, qualifies nothing even when its id is the true digest of its body; round-1 mutants that deleted either check left every test green.
 */
 
 const DIGESTS: CccPlanningQualificationDigestsV1 = {
@@ -26,12 +28,12 @@ function receiptWith(targetClass: string, mode: "spec" | "build" = "build"): Ccc
   } as unknown as CccPlanningLiveAuthorityReceiptV1;
 }
 
-function certificate(scope: { targetClasses: ("owned_disposable" | "admitted_repository")[]; modes: ("spec" | "build")[] }):
-  CccPlanningQualificationCertificateV1 {
+function certificate(scope: { targetClasses: ("owned_disposable" | "admitted_repository")[]; modes: ("spec" | "build")[] },
+  override?: { schema?: string; profiles?: string[] }): CccPlanningQualificationCertificateV1 {
   const body = {
-    schema: "ccc-planning.qualification-certificate.v1" as const,
+    schema: (override?.schema ?? "ccc-planning.qualification-certificate.v1") as "ccc-planning.qualification-certificate.v1",
     issuedAt: "2027-01-01T00:00:00.000Z",
-    scope: { targetClasses: scope.targetClasses, modes: scope.modes, profiles: ["full-v2"] as ["full-v2"] },
+    scope: { targetClasses: scope.targetClasses, modes: scope.modes, profiles: (override?.profiles ?? ["full-v2"]) as ["full-v2"] },
     digests: DIGESTS,
     evidence: { reportSha256: "9".repeat(64), heldOutResultsSha256: "a".repeat(64), reviewDispositionsSha256: "b".repeat(64) },
   };
@@ -93,5 +95,17 @@ describe("pre-qualification target admission", () => {
     // The owned disposable rule still holds when a certificate does not apply.
     expect(decideCccPlanningTargetAdmission({ certificate: tampered, receipt: receiptWith("owned_disposable"), mode: "build" }))
       .toEqual({ admitted: true, basis: "owned_disposable_receipt" });
+  });
+
+  it("ignores a certificate of another schema or whose profile scope omits full-v2, each with its id recomputed", () => {
+    // E5-K2 item 5: the schema and profile-scope guards the round-1 mutants (Q01, Q02) showed unprotected.
+    const repository = receiptWith("admitted_repository");
+    const scope = { targetClasses: ["admitted_repository" as const], modes: ["build" as const] };
+    for (const override of [{ schema: "ccc-planning.qualification-certificate.v0" }, { profiles: ["full-v1"] }, { profiles: [] }]) {
+      expect(decideCccPlanningTargetAdmission({ certificate: certificate(scope, override), receipt: repository, mode: "build" }),
+        JSON.stringify(override)).toEqual({ admitted: false, code: "CCC_PLANNING_QUALIFICATION_REQUIRED" });
+    }
+    expect(decideCccPlanningTargetAdmission({ certificate: certificate(scope, { profiles: ["full-v2"] }), receipt: repository, mode: "build" }))
+      .toEqual({ admitted: true, basis: "qualification_certificate" });
   });
 });

@@ -10,6 +10,8 @@ import type { CccCampaignProductExecutionRoute } from "../ccc-campaign/types.js"
 /*
 FNXC:CccRouteAdmission 2026-10-14-13:45:
 Card K2 RED for request-to-code route admission (critic 11, ADR C Q2 as amended by CONTRACT-v3 section 2.7). Admission is by allowlist: a writer is GLM 5.3 Flash, every review identity is MiniMax M3, each on its pinned loopback provider through the receipt adapter and Pi, and a reviewer never shares the reviewed writer's model family. Every refusal case is the admitted control set with one field changed, so a refuse-everything implementation fails the control.
+FNXC:CccRouteAdmission 2026-10-14-17:16:
+Repair 1 (errata E5-K2 items 3, 5 and 6). An unknown route kind is refused rather than judged as G8, a provider that serves two pinned models pins neither, and each graph-role, duplicate-id and pin-shape guard the round-1 mutants showed unprotected has a refusal with an admitted control. A role override changes one task's graph role and nothing else, so the control and the refusal differ in that one field.
 */
 
 const PINS: readonly CccQualifiedPin[] = [
@@ -47,11 +49,11 @@ const ROLES: Readonly<Record<string, CccRouteRole>> = {
   T1: "writer", T2: "writer", "review:T1": "g7-review", "review:T2": "g7-review",
 };
 
-function admit(routes: readonly Route[], pins: readonly CccQualifiedPin[] = PINS) {
+function admit(routes: readonly Route[], pins: readonly CccQualifiedPin[] = PINS, roles: Readonly<Record<string, CccRouteRole>> = {}) {
   return admitCccRequestToCodeRoutes({
     routes,
     roleOf: (taskId) => {
-      const role = ROLES[taskId];
+      const role = roles[taskId] ?? ROLES[taskId];
       if (!role) throw new Error(`unknown task ${taskId}`);
       return role;
     },
@@ -60,8 +62,8 @@ function admit(routes: readonly Route[], pins: readonly CccQualifiedPin[] = PINS
   });
 }
 
-function reasons(routes: readonly Route[], pins?: readonly CccQualifiedPin[]): string[] {
-  return admit(routes, pins).map((refusal) => `${refusal.taskId}:${refusal.reason}:${refusal.observedModelId}`);
+function reasons(routes: readonly Route[], pins?: readonly CccQualifiedPin[], roles?: Readonly<Record<string, CccRouteRole>>): string[] {
+  return admit(routes, pins, roles).map((refusal) => `${refusal.taskId}:${refusal.reason}:${refusal.observedModelId}`);
 }
 
 function replaceAt(index: number, route: Route): Route[] {
@@ -154,5 +156,56 @@ describe("request-to-code route admission", () => {
     const doubled = [...PINS, { ...PINS[1]!, providerId: "ccc-glm53-flash-b" }];
     expect(reasons(controlRoutes(), doubled))
       .toEqual(["T1:provider-not-pinned:glm/glm-5.3-flash", "T2:provider-not-pinned:glm/glm-5.3-flash"]);
+  });
+
+  it("refuses a review identity whose route kind is neither g7-review nor g8-judge, and admits the g8-judge control", () => {
+    // E5-K2 item 3: the route kind is an allowlist; an unknown kind is not a judge.
+    const unknownKind = { ...judge(), routeKind: "g9-anything" } as unknown as CccPlanningReviewIdentity;
+    expect(reasons(replaceAt(4, unknownKind))).toEqual(["judge:final:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons(replaceAt(4, { ...judge(), routeKind: "g8-judge" as const }))).toEqual([]);
+  });
+
+  it("refuses pins that give two models the same provider as provider-not-pinned", () => {
+    // E5-K2 item 6: one provider per model, as the receipt's three distinct provider ids require.
+    const shared = PINS.map((pin) => (pin.modelId === "glm/glm-5.3" ? pin : { ...pin, providerId: "ccc-shared" }));
+    const onShared = controlRoutes().map((route) => ({ ...route, providerId: "ccc-shared" }));
+    expect(reasons(onShared, shared)).toEqual([
+      "T1:provider-not-pinned:glm/glm-5.3-flash", "T2:provider-not-pinned:glm/glm-5.3-flash",
+      "review:T1:provider-not-pinned:minimax/MiniMax-M3", "review:T2:provider-not-pinned:minimax/MiniMax-M3",
+      "judge:final:provider-not-pinned:minimax/MiniMax-M3",
+    ]);
+    // The GLM 5.3 pin on the Flash provider leaves the Flash writers unpinned, although no route uses GLM 5.3.
+    const glmOnFlash = PINS.map((pin) => (pin.modelId === "glm/glm-5.3" ? { ...pin, providerId: "ccc-glm53-flash" } : pin));
+    expect(reasons(controlRoutes(), glmOnFlash))
+      .toEqual(["T1:provider-not-pinned:glm/glm-5.3-flash", "T2:provider-not-pinned:glm/glm-5.3-flash"]);
+    expect(reasons(controlRoutes(), PINS)).toEqual([]);
+  });
+
+  it("refuses a G7 identity on a writer task, a G7 review of a review or of a non-writer, and a G8 judge with a reviewed task", () => {
+    // E5-K2 item 5: each graph-role guard the round-1 mutants showed unprotected, against an admitted one-field control.
+    expect(reasons(controlRoutes(), PINS, { "review:T1": "writer" })).toEqual(["review:T1:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons(controlRoutes(), PINS, { "review:T1": "g7-review" })).toEqual([]);
+    // A G7 identity whose reviewed task is itself a review identity.
+    expect(reasons([...controlRoutes(), review("review:review:T1", "review:T1")], PINS, { "review:review:T1": "g7-review" }))
+      .toEqual(["review:review:T1:role-model-mismatch:minimax/MiniMax-M3"]);
+    // A G7 identity whose reviewed task is a product route the graph does not call a writer.
+    const withP9 = [...controlRoutes(), writer("P9"), review("review:P9", "P9")];
+    expect(reasons(withP9, PINS, { P9: "g7-review", "review:P9": "g7-review" }))
+      .toEqual(["P9:role-model-mismatch:glm/glm-5.3-flash", "review:P9:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons(withP9, PINS, { P9: "writer", "review:P9": "g7-review" })).toEqual([]);
+    expect(reasons(replaceAt(4, judge({ reviewOfTaskId: "T1" })))).toEqual(["judge:final:role-model-mismatch:minimax/MiniMax-M3"]);
+    expect(reasons(replaceAt(4, judge({ reviewOfTaskId: null })))).toEqual([]);
+  });
+
+  it("refuses duplicate task ids, and a pin with the wrong family or a malformed settings digest", () => {
+    // E5-K2 item 5: a duplicate task id is a caller bug, never a second admitted route.
+    expect(() => admit([...controlRoutes(), writer("T1")])).toThrow(/duplicate task id "T1"/u);
+    expect(() => admit(controlRoutes())).not.toThrow();
+    const flashPin = (patch: Partial<CccQualifiedPin>) => PINS.map((pin) => (pin.modelId === "glm/glm-5.3-flash" ? { ...pin, ...patch } : pin));
+    for (const patch of [{ family: "minimax" as const }, { settingsEntrySha256: "2".repeat(63) }, { settingsEntrySha256: "A".repeat(64) }]) {
+      expect(reasons(controlRoutes(), flashPin(patch)), JSON.stringify(patch))
+        .toEqual(["T1:provider-not-pinned:glm/glm-5.3-flash", "T2:provider-not-pinned:glm/glm-5.3-flash"]);
+    }
+    expect(reasons(controlRoutes(), flashPin({ family: "glm", settingsEntrySha256: "2".repeat(64) }))).toEqual([]);
   });
 });

@@ -2,9 +2,11 @@
 FNXC:CccPlanningProofInventory 2026-10-14-14:10:
 Proof inventory for request-to-code card K2 (live-authority receipt, envelope check, null qualification port and request-to-code route admission; D23, D24, critic 11). Card K2 owns exactly this module; the inventory index (card P0) loads every cards/*.mjs in sorted order and rejects duplicate command ids.
 
-TARGETED is file-closed over the three K2 test files of the card's check command. OFFLINE is name-closed over the same files: the 35 names below are exactly the tests in them, built as ancestor titles and the title joined by " > ", so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. Every K2 module is pure: none of these tests touches PostgreSQL, the network or the clock.
+TARGETED is file-closed over the three K2 test files of the card's check command. OFFLINE is name-closed over the same files: the names below are exactly the tests in them, built as ancestor titles and the title joined by " > ", so a skipped, renamed, missing or extra test fails the command instead of passing quietly. Core has no Vitest projects, so `project` is null. Every K2 module is pure: none of these tests touches PostgreSQL, the network or the clock.
 
 Measured on the M5 Max under parallel agent load: about 5 s wall for the three files, 35 tests. The 60 s command timeout is that measurement with headroom for a slower host; no test timeout is raised anywhere.
+FNXC:CccPlanningProofInventory 2026-10-14-17:16:
+Repair 1 (errata E5-K2) adds 11 tests, so OFFLINE now names 46: the run-to-receipt binding, the remaining-calls guard, the literal Flash member and slot, the route-kind allowlist, one provider per model, the case-insensitive .git ban, and the non-vacuity tables for the envelope, parse, route admission and certificate guards. The command still measures well under 5 s wall (the vitest run itself is under 1 s), so the 60 s timeout is unchanged.
 */
 
 const FILES = Object.freeze([
@@ -59,18 +61,25 @@ export const OFFLINE = Object.freeze([
       `${PARSE} > refuses a repository that is not a direct child of the scratch root, or a marker outside it`,
       `${PARSE} > refuses outside the validity window as EXPIRED and a window over 7 days or before the deadline as INVALID`,
       `${PARSE} > refuses more than one permitted protected action and any action other than live_execution`,
+      `${PARSE} > refuses each field check of a one-field table built from the control as INVALID, and admits the control`,
+      `${PARSE} > refuses an admitted Fusion path with a .git segment in any letter case, and admits .github`,
       `${ENVELOPE} > accepts the control authorization inside the receipt envelope`,
       `${ENVELOPE} > accepts the import key ccc-plan:<24hex>:r1 and refuses ccc-plan:<24hex>:<digest>`,
       `${ENVELOPE} > refuses a member on glm/glm-5.3, a member on another provider and a non-pi member`,
       `${ENVELOPE} > refuses maxRequests above the remaining allocation and a deadline or expiry after the receipt's`,
       `${ENVELOPE} > refuses a baseline whose first parent is not the receipt base or that changes a path outside the admitted Fusion paths`,
       `${ENVELOPE} > refuses when the receipt asks for the operator, or is not the receipt the run consumed`,
+      `${ENVELOPE} > refuses a Spec receipt and maxRequests above the receipt's implementation cap, each against a one-field control`,
+      `${ENVELOPE} > refuses remaining implementation calls that are not a non-negative safe integer, and the control 3072 stays within`,
+      `${ENVELOPE} > refuses members on any model but the literal glm/glm-5.3-flash, even under a resealed receipt naming another Flash slot`,
+      `${ENVELOPE} > refuses now before notBefore, zero members, maxRequests 0, a non-hex baseline, an unsealed edit and a dot-dot changed path`,
       `${PORT} > the unqualified port finds no certificate for any digest tuple`,
       `${ADMISSION} > refuses an admitted_repository class with the null certificate as QUALIFICATION_REQUIRED; the owned_disposable control is admitted`,
       `${ADMISSION} > refuses a missing receipt as AUTHORITY_RECEIPT_REQUIRED, with or without a certificate`,
       `${ADMISSION} > refuses a receipt issued for the other mode as AUTHORITY_RECEIPT_REQUIRED`,
       `${ADMISSION} > admits an admitted_repository through a certificate whose scope covers its class and mode`,
       `${ADMISSION} > ignores a certificate whose scope omits the class or mode, or whose id is not the digest of its body`,
+      `${ADMISSION} > ignores a certificate of another schema or whose profile scope omits full-v2, each with its id recomputed`,
       `${ROUTES} > admits the control: Flash writers, M3 task reviews and an M3 final judge on their pinned providers`,
       `${ROUTES} > refuses combo/x as combo-route, and admits the control glm/glm-5.3-flash`,
       `${ROUTES} > refuses a Flash writer reviewed by glm/glm-5.3 as same-family-review, and admits the M3 control`,
@@ -80,6 +89,10 @@ export const OFFLINE = Object.freeze([
       `${ROUTES} > refuses a writer on GLM 5.3 or M3 as role-model-mismatch, and a review of its own family first as same-family-review`,
       `${ROUTES} > refuses a route whose kind disagrees with the graph role or whose reviewed task disagrees with the graph`,
       `${ROUTES} > refuses a non-pi transport, a missing receipt adapter and an unpinned provider`,
+      `${ROUTES} > refuses a review identity whose route kind is neither g7-review nor g8-judge, and admits the g8-judge control`,
+      `${ROUTES} > refuses pins that give two models the same provider as provider-not-pinned`,
+      `${ROUTES} > refuses a G7 identity on a writer task, a G7 review of a review or of a non-writer, and a G8 judge with a reviewed task`,
+      `${ROUTES} > refuses duplicate task ids, and a pin with the wrong family or a malformed settings digest`,
     ]),
     platform: "any",
     needsPostgres: false,

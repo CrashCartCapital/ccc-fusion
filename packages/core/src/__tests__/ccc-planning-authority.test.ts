@@ -10,11 +10,13 @@ import {
   type CccPlanningLiveAuthorityReceiptV1,
 } from "../ccc-planning/authority.js";
 import { CCC_PLANNING_BUDGET_POLICY_V1 } from "../ccc-planning/budget-fit.js";
-import { cccPlanningImportKey, cccPlanningSourcePolicySha256 } from "../ccc-planning/policy.js";
+import { cccPlanningImportKey, cccPlanningRunId, cccPlanningSourcePolicySha256 } from "../ccc-planning/policy.js";
 
 /*
 FNXC:CccPlanningAuthority 2026-10-14-13:45:
 Card K2 RED for the live-authority receipt (D23, ADR D Q3, CONTRACT-v3 section 2.18). Every refusal case is the control receipt with exactly one field changed and the confirmation re-derived for the changed body, so the refusal can only come from that field: the positive control on the same fixture is admitted. The confirmation digest is computed here independently (sha256 of the canonical receipt without `operatorConfirmation`), never through the function under test, so a wrong digest implementation cannot certify its own fixtures.
+FNXC:CccPlanningAuthority 2026-10-14-17:16:
+Repair 1 (errata E5-K2). The envelope fixture's run is the run that consumed the control receipt: its id is K1's `cccPlanningRunId` over the receipt's project, request digest and SHA-256, and the import key is derived from that id, so a test that swaps the receipt re-derives the run it belongs to (`aroundReceipt`) and only the field under test differs. The non-vacuity tables pin each guard the round-1 mutation runs showed no test could see; the mutation run that kills each one is reported with the repair.
 */
 
 type MutableBody = Record<string, unknown> & {
@@ -29,7 +31,6 @@ const DEADLINE = "2026-10-16T12:00:00.000Z"; // 48 h, the Build Standard deadlin
 const EXPIRES = "2026-10-20T12:00:00.000Z"; // 6 days after issue, after the deadline
 const B0 = "a".repeat(40);
 const B1 = "1".repeat(40);
-const RUN_ID = "ccc-plan:0123456789abcdef01234567";
 const FLASH_PROVIDER = "ccc-glm53-flash";
 
 function sha256(text: string): string {
@@ -100,6 +101,16 @@ function controlReceipt(): CccPlanningLiveAuthorityReceiptV1 {
   const result = parse();
   if (!result.ok) throw new Error(`control receipt refused: ${result.code} ${result.field}`);
   return result.receipt;
+}
+
+/** A receipt object built without parse: the control body with one change, resealed unless `reseal` is false. */
+function receiptOf(mutate: (body: MutableBody) => void, options?: { reseal?: boolean }): CccPlanningLiveAuthorityReceiptV1 {
+  const sealed = seal(controlBody());
+  const body = structuredClone(sealed) as unknown as MutableBody;
+  mutate(body);
+  if (options?.reseal === false) return body as unknown as CccPlanningLiveAuthorityReceiptV1;
+  delete body.operatorConfirmation;
+  return seal(body) as unknown as CccPlanningLiveAuthorityReceiptV1;
 }
 
 describe("live-authority receipt parse", () => {
@@ -246,6 +257,56 @@ describe("live-authority receipt parse", () => {
       .toEqual({ code: "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID", field: "permittedProtectedActions[0].kind" });
     expect(parse((b) => { b.permittedProtectedActions = []; }).ok).toBe(true);
   });
+
+  it("refuses each field check of a one-field table built from the control as INVALID, and admits the control", () => {
+    // E5-K2 item 5: one row per parse check the round-1 adversary could delete with every test still green.
+    const field = (b: MutableBody, key: string) => b[key] as Record<string, unknown>;
+    const rows: readonly [string, (b: MutableBody) => void, string][] = [
+      ["notBefore before issuedAt", (b) => { b.notBefore = "2026-10-14T11:59:59.999Z"; }, "notBefore"],
+      ["expiresAt not after notBefore", (b) => { b.notBefore = EXPIRES; }, "expiresAt"],
+      ["baseTree in another object format", (b) => { b.target.baseTree = "b".repeat(64); }, "target.baseTree"],
+      ["baseTree not lowercase hex", (b) => { b.target.baseTree = "B".repeat(40); }, "target.baseTree"],
+      ["two slots on one provider", (b) => { b.omniRoute.providerIds.glm53 = FLASH_PROVIDER; }, "omniRoute.providerIds"],
+      ["metered quota accounting", (b) => { field(b, "quota").accounting = "metered"; }, "quota.accounting"],
+      ["escalation allowed", (b) => { b.escalation = "allowed"; }, "escalation"],
+      ["profile other than full-v2", (b) => { b.profile = "full-v1"; }, "profile"],
+      ["receiptId with capitals", (b) => { b.receiptId = "R2C-i2-text-stats-01"; }, "receiptId"],
+      ["request byteLength 0", (b) => { field(b, "request").byteLength = 0; }, "request.byteLength"],
+      ["request byteLength over 4 MiB", (b) => { field(b, "request").byteLength = 4 * 1024 * 1024 + 1; }, "request.byteLength"],
+      ["request sha256 not lowercase hex", (b) => { field(b, "request").sha256 = "D".repeat(64); }, "request.sha256"],
+      ["marker sha256 too short", (b) => {
+        b.target.ownershipMarker = { path: "/private/tmp/ccc-r2c-i2/owner.json", sha256: "c".repeat(63) };
+      }, "target.ownershipMarker.sha256"],
+      ["runtime receipt digest not hex", (b) => { field(b, "runtime").installedRuntimeReceiptSha256 = "E".repeat(64); },
+        "runtime.installedRuntimeReceiptSha256"],
+      ["dist manifest digest too long", (b) => { field(b, "runtime").distManifestSha256 = "f".repeat(65); }, "runtime.distManifestSha256"],
+      ["source policy digest not a digest", (b) => { field(b, "sourceToolPolicy").sha256 = "source-policy"; }, "sourceToolPolicy.sha256"],
+      ["another receipt adapter", (b) => { b.omniRoute.receiptAdapterId = "terminal-route-sse-comments.v2"; }, "omniRoute.receiptAdapterId"],
+      ["largeAuthorized as a string", (b) => { b.largeAuthorized = "false"; }, "largeAuthorized"],
+      ["empty operator actorId", (b) => { field(b, "operator").actorId = ""; }, "operator.actorId"],
+      ["baseCommit not lowercase hex", (b) => { b.target.baseCommit = "A".repeat(40); }, "target.baseCommit"],
+      ["relative scratchRoot", (b) => { b.target.scratchRoot = "private/tmp/ccc-r2c-i2"; }, "target.scratchRoot"],
+      ["mode other than spec or build", (b) => { b.mode = "plan"; }, "mode"],
+      ["metered fallback allowed", (b) => { field(b, "quota").meteredFallback = "allowed"; }, "quota.meteredFallback"],
+      ["another release literal", (b) => { b.permittedProtectedActions[0]!.release = "controller_any"; },
+        "permittedProtectedActions[0].release"],
+      ["duplicate admitted path", (b) => { b.target.admittedFusionPaths = ["proof/**", "Taskfile.yml", "proof/**"]; },
+        "target.admittedFusionPaths[2]"],
+    ];
+    expect(parse().ok).toBe(true);
+    for (const [label, mutate, expectedField] of rows) {
+      expect(refusal(parse(mutate)), label).toEqual({ code: "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID", field: expectedField });
+    }
+  });
+
+  it("refuses an admitted Fusion path with a .git segment in any letter case, and admits .github", () => {
+    // E5-K2 item 7: the .git ban compares each segment through K1's path comparison key, as APFS opens .GIT as .git.
+    for (const pattern of [".GIT/**", "proof/.Git/config", ".git/**"]) {
+      expect(refusal(parse((b) => { b.target.admittedFusionPaths = ["proof/**", pattern]; })), pattern)
+        .toEqual({ code: "CCC_PLANNING_AUTHORITY_RECEIPT_INVALID", field: "target.admittedFusionPaths[1]" });
+    }
+    expect(parse((b) => { b.target.admittedFusionPaths = ["proof/**", ".github/**"]; }).ok).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------- envelope check
@@ -256,10 +317,10 @@ const MEMBER_BASE = {
   memberHash: "5".repeat(64), modelId: "glm/glm-5.3-flash", providerId: FLASH_PROVIDER,
 } as const;
 
-function controlAuthorization(): CccCampaignExecutionAuthorization {
+function controlAuthorization(runId: string): CccCampaignExecutionAuthorization {
   return {
     projectId: "proj-r2c-i2", importId: "import-1", campaignId: "campaign-1",
-    idempotencyKey: cccPlanningImportKey(RUN_ID, 1),
+    idempotencyKey: cccPlanningImportKey(runId, 1),
     workflowId: "workflow-1", workItemId: "work-item-1", workflowIrHash: "6".repeat(64), packetHash: "7".repeat(64),
     sidecarHash: "8".repeat(64), bundleHash: "9".repeat(64), manifestHash: "a".repeat(64), executionPolicySha256: "b".repeat(64),
     targetRepository: "/private/tmp/ccc-r2c-i2/target", targetBase: B1,
@@ -280,15 +341,32 @@ function controlAuthorization(): CccCampaignExecutionAuthorization {
 
 type EnvelopeInput = Parameters<typeof assertCccPlanningExecutionAuthorizationWithinReceipt>[0];
 
+/** The run that consumed a receipt: K1's run id over the receipt's project, its request digest and its SHA-256. */
+function runIdOf(receipt: CccPlanningLiveAuthorityReceiptV1, receiptSha256: string): string {
+  return cccPlanningRunId({ projectId: receipt.project.projectId, requestDigest: receipt.request.sha256, receiptSha256 });
+}
+
 function controlEnvelope(): EnvelopeInput {
   const receipt = controlReceipt();
+  const receiptSha256 = sha256(canonicalCccPrdJson(receipt));
+  const runId = runIdOf(receipt, receiptSha256);
   return {
-    receipt, receiptSha256: sha256(canonicalCccPrdJson(receipt)),
-    run: { runId: RUN_ID, runRevision: 1, deadlineAt: DEADLINE, implementationCallsRemaining: 3072,
+    receipt, receiptSha256,
+    run: { runId, runRevision: 1, deadlineAt: DEADLINE, implementationCallsRemaining: 3072,
       compiledProviderTaskCount: 2, writerProviderId: FLASH_PROVIDER },
-    authorization: controlAuthorization(),
+    authorization: controlAuthorization(runId),
     baseline: { commit: B1, firstParent: B0, changedPaths: ["Taskfile.yml", "proof/verify-text-stats.mjs", "proof/fixtures/a.txt"] },
     now: "2026-10-14T20:00:05.000Z",
+  };
+}
+
+/** The same envelope around another receipt, consumed by its own run: the SHA-256, run id and import key are re-derived. */
+function aroundReceipt(input: EnvelopeInput, receipt: CccPlanningLiveAuthorityReceiptV1): EnvelopeInput {
+  const receiptSha256 = sha256(canonicalCccPrdJson(receipt));
+  const runId = runIdOf(receipt, receiptSha256);
+  return {
+    ...input, receipt, receiptSha256, run: { ...input.run, runId },
+    authorization: { ...input.authorization, idempotencyKey: cccPlanningImportKey(runId, input.run.runRevision) },
   };
 }
 
@@ -307,12 +385,13 @@ describe("receipt envelope check", () => {
   });
 
   it("accepts the import key ccc-plan:<24hex>:r1 and refuses ccc-plan:<24hex>:<digest>", () => {
-    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${RUN_ID}:r1` } as never; }))
+    expect(controlEnvelope().run.runId).toMatch(/^ccc-plan:[0-9a-f]{24}$/u);
+    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${i.run.runId}:r1` } as never; }))
       .toEqual({ code: "within", field: "" });
-    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${RUN_ID}:${"9".repeat(64)}` } as never; }))
+    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${i.run.runId}:${"9".repeat(64)}` } as never; }))
       .toEqual({ code: MISMATCH, field: "authorization.idempotencyKey" });
     // Another revision's key is refused too.
-    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${RUN_ID}:r2` } as never; }))
+    expect(envelope((i) => { i.authorization = { ...i.authorization, idempotencyKey: `${i.run.runId}:r2` } as never; }))
       .toEqual({ code: MISMATCH, field: "authorization.idempotencyKey" });
   });
 
@@ -360,13 +439,93 @@ describe("receipt envelope check", () => {
   it("refuses when the receipt asks for the operator, or is not the receipt the run consumed", () => {
     const operatorReceipt = parse((b) => { b.permittedProtectedActions = [{ kind: "live_execution", release: "operator_confirm_after_import" }]; });
     if (!operatorReceipt.ok) throw new Error("operator receipt fixture refused");
-    expect(envelope((i) => ({ ...i, receipt: operatorReceipt.receipt, receiptSha256: operatorReceipt.receiptSha256 })))
+    // The operator receipt with its own run: only the release differs from the control.
+    expect(envelope((i) => aroundReceipt(i, operatorReceipt.receipt)))
       .toEqual({ code: MISMATCH, field: "receipt.permittedProtectedActions" });
+    // E5-K2 item 4: run B consumed the operator receipt. Presenting the control receipt A, sealed and with its own
+    // SHA-256, for run B and B's import key is refused: A is not the receipt run B consumed.
+    const runB = aroundReceipt(controlEnvelope(), operatorReceipt.receipt).run.runId;
+    expect(envelope((i) => ({ ...i, run: { ...i.run, runId: runB },
+      authorization: { ...i.authorization, idempotencyKey: cccPlanningImportKey(runB, 1) } })))
+      .toEqual({ code: MISMATCH, field: "run.runId" });
+    // One-field control: the same envelope with run A's own id and key is within.
+    expect(envelope((i) => ({ ...i, authorization: { ...i.authorization, idempotencyKey: cccPlanningImportKey(i.run.runId, 1) } })))
+      .toEqual({ code: "within", field: "" });
     expect(envelope((i) => ({ ...i, receiptSha256: "0".repeat(64) }))).toEqual({ code: MISMATCH, field: "receiptSha256" });
     // Control: the receipt's identity is its named fields, so a wider object is still the consumed receipt (errata E1-11).
     expect(envelope((i) => ({ ...i, receipt: { ...i.receipt, note: "not a receipt field" } as CccPlanningLiveAuthorityReceiptV1 })))
       .toEqual({ code: "within", field: "" });
     expect(envelope((i) => { i.authorization = { ...i.authorization, projectId: "another-project" } as never; }))
       .toEqual({ code: MISMATCH, field: "authorization.projectId" });
+  });
+
+  it("refuses a Spec receipt and maxRequests above the receipt's implementation cap, each against a one-field control", () => {
+    // E5-K2 item 4: only a Build receipt releases live execution, and never for more calls than the operator granted.
+    expect(envelope((i) => aroundReceipt(i, receiptOf((b) => { b.mode = "spec"; }))))
+      .toEqual({ code: MISMATCH, field: "receipt.mode" });
+    expect(envelope((i) => aroundReceipt(i, receiptOf((b) => { b.mode = "build"; }))))
+      .toEqual({ code: "within", field: "" });
+    // The parse-valid Spec Standard receipt (no implementation calls) with a caller-supplied remaining count.
+    const spec = parse((b) => { b.mode = "spec"; b.phaseCallCaps.implementation = 0; b.phaseCallCaps.reviewProof = 0; });
+    if (!spec.ok) throw new Error("spec receipt fixture refused");
+    expect(envelope((i) => aroundReceipt(i, spec.receipt))).toEqual({ code: MISMATCH, field: "receipt.mode" });
+    // The receipt grants 3072 implementation calls; a run claiming 4000 remaining cannot widen that.
+    const remaining4000 = (maxRequests: number) => (i: EnvelopeInput) => ({
+      ...i, run: { ...i.run, implementationCallsRemaining: 4000 }, authorization: { ...i.authorization, maxRequests } });
+    expect(envelope(remaining4000(3073))).toEqual({ code: MISMATCH, field: "authorization.maxRequests" });
+    expect(envelope(remaining4000(3072))).toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses remaining implementation calls that are not a non-negative safe integer, and the control 3072 stays within", () => {
+    // E5-K2 item 1: NaN or undefined made `maxRequests > remaining` false, so the budget bound silently stopped applying.
+    for (const remaining of [Number.NaN, undefined, Number.POSITIVE_INFINITY, -1, 3072.5]) {
+      expect(envelope((i) => ({ ...i, run: { ...i.run, implementationCallsRemaining: remaining as number } })), String(remaining))
+        .toEqual({ code: MISMATCH, field: "run.implementationCallsRemaining" });
+    }
+    expect(envelope((i) => ({ ...i, run: { ...i.run, implementationCallsRemaining: 3072 } }))).toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses members on any model but the literal glm/glm-5.3-flash, even under a resealed receipt naming another Flash slot", () => {
+    // E5-K2 item 2: a receipt object that did not come from parse, sealed consistently, with its Flash slot on glm/glm-5.3.
+    const glmSlot = receiptOf((b) => { b.models.glm53Flash = "glm/glm-5.3"; });
+    const membersOn = (modelId: string) => (i: EnvelopeInput) => ({
+      ...i, authorization: { ...i.authorization, members: i.authorization.members.map((member) => ({ ...member, modelId })) } });
+    expect(envelope((i) => membersOn("glm/glm-5.3")(aroundReceipt(i, glmSlot))))
+      .toEqual({ code: MISMATCH, field: "receipt.models.glm53Flash" });
+    expect(envelope((i) => aroundReceipt(i, glmSlot))).toEqual({ code: MISMATCH, field: "receipt.models.glm53Flash" });
+    // The member literal on its own, under the control receipt.
+    expect(envelope(membersOn("glm/glm-5.3"))).toEqual({ code: MISMATCH, field: "authorization.members[0].modelId" });
+    // Control: the resealed receipt with the literal slot and members on it.
+    expect(envelope((i) => membersOn("glm/glm-5.3-flash")(aroundReceipt(i, receiptOf((b) => { b.models.glm53Flash = "glm/glm-5.3-flash"; })))))
+      .toEqual({ code: "within", field: "" });
+  });
+
+  it("refuses now before notBefore, zero members, maxRequests 0, a non-hex baseline, an unsealed edit and a dot-dot changed path", () => {
+    // E5-K2 item 5: each guard the round-1 mutants showed unprotected, against a control that differs only there.
+    expect(envelope((i) => ({ ...i, now: "2026-10-14T11:59:59.999Z" }))).toEqual({ code: MISMATCH, field: "now" });
+    expect(envelope((i) => ({ ...i, now: ISSUED }))).toEqual({ code: "within", field: "" });
+    // Zero members against zero compiled provider tasks; the control is one member against one task.
+    const memberCount = (count: number) => (i: EnvelopeInput) => ({
+      ...i, run: { ...i.run, compiledProviderTaskCount: count },
+      authorization: { ...i.authorization, members: i.authorization.members.slice(0, count) } });
+    expect(envelope(memberCount(0))).toEqual({ code: MISMATCH, field: "authorization.members" });
+    expect(envelope(memberCount(1))).toEqual({ code: "within", field: "" });
+    expect(envelope((i) => ({ ...i, authorization: { ...i.authorization, maxRequests: 0 } })))
+      .toEqual({ code: MISMATCH, field: "authorization.maxRequests" });
+    expect(envelope((i) => ({ ...i, authorization: { ...i.authorization, maxRequests: 1 } }))).toEqual({ code: "within", field: "" });
+    // A baseline commit that is not an object id, even when the authorization repeats it.
+    const baselineAt = (commit: string) => (i: EnvelopeInput) => ({
+      ...i, baseline: { ...i.baseline, commit }, authorization: { ...i.authorization, targetBase: commit } });
+    expect(envelope(baselineAt("z".repeat(40)))).toEqual({ code: MISMATCH, field: "authorization.targetBase" });
+    expect(envelope(baselineAt("2".repeat(40)))).toEqual({ code: "within", field: "" });
+    // A receipt widened after confirmation, presented with the SHA-256 of the widened bytes and that receipt's run.
+    const widen = (b: MutableBody) => { b.target.admittedFusionPaths = ["proof/**", "Taskfile.yml", "src/**"]; };
+    expect(envelope((i) => aroundReceipt(i, receiptOf(widen, { reseal: false }))))
+      .toEqual({ code: MISMATCH, field: "receipt.operatorConfirmation" });
+    expect(envelope((i) => aroundReceipt(i, receiptOf(widen)))).toEqual({ code: "within", field: "" });
+    expect(envelope((i) => ({ ...i, baseline: { ...i.baseline, changedPaths: ["proof/../src/index.mjs"] } })))
+      .toEqual({ code: MISMATCH, field: "baseline.changedPaths" });
+    expect(envelope((i) => ({ ...i, baseline: { ...i.baseline, changedPaths: ["proof/src/index.mjs"] } })))
+      .toEqual({ code: "within", field: "" });
   });
 });

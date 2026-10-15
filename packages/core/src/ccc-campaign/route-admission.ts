@@ -59,7 +59,11 @@ function familyOf(route: AdmissionRoute): CccModelFamily | null {
   return identity.admitted ? identity.family : null;
 }
 
-/** A model is pinned only by exactly one well-formed pin; a duplicate or malformed pin pins nothing. */
+/*
+FNXC:CccRouteAdmission 2026-10-14-17:16:
+Errata E5-K2 item 6: one provider per model. ADR C's `provider-not-pinned` covers a provider with extra models, and the receipt names three distinct provider ids, but route admission receives its pins separately, so it refuses a pin whose provider also serves another model's pin: neither model is pinned then.
+*/
+/** A model is pinned only by exactly one well-formed pin whose provider serves no other model; anything else pins nothing. */
 function pinnedProviderOf(modelId: CccPlanningExactModelId, pins: readonly CccQualifiedPin[]): string | null {
   const matches = pins.filter((pin) => pin.modelId === modelId);
   if (matches.length !== 1) return null;
@@ -67,7 +71,9 @@ function pinnedProviderOf(modelId: CccPlanningExactModelId, pins: readonly CccQu
   const wellFormed = pin.family === CCC_PLANNING_MODEL_FAMILIES[modelId]
     && typeof pin.providerId === "string" && pin.providerId !== ""
     && typeof pin.settingsEntrySha256 === "string" && SHA256_HEX.test(pin.settingsEntrySha256);
-  return wellFormed ? pin.providerId : null;
+  if (!wellFormed) return null;
+  if (pins.some((other) => other.modelId !== modelId && other.providerId === pin.providerId)) return null;
+  return pin.providerId;
 }
 
 export function admitCccRequestToCodeRoutes(input: Readonly<{
@@ -106,11 +112,14 @@ export function admitCccRequestToCodeRoutes(input: Readonly<{
       const reviewedFamily = familyOf(reviewed);
       if (reviewedFamily !== null && reviewedFamily === identity.family) return "same-family-review";
       expectedModel = REVIEW_MODEL;
-    } else {
+    } else if (route.routeKind === "g8-judge") {
       // G8 judges the integrated candidate, so it must differ in family from every writer.
       if (route.reviewOfTaskId !== null) return "role-model-mismatch";
       if (writers.some((writer) => familyOf(writer) === identity.family)) return "same-family-review";
       expectedModel = REVIEW_MODEL;
+    } else {
+      // Errata E5-K2 item 3: the route kind is an allowlist, as E2-47 refuses out-of-type values at runtime.
+      return "role-model-mismatch";
     }
     if (identity.modelId !== expectedModel) return "role-model-mismatch";
     if (pinnedProviderOf(identity.modelId, input.pins) !== route.providerId) return "provider-not-pinned";

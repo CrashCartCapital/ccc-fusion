@@ -4,7 +4,8 @@ import type { CccCampaignExecutionAuthorization } from "../ccc-campaign/executio
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import type { CccPlanningBudgetPolicy } from "./budget-fit.js";
 import { CccPlanningRefusal } from "./errors.js";
-import { cccPlanningImportKey, classifyCccModelIdentity } from "./policy.js";
+import { cccPlanningImportKey, cccPlanningRunId, classifyCccModelIdentity } from "./policy.js";
+import { cccPlanningPathComparisonKey } from "./schemas.js";
 
 /*
 FNXC:CccPlanningAuthority 2026-10-14-13:52:
@@ -127,15 +128,19 @@ function isRelativeNormalPath(value: unknown): value is string {
   return value.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
+/*
+FNXC:CccPlanningAuthority 2026-10-14-17:16:
+Errata E5-K2 item 7: the `.git` ban compares each segment through K1's `cccPlanningPathComparisonKey`, the one path identity of the I2 host's case-folding volume, so `.GIT/**` or `proof/.Git/config` is refused like `.git/**`. The envelope still matches changed paths against the admitted patterns exactly and case-sensitively, which can only refuse more.
+*/
 /**
  * An admitted Fusion path is an exact relative path or `<dir>/**`, nothing else: no other wildcard, no `.git`
- * segment. The grammar is closed so the envelope check can match it exactly, case-sensitively.
+ * segment in any letter case. The grammar is closed so the envelope check can match it exactly, case-sensitively.
  */
 function isAdmittedFusionPathPattern(value: unknown): value is string {
   if (typeof value !== "string" || value.length > TEXT_MAX) return false;
   const base = value.endsWith("/**") ? value.slice(0, -3) : value;
   if (!isRelativeNormalPath(base) || /[*?[\]{}]/u.test(base)) return false;
-  return !base.split("/").includes(".git");
+  return !base.split("/").some((segment) => cccPlanningPathComparisonKey(segment) === ".git");
 }
 
 function matchesAdmittedFusionPath(path: string, pattern: string): boolean {
@@ -495,7 +500,11 @@ function envelopeTime(value: unknown, field: string): number {
 /*
 FNXC:CccPlanningAuthority 2026-10-14-13:52:
 The envelope check decides whether code may release live execution for the campaign this run imported, with no operator step (D36, leader ruling `controller_within_receipt`). It never widens: every field of the issued authorization must sit inside the receipt and the run, and any mismatch returns the field so AU2 falls back to `awaiting_execution_authority`. The import key is `cccPlanningImportKey(runId, runRevision)` (`ccc-plan:<24hex>:r<n>`, decision 0.5), not v1's digest-keyed form, so a retry with a changed digest can never point the release at a second campaign. The bundle hash is checked against the intent elsewhere (section 2.18). Two checks beyond ADR D's list are fail-closed bindings: the receipt is the one the run consumed (its SHA-256 and confirmation), and the authorization's project is the receipt's project.
+FNXC:CccPlanningAuthority 2026-10-14-17:16:
+Repair 1 (errata E5-K2 items 1, 2 and 4). The SHA-256 check alone was self-referential, because the caller supplies both the receipt and its hash, so a sealed receipt that allowed controller release could be presented for a run whose own receipt asked for the operator. The run is now bound to the receipt: `run.runId` must be K1's `cccPlanningRunId` over the receipt's project, its request digest (equal to the request bytes' digest after G0 step 4) and the receipt SHA-256, which is how AD1 derives it. Only a Build receipt releases, `maxRequests` is bounded by the receipt's own implementation cap as well as the run's remaining calls, and the remaining count must be a non-negative safe integer, since NaN or undefined made the upper bound silently pass. Every member, and the receipt's Flash slot, must be the literal `glm/glm-5.3-flash` (section 2.18), so a receipt object that did not come from parse cannot widen the member model through its own slot.
 */
+const FLASH_MODEL_ID = "glm/glm-5.3-flash";
+
 function checkEnvelope(input: Parameters<typeof assertCccPlanningExecutionAuthorizationWithinReceipt>[0]): void {
   const { receipt, run, authorization, baseline } = input;
   const actions = receipt.permittedProtectedActions;
@@ -513,6 +522,16 @@ function checkEnvelope(input: Parameters<typeof assertCccPlanningExecutionAuthor
   if (sha256Hex(canonicalCccPrdJson(projectNamed(receipt, RECEIPT_SHAPE, ""))) !== input.receiptSha256) {
     mismatch("receiptSha256", "the receipt is not the one this run consumed");
   }
+  if (receipt.mode !== "build") mismatch("receipt.mode", "only a Build receipt releases live execution");
+  if (receipt.models.glm53Flash !== FLASH_MODEL_ID) mismatch("receipt.models.glm53Flash", `must be ${FLASH_MODEL_ID}`);
+  let consumedBy: string;
+  try {
+    consumedBy = cccPlanningRunId({
+      projectId: receipt.project.projectId, requestDigest: receipt.request.sha256, receiptSha256: input.receiptSha256 });
+  } catch {
+    mismatch("run.runId", "no run id can be derived from the receipt");
+  }
+  if (run.runId !== consumedBy) mismatch("run.runId", "the run did not consume this receipt");
   const now = envelopeTime(input.now, "now");
   if (now < envelopeTime(receipt.notBefore, "receipt.notBefore") || now >= envelopeTime(receipt.expiresAt, "receipt.expiresAt")) {
     mismatch("now", "outside the receipt's validity window");
@@ -548,13 +567,21 @@ function checkEnvelope(input: Parameters<typeof assertCccPlanningExecutionAuthor
   }
   members.forEach((member, index) => {
     const field = `authorization.members[${index}]`;
-    if (member.modelId !== receipt.models.glm53Flash) mismatch(`${field}.modelId`, `must be ${receipt.models.glm53Flash}`);
+    if (member.modelId !== FLASH_MODEL_ID) mismatch(`${field}.modelId`, `must be ${FLASH_MODEL_ID}`);
     if (member.providerId !== flashProvider) mismatch(`${field}.providerId`, `must be ${flashProvider}`);
     if (member.transport !== "pi") mismatch(`${field}.transport`, "must be pi");
   });
+  const remaining: unknown = run.implementationCallsRemaining;
+  if (typeof remaining !== "number" || !Number.isSafeInteger(remaining) || remaining < 0) {
+    mismatch("run.implementationCallsRemaining", "must be a non-negative integer");
+  }
   if (!Number.isSafeInteger(authorization.maxRequests) || authorization.maxRequests < 1
-    || authorization.maxRequests > run.implementationCallsRemaining) {
-    mismatch("authorization.maxRequests", `must be at most the ${run.implementationCallsRemaining} implementation calls remaining`);
+    || authorization.maxRequests > remaining) {
+    mismatch("authorization.maxRequests", `must be at most the ${remaining} implementation calls remaining`);
+  }
+  // Written as "not within" so a cap that is not a number (an unparsed receipt) refuses instead of comparing false.
+  if (!(authorization.maxRequests <= receipt.phaseCallCaps.implementation)) {
+    mismatch("authorization.maxRequests", `must be at most the receipt's ${receipt.phaseCallCaps.implementation} implementation calls`);
   }
   const deadline = Math.min(envelopeTime(receipt.deadlineAt, "receipt.deadlineAt"), envelopeTime(run.deadlineAt, "run.deadlineAt"));
   if (envelopeTime(authorization.campaignDeadlineAt, "authorization.campaignDeadlineAt") > deadline) {
