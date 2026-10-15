@@ -211,7 +211,7 @@ export type CccPlanningRunStatusV1 = Readonly<{
   state: CccPlanningRunState; stateCode: string | null; revision: number; controlSeq: number; deadlineAt: string;
   pendingControl: null | Readonly<{ request: "pause" | "cancel" | "resume"; revision: number; requestedAt: string }>;
   lastControl: null | Readonly<{ request: "pause" | "cancel" | "resume"; controlSeq: number; actor: string; at: string;
-    route: "planning" | "campaign-bridge"; outcome: "applied" | "pending" | "deferred-leased" }>;
+    route: "planning" | "campaign-bridge"; outcome: "applied" | "pending" }>;
   awaitingDecision: null | Readonly<{ decisionId: string; questionArtifactKey: string; questionDigest: string }>;
   budgets: Readonly<{
     planning: Readonly<{ allocation: number; spent: number; preflightSpent: number }>;

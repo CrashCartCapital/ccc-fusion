@@ -828,4 +828,124 @@ pgDescribe("ccc planning ledger (card L1, PostgreSQL)", () => {
     expect(await events(run.runId, "ccc-planning:call:terminal")).toHaveLength(0);
     expect((await proveCccPlanningCallNotDispatched(layer, scope, sha("not-dispatched"))).state).toBe("proved_failed");
   });
+
+  /*
+  FNXC:CccPlanningLedger 2026-10-14-18:40:
+  Errata E7-L (the final L1 repair). Item 3 pins the role half of lineage admission and the leaf cap, each a counter
+  reset by renaming (ADV-1). Item 5 bounds every string a committed settlement copies into its terminal event. Item 7
+  refuses every new call on a superseded lineage, the next call of a continuing turn included (ADV1-C). Item 8 keeps the
+  lineage namespace apart: a split child may not take a fixed lineage id, and because dispatch counters are keyed by
+  lineage id alone (one history per run, whatever the fence), a campaign-fence lineage may not reuse a planning one.
+  */
+  const TECHNICAL_CRITIC: Lineage = { stageId: "review", roleId: "technical-critic", lineageId: "review:technical-critic" };
+
+  it("refuses a product-adversary binding in review:technical-critic after its own three turn keys; a technical-critic binding there is admitted (E7-L item 3a)", async () => {
+    const run = await seedRun();
+    for (const attempt of [1, 2, 3] as const) await oneAttempt(run, ADVERSARY, attempt);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 3 });
+    const renamed: Lineage = { ...ADVERSARY, lineageId: TECHNICAL_CRITIC.lineageId };
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, renamed, 1, 1)), /lineage-not-admitted/u);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 3 });
+    expect(await events(run.runId, "ccc-planning:call:reserved")).toHaveLength(3);
+
+    await oneAttempt(run, TECHNICAL_CRITIC, 1);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 4 });
+  });
+
+  it("refuses research:leaf-1 at the standard 1536 allocation and research:leaf-78 at 6144, where research:leaf-77 is admitted (E7-L item 3b)", async () => {
+    const leaf = (n: number): Lineage => ({ stageId: "research", roleId: "extraction-leaf", lineageId: `research:leaf-${n}` });
+    const standard = await seedRun();
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(standard, leaf(1), 1, 1)), /lineage-not-admitted/u);
+    expect(await anchor(standard.runId)).toMatchObject({ planning_spent: 0 });
+    expect(await events(standard.runId, "ccc-planning:call:reserved")).toHaveLength(0);
+
+    const large = await seedRun({ planningAllocation: 6144 });
+    await oneAttempt(large, leaf(77), 1);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(large, leaf(78), 1, 1)), /lineage-not-admitted/u);
+    expect(await anchor(large.runId)).toMatchObject({ planning_spent: 1 });
+    expect(await events(large.runId, "ccc-planning:call:reserved")).toHaveLength(1);
+  });
+
+  it("refuses a committed settlement whose effective-route strings exceed their bounds with INTERNAL_ERROR and no row; values at the bounds commit (E7-L item 5)", async () => {
+    const run = await seedRun();
+    const scope = await admit(request(run, SPEC_AUTHOR, 1, 1));
+    const base = route(scope.binding);
+    const oversized: Array<{ effectiveRoute: Row; field: RegExp }> = [
+      { effectiveRoute: { ...base, effectiveReasoningEffort: "x".repeat(100_000) }, field: /effectiveReasoningEffort/u },
+      { effectiveRoute: { ...base, cost: { kind: "unknown", reason: "x".repeat(100_000) } }, field: /cost\.reason/u },
+      { effectiveRoute: { ...base, effectiveReasoningEffort: "x".repeat(257) }, field: /effectiveReasoningEffort/u },
+      { effectiveRoute: { ...base, effectiveServiceTier: "t".repeat(257) }, field: /effectiveServiceTier/u },
+      { effectiveRoute: { ...base, cost: { amountUsd: 0.01, source: "s".repeat(257) } }, field: /cost\.source/u },
+      { effectiveRoute: { ...base, cost: { kind: "unknown", reason: "r".repeat(1025) } }, field: /cost\.reason/u },
+    ];
+    for (const { effectiveRoute, field } of oversized) {
+      await expectRefusal(settleCccPlanningCall(layer, settlement(scope, { outcome: "committed", effectiveRoute: effectiveRoute as never })),
+        "CCC_PLANNING_INTERNAL_ERROR", field);
+    }
+    expect(await events(run.runId, "ccc-planning:call:terminal")).toHaveLength(0);
+    expect(await anchor(run.runId)).toMatchObject({ state: "running", planning_spent: 1 });
+
+    const bounded = {
+      ...base, effectiveReasoningEffort: "x".repeat(256), effectiveServiceTier: "t".repeat(256),
+      cost: { kind: "unknown" as const, reason: "r".repeat(1024) },
+    };
+    expect((await settleCccPlanningCall(layer, settlement(scope, { outcome: "committed", effectiveRoute: bounded }))).state)
+      .toBe("committed");
+    const terminal = await events(run.runId, "ccc-planning:call:terminal");
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]!.metadata).toMatchObject({ outcome: "committed", effectiveRoute: {
+      effectiveReasoningEffort: "x".repeat(256), effectiveServiceTier: "t".repeat(256), cost: { reason: "r".repeat(1024) },
+    } });
+  });
+
+  it("refuses the next call of a continuing turn on a superseded lineage and charges nothing; the dispatched call still settles (E7-L item 7)", async () => {
+    const twin = await seedRun();
+    await commit(await admit(request(twin, SPEC_AUTHOR, 1, 1)));
+    await commit(await admit(request(twin, SPEC_AUTHOR, 1, 2)));
+
+    const run = await seedRun();
+    const first = await admit(request(run, SPEC_AUTHOR, 1, 1));
+    expect((await commit(first)).state).toBe("committed");
+    expect((await claimChunk(run)).lineages).toEqual([expect.objectContaining({ lineageId: REPAIR_1.lineageId })]);
+    await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 1, 2)), /lineage-superseded/u);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 1 });
+    expect(await events(run.runId, "ccc-planning:call:reserved")).toHaveLength(1);
+
+    // The claim waits for every call of the role to settle (ADV-8), so pi-stream:1 settled before it; its settlement,
+    // redelivered after the claim, still commits as the same single terminal, and the work continues in the repair lineage.
+    expect((await commit(first)).state).toBe("committed");
+    expect(await events(run.runId, "ccc-planning:call:terminal")).toHaveLength(1);
+    await oneAttempt(run, REPAIR_1, 1);
+    expect(await anchor(run.runId)).toMatchObject({ planning_spent: 2 });
+  });
+
+  it("refuses a split child whose id is another role's fixed lineage and writes nothing; a fresh child id is accepted (E7-L item 8a)", async () => {
+    const run = await seedRun();
+    await oneAttempt(run, ADVERSARY, 1);
+    const split = (child: string) => recordCccPlanningLineageSplit(layer, {
+      runId: run.runId, parentLineageId: ADVERSARY.lineageId, childLineageIds: [child], fence: run.fence,
+    });
+    await expectRouteRefusal(split(TECHNICAL_CRITIC.lineageId), /lineage-not-admitted/u);
+    expect(await events(run.runId, "ccc-planning:lineage:created")).toHaveLength(0);
+
+    await split("split:product-adversary:1");
+    expect((await events(run.runId, "ccc-planning:lineage:created")).map((row) => row.metadata)).toEqual([
+      expect.objectContaining({ kind: "split", lineageId: "split:product-adversary:1", parentLineageId: ADVERSARY.lineageId,
+        roleId: "product-adversary", stageId: "review", inheritedDispatchAttempts: 1 }),
+    ]);
+  });
+
+  it("refuses a campaign-fence lineage named like a planning fixed lineage, since dispatch counters are keyed by lineage id alone; review:T-1 is admitted (E7-L item 8b)", async () => {
+    const run = await seedLinkedRun();
+    const reviewer = (lineageId: string): Lineage => ({ stageId: "g7", roleId: "task-reviewer", lineageId });
+    for (const lineageId of [ADVERSARY.lineageId, TECHNICAL_CRITIC.lineageId]) {
+      await expectRouteRefusal(admitCccPlanningDispatch(layer, request(run, reviewer(lineageId), 1, 1, { fence: run.campaignFence })),
+        /lineage-not-admitted/u);
+    }
+    expect(await anchor(run.runId)).toMatchObject({ review_proof_spent: 0 });
+    expect(await events(run.runId, "ccc-planning:call:reserved")).toHaveLength(0);
+
+    await commit(await admit(request(run, reviewer("review:T-1"), 1, 1, { fence: run.campaignFence })));
+    expect(await anchor(run.runId)).toMatchObject({ review_proof_spent: 1 });
+  });
 });

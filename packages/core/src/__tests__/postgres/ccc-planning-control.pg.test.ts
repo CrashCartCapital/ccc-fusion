@@ -22,6 +22,7 @@ import { cccPlanningRuns, type CccPlanningRunInsert } from "../../postgres/schem
 import {
   cccPlanningBindingHash,
   cccPlanningDecisionId,
+  cccPlanningEventId,
   cccPlanningRole,
   cccPlanningTurnKey,
 } from "../../ccc-planning/policy.js";
@@ -36,7 +37,9 @@ import {
   admitCccPlanningDispatch,
   answerCccPlanningDecision,
   completeCccPlanningCancellation,
+  completeCccPlanningCancellationWithin,
   getCccPlanningRunForTask,
+  inspectCccPlanningRun,
   proveCccPlanningCallNotDispatched,
   recordCccPlanningBuildControl,
   requestCccPlanningControl,
@@ -325,13 +328,14 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
 
   async function events(runId: string, mutationType: string): Promise<Row[]> {
     return (await db.execute(sql`
-      SELECT agent_id, target, metadata FROM project.run_audit_events
+      SELECT id, agent_id, target, metadata FROM project.run_audit_events
        WHERE run_id = ${runId} AND mutation_type = ${mutationType} ORDER BY timestamp, id
     `)) as unknown as Row[];
   }
 
-  async function expectRefusal(promise: Promise<unknown>, code: string): Promise<void> {
+  async function expectRefusal(promise: Promise<unknown>, code: string, detail?: RegExp): Promise<void> {
     await expect(promise).rejects.toMatchObject({ name: "CccPlanningRefusal", code });
+    if (detail) await expect(promise).rejects.toMatchObject({ detail: expect.stringMatching(detail) });
   }
 
   it("pause while running sets control_request and the next dispatch is refused control-pending; an unpaused run admits", async () => {
@@ -706,5 +710,123 @@ pgDescribe("ccc planning control (card L1, PostgreSQL)", () => {
     expect(await resolveCccPlanningRunProject(runtimeLayer, { runId: elsewhere.runId })).toEqual({ projectId: OTHER_PROJECT });
     await expectRefusal(resolveCccPlanningRunProject(runtimeLayer, { runId: elsewhere.runId, projectId: PROJECT }),
       "CCC_PLANNING_RUN_PROJECT_MISMATCH");
+  });
+
+  /*
+  FNXC:CccPlanningControl 2026-10-14-18:34:
+  Errata E7-L (the final L1 repair). Item 1: a pause in `admitted` has no admitted -> paused pair to apply, so recording it
+  left a run that could neither start (the pending-control predicate) nor clear the pause; it is refused before any write.
+  Item 2: a cancel that replaced a pending pause must survive a caller that still applies the pause it read earlier.
+  Item 4: a deferred direct completion records why, once per control_seq and reason. Item 9: the within-transaction
+  completion joins the caller's transaction, so BF's campaign transaction can roll it back.
+  */
+  it("refuses pause in admitted with STATE_TRANSITION_REFUSED and writes nothing; admitted -> running then succeeds and a running pause stays pending (E7-L item 1)", async () => {
+    const run = await seedRun({ state: "admitted" });
+    await expectRefusal(requestCccPlanningControl(layer, { runId: run.runId, request: "pause", actor: "ryan" }),
+      "CCC_PLANNING_STATE_TRANSITION_REFUSED", /admitted has no -> paused transition/u);
+    expect(await anchor(run)).toMatchObject({ state: "admitted", control_seq: 0, control_request: null });
+    expect(await events(run.runId, "ccc-planning:control")).toHaveLength(0);
+
+    await transitionCccPlanningRunState(layer, { runId: run.runId, from: "admitted", to: "running", stateCode: null, fence: run.fence });
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 0, control_request: null });
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "pause", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: false });
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 1, control_request: "pause" });
+  });
+
+  it("refuses running -> paused with CONTROL_PENDING once a cancel replaced the pending pause; running -> cancelling then succeeds (E7-L item 2)", async () => {
+    const run = await seedRun();
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "pause", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: false });
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" }))
+      .toEqual({ controlSeq: 2, appliedDirectly: false });
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 2, control_request: "cancel" });
+
+    await expectRefusal(transitionCccPlanningRunState(layer, {
+      runId: run.runId, from: "running", to: "paused", stateCode: null, fence: run.fence,
+    }), "CCC_PLANNING_CONTROL_PENDING", /pending cancel/u);
+    expect(await anchor(run)).toMatchObject({ state: "running", control_seq: 2, control_request: "cancel" });
+    expect(await events(run.runId, "ccc-planning:state")).toHaveLength(0);
+
+    await transitionCccPlanningRunState(layer, { runId: run.runId, from: "running", to: "cancelling", stateCode: null, fence: run.fence });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling", control_request: null });
+    expect((await events(run.runId, "ccc-planning:state")).map((row) => (row.metadata as Row).to)).toEqual(["cancelling"]);
+  });
+
+  it("a deferred direct completion records its reason once per control_seq and reason; a changed reason adds one row and a repeat adds none (E7-L item 4)", async () => {
+    const run = await seedRun();
+    const decision = await admitCccPlanningDispatch(layer, request(run, SPEC_AUTHOR, 1, run.fence));
+    expect(decision.kind).toBe("dispatch-permit");
+    await move(run, "blocked_provider");
+    expect(await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" }))
+      .toEqual({ controlSeq: 1, appliedDirectly: true });
+    const deferrals = async () => (await events(run.runId, "ccc-planning:control"))
+      .filter((row) => String(row.target).startsWith("cancel-deferred:"));
+    expect((await events(run.runId, "ccc-planning:control"))[0]!.metadata)
+      .toMatchObject({ outcome: "applied", cancellation: { completed: false, reason: "live-lease" } });
+
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: false });
+    const liveLease = await deferrals();
+    expect(liveLease).toHaveLength(1);
+    expect(liveLease[0]).toMatchObject({
+      agent_id: "ccc-planning-controller", target: "cancel-deferred:live-lease",
+      metadata: { schema: "ccc-planning-cancel-deferred/v1", runId: run.runId, controlSeq: 1, reason: "live-lease" },
+    });
+    expect(liveLease[0]!.metadata as Row).not.toHaveProperty("code");
+    // The event id is derived from the run, the current control_seq and the reason.
+    expect(liveLease[0]!.id).toBe(cccPlanningEventId({ projectId: PROJECT, runId: run.runId, mutationType: "ccc-planning:control",
+      subject: "cancel-deferred:live-lease@control:1" }));
+
+    await expireLease(run);
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: false });
+    const changed = await deferrals();
+    expect(changed).toHaveLength(2);
+    expect(changed[1]).toMatchObject({
+      agent_id: "ccc-planning-controller", target: "cancel-deferred:descendants-unsettled",
+      metadata: { schema: "ccc-planning-cancel-deferred/v1", runId: run.runId, controlSeq: 1, reason: "descendants-unsettled",
+        code: "CCC_PLANNING_DESCENDANTS_UNSETTLED" },
+    });
+    expect(changed[1]!.id).not.toBe(changed[0]!.id);
+
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: false });
+    expect((await deferrals()).map((row) => row.id)).toEqual(changed.map((row) => row.id));
+    expect(await anchor(run)).toMatchObject({ state: "cancelling", control_seq: 1 });
+    // The operator's cancel stays the last control; a deferral row never takes its place.
+    expect((await inspectCccPlanningRun(layer, run.runId)).lastControl)
+      .toMatchObject({ request: "cancel", controlSeq: 1, actor: "ryan", route: "planning", outcome: "applied" });
+
+    await proveCccPlanningCallNotDispatched(layer, decision.scope, sha("never-sent"));
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await deferrals()).toHaveLength(2);
+  });
+
+  it("the within-transaction completion joins the caller's transaction: a rollback leaves the run cancelling; the committed form ends cancelled (E7-L item 9)", async () => {
+    expect(completeCccPlanningCancellationWithin).toBeTypeOf("function");
+    const run = await seedRun();
+    await move(run, "blocked_provider");
+    await requestCccPlanningControl(layer, { runId: run.runId, request: "cancel", actor: "ryan" });
+    await expireLease(run);
+    expect(await anchor(run)).toMatchObject({ state: "cancelling" });
+
+    let inside: Row | undefined;
+    await expect(layer.transactionImmediate(async (tx) => {
+      expect(await completeCccPlanningCancellationWithin(tx, { projectId: run.projectId, runId: run.runId }))
+        .toEqual({ completed: true });
+      inside = ((await tx.execute(sql`
+        SELECT state, state_code FROM project.ccc_planning_runs WHERE project_id = ${run.projectId} AND run_id = ${run.runId}
+      `)) as unknown as Row[])[0];
+      throw new Error("E7-L item 9: the caller rolls its transaction back");
+    })).rejects.toThrow("the caller rolls its transaction back");
+    expect(inside).toMatchObject({ state: "cancelled", state_code: "CCC_PLANNING_CANCELLED" });
+    expect(await anchor(run)).toMatchObject({ state: "cancelling", state_code: null });
+    expect(await workItem(run)).toMatchObject({ state: "running" });
+    expect((await events(run.runId, "ccc-planning:state")).map((row) => (row.metadata as Row).to)).toEqual(["cancelling"]);
+
+    expect(await completeCccPlanningCancellation(layer, { runId: run.runId })).toEqual({ completed: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled", state_code: "CCC_PLANNING_CANCELLED" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+    expect((await events(run.runId, "ccc-planning:state")).map((row) => (row.metadata as Row).to))
+      .toEqual(["cancelling", "cancelled"]);
   });
 });

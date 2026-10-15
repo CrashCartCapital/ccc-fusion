@@ -16,6 +16,12 @@ FNXC:CccPlanningProof 2026-10-14-17:46:
 Repair 1 (errata E5-L1) renames the split test and adds 13 tests (items 3 to 12 and 14), so the name list is 50 names,
 exactly the passing names of the card command. Measured again on the same host at load average 32.8 (1 min): 7 to 8 s
 wall for the four files. The 180 s timeouts stay hang bounds.
+
+FNXC:CccPlanningProof 2026-10-14-18:55:
+Repair 2 (errata E7-L, the final L1 repair) adds 10 tests: items 3a, 3b, 5, 7, 8a and 8b in the ledger file and
+items 1, 2, 4 and 9 in the control file. The name list is 60 names, exactly the passing names of a JSON reporter run
+of the card command. Measured at load average about 11 (1 min): about 4 s wall for the four files. The 180 s timeouts
+stay hang bounds.
 */
 
 const CHECK_FILES = Object.freeze([
@@ -82,6 +88,12 @@ export const OFFLINE = Object.freeze([
       `${LEDGER} > refuses a settlement whose refusal reason is outside the union with INTERNAL_ERROR and writes nothing (ADV-2)`,
       `${LEDGER} > an earlier epoch's digest redelivered after a later epoch is a replay that records nothing (ADV-5)`,
       `${LEDGER} > refuses an audit id over 256 characters or a malformed digest with INTERNAL_ERROR before any write; bounded values are admitted`,
+      `${LEDGER} > refuses a product-adversary binding in review:technical-critic after its own three turn keys; a technical-critic binding there is admitted (E7-L item 3a)`,
+      `${LEDGER} > refuses research:leaf-1 at the standard 1536 allocation and research:leaf-78 at 6144, where research:leaf-77 is admitted (E7-L item 3b)`,
+      `${LEDGER} > refuses a committed settlement whose effective-route strings exceed their bounds with INTERNAL_ERROR and no row; values at the bounds commit (E7-L item 5)`,
+      `${LEDGER} > refuses the next call of a continuing turn on a superseded lineage and charges nothing; the dispatched call still settles (E7-L item 7)`,
+      `${LEDGER} > refuses a split child whose id is another role's fixed lineage and writes nothing; a fresh child id is accepted (E7-L item 8a)`,
+      `${LEDGER} > refuses a campaign-fence lineage named like a planning fixed lineage, since dispatch counters are keyed by lineage id alone; review:T-1 is admitted (E7-L item 8b)`,
       `${CONTROL} > pause while running sets control_request and the next dispatch is refused control-pending; an unpaused run admits`,
       `${CONTROL} > answering the awaited decision moves the run to running and the held work item to runnable in one transaction`,
       `${CONTROL} > resume from paused moves the run to running and the held work item to runnable; resume of a running run is refused`,
@@ -103,6 +115,10 @@ export const OFFLINE = Object.freeze([
       `${CONTROL} > refuses the generic cancelling -> cancelled with STATE_TRANSITION_REFUSED even after the lease expires; completion ends the run (ADV-10)`,
       `${CONTROL} > a cancellation with an unsettled call stays cancelling with DESCENDANTS_UNSETTLED recorded and completes once the call is settled`,
       `${CONTROL} > resolves a run of another project through the runtime role with row-level security live (E5-L1 item 14)`,
+      `${CONTROL} > refuses pause in admitted with STATE_TRANSITION_REFUSED and writes nothing; admitted -> running then succeeds and a running pause stays pending (E7-L item 1)`,
+      `${CONTROL} > refuses running -> paused with CONTROL_PENDING once a cancel replaced the pending pause; running -> cancelling then succeeds (E7-L item 2)`,
+      `${CONTROL} > a deferred direct completion records its reason once per control_seq and reason; a changed reason adds one row and a repeat adds none (E7-L item 4)`,
+      `${CONTROL} > the within-transaction completion joins the caller's transaction: a rollback leaves the run cancelling; the committed form ends cancelled (E7-L item 9)`,
       `${RETENTION} > keeps an old ccc-plan: audit row and deletes an equally old non-planning row on the same task`,
       `${PARITY} > K1 and the SQL function agree on all 400 pairs, and exactly 65 non-identity pairs are allowed`,
       `${PARITY} > refuses a pair outside the table before any write and applies an allowed pair with a state event`,
