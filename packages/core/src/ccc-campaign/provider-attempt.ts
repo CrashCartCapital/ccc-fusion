@@ -1189,9 +1189,20 @@ export function assertCccProviderAttemptLaunchHeadroom(
   }
 }
 
-function assertBeforeDeadline(context: CccCampaignTaskContext, now: string): void {
+function assertBeforeDeadline(context: CccCampaignTaskContext, now: string, linked: CccPlanningRunCustody | null,
+  request: Readonly<{ turnKey: string; dispatchKey: string }>): void {
   const { deadlineAt } = admittedBounds(context);
-  assertCccProviderAttemptLaunchHeadroom(deadlineAt, Date.parse(now), context.taskId);
+  try {
+    assertCccProviderAttemptLaunchHeadroom(deadlineAt, Date.parse(now), context.taskId);
+  } catch (error) {
+    // FNXC:CccPlanningLinkedWriterDeadline 2026-10-15-06:00: native campaign headroom failures carry linked refusal evidence at reservation and begin.
+    if (linked && error instanceof CccProviderAttemptLimitError && error.reason === "deadline") {
+      throw new CccPlanningLinkedWriterLimitError({ runId: linked.runId, importId: context.importId,
+        turnKey: request.turnKey, dispatchKey: request.dispatchKey, reason: "deadline", refusedAt: now },
+      `CCC_PLANNING_DEADLINE: ${error.message}`);
+    }
+    throw error;
+  }
 }
 
 function assertRequestRoute(
@@ -1511,10 +1522,7 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
       );
     }
     const now = linkedNow ?? await databaseNow(tx);
-    if (linked && Date.parse(now) >= Date.parse(context.campaignDeadlineAt)) {
-      refuse("deadline", "CCC_PLANNING_DEADLINE: campaign deadline reached");
-    }
-    assertBeforeDeadline(context, now);
+    assertBeforeDeadline(context, now, linked, requested);
     if (context.requestCount >= maxRequests) {
       refuse(
         "max-requests",
@@ -1568,7 +1576,7 @@ export async function beginCccProviderAttemptDispatch(
     const linked = await findCccPlanningRunForImport(tx, context.projectId, context.importId);
     const now = await databaseNow(tx);
     if (linked) await assertLinkedWriterRunPermitsCall(tx, linked, attempt.scope, now);
-    assertBeforeDeadline(context, now);
+    assertBeforeDeadline(context, now, linked, attempt.scope);
     const dispatched = scopeWithState(attempt.scope, "dispatched_unknown");
     await appendAttemptEvent(tx, now, dispatched, "dispatched");
     return Object.freeze({ kind: "dispatch-permit", scope: dispatched });
@@ -1667,7 +1675,7 @@ export async function reconcileCccProviderAttempt(
         await recordCccPlanningWriterRefusalWithin(tx, linked, { runId: linked.runId, importId: context.importId,
           turnKey: terminal.turnKey, dispatchKey: terminal.dispatchKey,
           reason: refusalReason as CccProviderAttemptLimitError["reason"], refusedAt: await databaseNow(tx) });
-        if (linked.state !== "blocked_provider") {
+        if (linked.state !== "blocked_provider" && linked.state !== "cancelling") {
           try {
             await transitionCccPlanningRunStateWithin(tx, { projectId: linked.projectId, runId: linked.runId,
               from: linked.state, to: "blocked_provider", stateCode: "CCC_PROVIDER_PIN_DRIFT", fence: null });

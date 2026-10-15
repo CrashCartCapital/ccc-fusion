@@ -1,6 +1,6 @@
 /**
  * FNXC:CccPlanningProofInventory 2026-10-15-11:00: BF caps, D43 outcomes and E18's issued-policy digest handoff.
- * TARGETED includes the five unchanged campaign regressions named by the card. OFFLINE closes over all 38 BF names,
+ * TARGETED includes the five unchanged campaign regressions named by the card. OFFLINE closes over all 42 BF names,
  * including real PostgreSQL rollback/savepoint evidence and unlinked positive controls; no skipped test can satisfy it.
  * The observed two-file run was about 13 seconds and the five regressions about 20 seconds; 120 seconds is a hang bound.
  */
@@ -20,6 +20,8 @@ const EXPECTED_NAMES = Object.freeze([
   "ccc planning linked writer caps (card BF, PostgreSQL) > iteration and dispatch caps > caps a linked writer turn at 11 calls, gives each node attempt its own turn and refuses a 4th distinct attempt",
   "ccc planning linked writer caps (card BF, PostgreSQL) > iteration and dispatch caps > returns the five admitted writer route values as exactly five string keys",
   "ccc planning linked writer caps (card BF, PostgreSQL) > iteration and dispatch caps > refuses a missing or invalid toolset digest before opening a transaction",
+  "ccc planning linked writer caps (card BF, PostgreSQL) > run state, control, deadline and runtime > records native campaign launch-headroom refusal at linked reservation, with 29s/31s and unlinked controls",
+  "ccc planning linked writer caps (card BF, PostgreSQL) > run state, control, deadline and runtime > records native campaign launch-headroom refusal at linked begin, with 29s/31s and unlinked controls",
   "ccc planning linked writer caps (card BF, PostgreSQL) > run state, control, deadline and runtime > checks runtime, state and control before deadline, and unsettled calls before caps",
   "ccc planning linked writer caps (card BF, PostgreSQL) > run state, control, deadline and runtime > refuses control-pending while the run has a pending cancel",
   "ccc planning linked writer caps (card BF, PostgreSQL) > run state, control, deadline and runtime > rechecks linked control before a reserved replay or direct dispatch can issue a provider permit",
@@ -30,6 +32,7 @@ const EXPECTED_NAMES = Object.freeze([
   "ccc planning linked writer caps (card BF, PostgreSQL) > refusal recording (item 48) > preserves the original linked refusal when its post-rollback audit transaction fails",
   "ccc planning linked writer caps (card BF, PostgreSQL) > refusal recording (item 48) > records exactly one writer-refused event after the reservation transaction rolls back, on a fresh transaction",
   "ccc planning linked writer caps (card BF, PostgreSQL) > unlinked positive control > keeps the unlinked reservation sequence byte-identical and writes no planning rows",
+  "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > keeps native approval parks in prebuild states while pending cancel wins and unrelated failures still fail",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > operator pause moves building to paused",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > operator resume moves paused to building only when before.blockedReason was the pause reason",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > operator stop moves the current state to cancelled through cancelling and clears control_request",
@@ -46,6 +49,7 @@ const EXPECTED_NAMES = Object.freeze([
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > any other failure moves building or awaiting_execution_authority to failed CAMPAIGN_FAILED",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > D43 rows > pins the pause reason the mapping reads to the engine operator constant",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > savepoint, rollback and L1-only writes > leaves cancellation pending while a linked provider effect is unsettled and completes it after settlement",
+  "ccc planning campaign outcome mapping (card BF, PostgreSQL) > savepoint, rollback and L1-only writes > preserves a route-refusal settlement after the run is already cancelling and still refuses unrelated illegal states",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > savepoint, rollback and L1-only writes > a transition the anchor does not allow leaves it unchanged, writes campaign-unmapped and commits the item",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > savepoint, rollback and L1-only writes > an SQL error inside the mapping body is contained by its savepoint",
   "ccc planning campaign outcome mapping (card BF, PostgreSQL) > savepoint, rollback and L1-only writes > an outer rollback after the mapping leaves no anchor change and no state event",

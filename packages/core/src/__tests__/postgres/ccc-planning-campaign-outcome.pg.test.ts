@@ -88,7 +88,7 @@ function sha(label: string): string {
 const RUNTIME = sha("bf-outcome-runtime");
 
 type Row = Record<string, unknown>;
-type LinkState = "building" | "awaiting_execution_authority";
+type LinkState = "importing" | "building" | "awaiting_execution_authority";
 type Fixture = Readonly<{
   suffix: string; taskId: string; semanticTaskId: string; importId: string; projectId: string; workItemId: string;
   campaign: NonNullable<Awaited<ReturnType<ReturnType<SharedPgTaskStoreHarness["store"]>["getCccCampaignContextForTask"]>>>;
@@ -162,7 +162,7 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
       UPDATE project.ccc_planning_runs SET import_id = ${i.importId}, implementation_transferred = 32
        WHERE project_id = ${i.projectId} AND run_id = ${runId}
     `);
-    await move(i.projectId, runId, i.state);
+    if (i.state !== "importing") await move(i.projectId, runId, i.state);
     return { runId, planningTaskId };
   }
 
@@ -285,6 +285,34 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
   }
 
   describe("D43 rows", () => {
+    it("keeps native approval parks in prebuild states while pending cancel wins and unrelated failures still fail", async () => {
+      const approvalReason = "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+      for (const state of ["importing", "awaiting_execution_authority"] as const) {
+        const parked = await fixture(`approval-${state}`, { link: state });
+        await setItem(parked, "runnable");
+        await transition(parked, "manual-required", { expectedLeaseOwner: null, blockedReason: approvalReason,
+          lastError: "ccc-planning:live-execution-release:awaiting-operator" });
+        expect(await item(parked)).toMatchObject({ state: "manual-required", blocked_reason: approvalReason });
+        expect(await anchor(parked)).toMatchObject({ state, state_code: null });
+        expect(await stateMoves(parked)).toEqual([]);
+
+        const cancelled = await fixture(`approval-cancel-${state}`, { link: state });
+        await setItem(cancelled, "runnable");
+        await recordCccPlanningBuildControl(h.layer(), { runId: cancelled.runId, request: "cancel", actor: "bf" });
+        await transition(cancelled, "manual-required", { expectedLeaseOwner: null, blockedReason: approvalReason });
+        expect(await anchor(cancelled)).toMatchObject({ state: "cancelled", state_code: "CCC_PLANNING_CANCELLED", control_request: null });
+
+        const unrelated = await fixture(`approval-other-${state}`, { link: state });
+        await setItem(unrelated, "runnable");
+        await transition(unrelated, "manual-required", { expectedLeaseOwner: null, blockedReason: "ccc-permanent:unrelated" });
+        expect(await anchor(unrelated)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_CAMPAIGN_FAILED" });
+      }
+      const building = await fixture("approval-building");
+      await setItem(building, "runnable");
+      await transition(building, "manual-required", { expectedLeaseOwner: null, blockedReason: approvalReason });
+      expect(await anchor(building)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_CAMPAIGN_FAILED" });
+    });
+
     it("operator pause moves building to paused", async () => {
       const f = await fixture("pause");
       await setItem(f, "runnable");
@@ -502,6 +530,48 @@ pgDescribe("ccc planning campaign outcome mapping (card BF, PostgreSQL)", () => 
       await reconcileCccPlanningCampaignOutcome(h.layer(), f.runId);
       expect(await anchor(f)).toMatchObject({ state: "cancelled", control_request: null });
       expect(await stateMoves(f)).toEqual(["building->cancelling", "cancelling->cancelled"]);
+    });
+
+    it("preserves a route-refusal settlement after the run is already cancelling and still refuses unrelated illegal states", async () => {
+      const f = await fixture("cancel-unsettled-route");
+      await lease(f);
+      const scope = await dispatched(f, "cancel-unsettled-route");
+      await recordCccPlanningBuildControl(h.layer(), { runId: f.runId, request: "cancel", actor: "bf" });
+      await transition(f, "cancelled", { expectedLeaseOwner: f.leaseOwner, leaseOwner: null, leaseExpiresAt: null,
+        lastError: "workflow-user-cancelled" });
+      expect(await anchor(f)).toMatchObject({ state: "cancelling", control_request: null });
+      const reconciliation = { taskId: f.taskId, attemptKey: scope.attemptKey, controllerToken: scope.controllerToken,
+        outcome: "proved_failed", evidenceDigest: sha("cancel-unsettled-route"), observerId: "pi",
+        refusalReason: "effective-route-drift" } as CccProviderAttemptReconciliation;
+      await expect(reconcileCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(), reconciliation }))
+        .resolves.toMatchObject({ state: "proved_failed" });
+      expect(await anchor(f)).toMatchObject({ state: "cancelling", control_request: null });
+      const terminal = await rows<{ xmin: string }>(sql`SELECT xmin::text AS xmin FROM project.run_audit_events
+        WHERE campaign_import_id = ${f.importId} AND mutation_type = 'ccc-campaign:provider-attempt:terminal'`);
+      expect(terminal).toHaveLength(1);
+      const refused = await events(f, "ccc-planning:writer-refused");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.metadata.reason).toBe("effective-route-drift");
+      expect(refused[0]!.xmin).toBe(terminal[0]!.xmin);
+      expect(await stateMoves(f)).toEqual(["building->cancelling"]);
+      await expect(reconcileCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(), reconciliation }))
+        .resolves.toMatchObject({ state: "proved_failed" });
+      expect(await events(f, "ccc-planning:writer-refused")).toHaveLength(1);
+      await reconcileCccPlanningCampaignOutcome(h.layer(), f.runId);
+      expect(await anchor(f)).toMatchObject({ state: "cancelled", control_request: null });
+      expect(await stateMoves(f)).toEqual(["building->cancelling", "cancelling->cancelled"]);
+
+      const illegal = await fixture("route-illegal-state");
+      await lease(illegal);
+      const illegalScope = await dispatched(illegal, "route-illegal-state");
+      await move(illegal.projectId, illegal.runId, "accepted");
+      await expect(reconcileCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(), reconciliation: {
+        ...reconciliation, taskId: illegal.taskId, attemptKey: illegalScope.attemptKey, controllerToken: illegalScope.controllerToken,
+      } })).rejects.toMatchObject({ code: "CCC_PLANNING_STATE_TRANSITION_REFUSED" });
+      expect(await rows(sql`SELECT 1 FROM project.run_audit_events WHERE campaign_import_id = ${illegal.importId}
+        AND mutation_type = 'ccc-campaign:provider-attempt:terminal'`)).toEqual([]);
+      expect(await events(illegal, "ccc-planning:writer-refused")).toEqual([]);
+      expect(await anchor(illegal)).toMatchObject({ state: "accepted" });
     });
 
     it("a transition the anchor does not allow leaves it unchanged, writes campaign-unmapped and commits the item", async () => {

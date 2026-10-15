@@ -19,6 +19,8 @@ import { completeCccPlanningCancellationWithin, transitionCccPlanningRunStateWit
 
 type Row = Record<string, unknown>;
 const PAUSED_REASON = "ccc-operator:campaign-paused";
+// Native product-status/approval custody use this canonical reason; their current constant is module-private.
+const LIVE_EXECUTION_APPROVAL_REQUIRED_REASON = "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
 const ROUTE_REFUSALS = new Set(["receipt-missing", "receipt-mismatch", "effective-route-drift"]);
 const LIMIT_REASONS = new Set(["deadline", "max-requests", "max-concurrency", "iteration-cap", "dispatch-cap",
   "unreconciled-dispatch", "control-pending", "phase-allocation", "run-not-building", "runtime-not-permitted",
@@ -177,6 +179,9 @@ async function mapOutcome(tx: DbTransaction, run: CccPlanningRunCustody, i: Outc
   }
   let target: CccPlanningRunState | null = null;
   let code: string | null = null;
+  const prebuildApprovalPark = i.toState === "manual-required"
+    && (run.state === "importing" || run.state === "awaiting_execution_authority")
+    && i.workItem.blockedReason === LIVE_EXECUTION_APPROVAL_REQUIRED_REASON;
   if (i.toState === "held" && i.workItem.blockedReason === PAUSED_REASON) target = "paused";
   else if (i.fromState === "held" && i.toState === "runnable" && i.before.blockedReason === PAUSED_REASON) target = "building";
   else if (i.toState === "cancelled" && (i.workItem.lastError?.startsWith(CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX)
@@ -189,7 +194,7 @@ async function mapOutcome(tx: DbTransaction, run: CccPlanningRunCustody, i: Outc
     const evidence = await verdicts(tx, run);
     target = evidence.finalAccepted ? "accepted" : "failed";
     code = evidence.finalAccepted ? null : "CCC_PLANNING_FINAL_JUDGMENT_MISSING";
-  } else if (i.toState === "failed" || i.toState === "manual-required") {
+  } else if (!prebuildApprovalPark && (i.toState === "failed" || i.toState === "manual-required")) {
     const evidence = await verdicts(tx, run);
     const refusal = await latestRefusal(tx, run);
     if (evidence.rejected) { target = "verification_failed"; code = "CCC_PLANNING_CODING_REPAIR_NOT_RUN"; }
@@ -214,6 +219,8 @@ async function mapOutcome(tx: DbTransaction, run: CccPlanningRunCustody, i: Outc
       return { kind: "mapped", runState: await cancel(tx, run, true) };
     }
   }
+  // FNXC:CccPlanningCampaignLink 2026-10-15-06:00: native live-approval parking preserves the prebuild anchor after cancellation has had priority.
+  if (prebuildApprovalPark) return { kind: "mapped", runState: run.state };
   if (target === null && TERMINAL_ITEMS.has(i.toState)) { target = "failed"; code = "CCC_PLANNING_CAMPAIGN_FAILED"; }
   if (target === null) return { kind: "mapped", runState: run.state };
   try {

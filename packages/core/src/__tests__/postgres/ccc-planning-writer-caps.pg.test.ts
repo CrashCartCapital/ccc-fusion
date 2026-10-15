@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../__test-utils__/pg-test-harness.js";
 import {
@@ -81,6 +82,33 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
                      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at
     `);
     return found[0]!.at;
+  }
+
+  /** Test clock only: intercept the exact databaseNow query; every query still executes against this suite's PostgreSQL. */
+  function campaignClock(f: Fixture, remainingSeconds: 29 | 31): Readonly<{ layer: AsyncDataLayer; intercepted: () => number }> {
+    const dialect = new PgDialect();
+    const expected = `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS now`;
+    let interceptions = 0;
+    const base = h.layer();
+    const layer = new Proxy(base, { get(target, property) {
+      if (property !== "transactionImmediate") return Reflect.get(target, property, target);
+      return (work: (tx: DbTransaction) => Promise<unknown>) => target.transactionImmediate(async (tx) => {
+        const clockTx = new Proxy(tx, { get(transaction, key) {
+          if (key !== "execute") return Reflect.get(transaction, key, transaction);
+          return async (query: Parameters<DbTransaction["execute"]>[0]) => {
+            const result = await transaction.execute(query);
+            if (typeof query === "string") return result;
+            const rendered = dialect.sqlToQuery(query.getSQL());
+            if (rendered.sql.replace(/\s+/gu, " ").trim() !== expected || rendered.params.length !== 0) return result;
+            interceptions += 1;
+            return transaction.execute(sql`SELECT to_char((${f.campaign.campaignDeadlineAt}::timestamptz
+              - make_interval(secs => ${remainingSeconds})) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS now`);
+          };
+        } }) as DbTransaction;
+        return work(clockTx);
+      });
+    } }) as AsyncDataLayer;
+    return { layer, intercepted: () => interceptions };
   }
 
   async function nativeTaskIdForImport(importId: string, semanticTaskId: string): Promise<string> {
@@ -301,6 +329,61 @@ pgDescribe("ccc planning linked writer caps (card BF, PostgreSQL)", () => {
   });
 
   describe("run state, control, deadline and runtime", () => {
+    async function nativeDeadlineCase(phase: "reserve" | "begin"): Promise<void> {
+      const f = await fixture(`native-deadline-${phase}`, { link: "building", approval: true });
+      if (phase === "begin") await reserveCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(),
+        request: request(f, "native-deadline", "pi-stream:1") });
+      const clock = campaignClock(f, 29);
+      await clock.layer.transactionImmediate(async tx => {
+        expect(await tx.execute(sql`SELECT 'unchanged' AS now`)).toMatchObject([{ now: "unchanged" }]);
+      });
+      expect(clock.intercepted()).toBe(0);
+      const refused = await linkedRefusal(atomicReserveCccCampaignProviderDispatch(
+        atomicInput(f, "native-deadline", "pi-stream:1", clock.layer)), "deadline");
+      expect(clock.intercepted()).toBe(phase === "reserve" ? 1 : 3);
+      const expectedNow = new Date(Date.parse(f.campaign.campaignDeadlineAt) - 29_000).toISOString();
+      expect(refused.refusal.refusedAt).toBe(expectedNow);
+      expect((await attemptRows(f)).map(row => row.mutation_type))
+        .toEqual(phase === "reserve" ? [] : ["ccc-campaign:provider-attempt:reserved"]);
+      const evidence = await planningEvents(f, "ccc-planning:writer-refused");
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0]!).toMatchObject({ timestamp: expectedNow, metadata: { reason: "deadline" } });
+      const ended = await h.store().transitionWorkflowWorkItem(f.workItemFence.workItemId, "failed", {
+        leaseOwner: null, leaseExpiresAt: null, lastError: "native campaign deadline refused",
+      });
+      expect(ended.state).toBe("failed");
+      expect(await anchor(f)).toMatchObject({ state: "budget_exhausted", state_code: "CCC_PLANNING_DEADLINE" });
+
+      const control = await fixture(`native-deadline-${phase}-control`, { link: "building", approval: true });
+      if (phase === "begin") await reserveCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(),
+        request: request(control, "native-deadline", "pi-stream:1") });
+      const positive = campaignClock(control, 31);
+      await expect(atomicReserveCccCampaignProviderDispatch(atomicInput(control, "native-deadline", "pi-stream:1", positive.layer)))
+        .resolves.toMatchObject({ kind: "dispatch-permit" });
+      expect(positive.intercepted()).toBe(3);
+      expect(await planningEvents(control, "ccc-planning:writer-refused")).toEqual([]);
+
+      const plain = await fixture(`native-deadline-${phase}-plain`, { link: null, approval: true });
+      if (phase === "begin") await reserveCccProviderAttempt({ layer: h.layer(), rootDir: h.rootDir(),
+        request: request(plain, "native-deadline", "pi-stream:1") });
+      const plainClock = campaignClock(plain, 29);
+      const plainError = await atomicReserveCccCampaignProviderDispatch(atomicInput(plain, "native-deadline", "pi-stream:1", plainClock.layer))
+        .then(() => null, (error: unknown) => error);
+      expect(plainError).toBeInstanceOf(CccProviderAttemptLimitError);
+      expect(plainError).not.toBeInstanceOf(CccPlanningLinkedWriterLimitError);
+      expect(plainError).toMatchObject({ reason: "deadline" });
+      expect(await rows(sql`SELECT 1 FROM project.run_audit_events WHERE mutation_type LIKE 'ccc-planning:%'
+        AND metadata->>'importId' = ${plain.importId}`)).toEqual([]);
+    }
+
+    it("records native campaign launch-headroom refusal at linked reservation, with 29s/31s and unlinked controls", async () => {
+      await nativeDeadlineCase("reserve");
+    });
+
+    it("records native campaign launch-headroom refusal at linked begin, with 29s/31s and unlinked controls", async () => {
+      await nativeDeadlineCase("begin");
+    });
+
     it("checks runtime, state and control before deadline, and unsettled calls before caps", async () => {
       const drift = await fixture("ordered-runtime", { link: "building", runtime: sha("unpermitted"),
         deadlineAt: await databaseNowPlus(20) });
