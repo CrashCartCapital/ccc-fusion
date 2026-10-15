@@ -68,11 +68,40 @@ load only (no CPU burners in this round): 23 of 23 passed in 27.8 s (load
 tests before this repair took 17.6 s at load 10.1, so the four new tests add
 about 3 s of sandboxed execs. The bound stays 120 s, well above 1.5 x the
 worst run here (41.7 s). The load-25 run was not repeated for the new tests.
+
+FNXC:CccPlanningProofInventory 2026-10-14-20:52:
+Card X1z, successor owner (errata E8-X items 1-3). The closed check now holds
+twenty-six tests: fourteen in discovery, twelve in the shim layer. New:
+- default search path: `discoverCccToolchain({})` seals the same toolchain
+  digest as an explicit default `searchPath` (a stub bash first on PATH is
+  ignored), an explicit empty `searchPath` refuses toolchain-missing:bash, and a
+  malformed one still throws the TypeError (item 1);
+- frozen signature (compiler-checked): the TypeScript compiler accepts `{}`
+  with no diagnostic and reports exactly TS2322 for a string `searchPath`
+  (item 1, type level);
+- the shim layer keeps the raw shell's own `dispose` (item 2).
+RED on INT-2d bytes: the first two fail with assertions (the TypeError where
+null was expected; TS2344 and TS2345 where no diagnostic was expected). Mutants
+that fail the check with an assertion: M1 (an empty searchPath takes the
+default), M2 (the default read from PATH), M3 (runtime default with the
+signature still requiring searchPath) and X2 (`return { exec } as unknown as
+T` in the decorator, run through a scratch vitest config that aliases the
+import to a mutated copy; shell-compat.ts itself is unchanged).
+The names stay ASCII. Both lists stay names-closed (the card owns both files).
+
+Measured with the prescribed command on the M5 Max on 2026-10-14 at ambient
+load (other agents' suites running, no CPU burners): 26 of 26 passed in 24.4 s
+(load 11.0 to 10.8), 21.8 s (11.6 to 10.6), 20.1 s (10.6 to 10.1) and 22.4 s
+(10.1 to 10.0). In the JSON run the three new tests took 1.4 s (default
+search path), 1.7 s (compiler check) and 2.3 s (dispose). The 120 s bound stays,
+well above 1.5 x the worst run here (36.6 s); it is a hang bound, and no test
+timeout is changed.
 */
 
 const DISCOVERY = "CCC toolchain discovery (Darwin)";
 const FIXTURE = `${DISCOVERY} > fixture search path`;
 const DEFAULT_PATH = `${DISCOVERY} > default search path (this host's Homebrew)`;
+const SIGNATURE = `${DISCOVERY} > frozen signature (compiler-checked)`;
 const HOST = `${DISCOVERY} > host scan (positive control)`;
 const COMPAT = "CCC shell compatibility layer (Darwin sandbox-exec)";
 
@@ -88,6 +117,8 @@ const NAMES = Object.freeze([
   `${FIXTURE} > takes the first directory on the path that holds a usable candidate, and inside one directory the unprefixed name before the g-prefixed one`,
   `${FIXTURE} > rejects a malformed required or optional name with a TypeError before any search, and ignores relative search-path entries, while the absolute entry is searched`,
   `${DEFAULT_PATH} > keeps user-writable directories off the default search path, so a tool found only in a PATH directory such as ~/.local/bin is missing by default and found when the caller passes that directory explicitly`,
+  `${DEFAULT_PATH} > defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError`,
+  `${SIGNATURE} > type-checks discoverCccToolchain({}) with searchPath optional and a Promise<CccSealedToolchain> result with no diagnostic, while a string searchPath reports exactly TS2322`,
   `${HOST} > discovers the default toolchain on this host from the Homebrew-only default search path, every sealed file under /opt/homebrew, and the sealed cat (from gcat) runs as cat inside X1's sandbox with task, rg and git`,
   `${COMPAT} > every wrapper carries a toolchain shebang and the npm wrapper runs npm inside the sandbox, while the raw shell has no npm`,
   `${COMPAT} > the BASH_ENV dispatcher runs node_modules/.bin shims through the toolchain sh and node and exports npm_config_script_shell, while the raw shell cannot run them`,
@@ -100,6 +131,7 @@ const NAMES = Object.freeze([
   `${COMPAT} > keeps the dispatcher read-only inside the sandbox and refuses an exec once it changed outside, while the scratch home stays writable and the restored file runs`,
   `${COMPAT} > refuses an exec once an extra file is planted in the shim layer's directory or in its wrappers directory, while the exec runs again once the file is removed`,
   `${COMPAT} > refuses an exec once the wrappers directory is replaced by a symlink to a directory outside the shim layer that holds the same bytes, while the exec runs again once the real directory is back`,
+  `${COMPAT} > keeps the raw shell's own dispose on the decorated operations, so disposing through the decorator returns the raw shell's closure result, removes its toolchain clone and makes a later raw exec refuse instance-disposed`,
 ]);
 
 function toolchainShellCompatCommand(id) {

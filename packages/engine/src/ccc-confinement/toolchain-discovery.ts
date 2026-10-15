@@ -3,7 +3,8 @@ FNXC:CccToolchainDiscovery 2026-10-14-17:20:
 Card X1b (request-to-code PRD v3 §8, D12; errata E2-25, E4-5, E4-15, E4-B;
 repair 1 per E6-0 and E6-B).
 G0, SF and WR take the writer shell's toolchain from `discoverCccToolchain`:
-it finds each tool on a caller-given search path, and seals the result through
+it finds each tool on a search path (the caller's, or the Homebrew-only default
+when the caller passes none; card X1z), and seals the result through
 X1's `sealCccToolchain` (never by hand), each tool under its unprefixed name.
 
 Why discovery is picky. Inside X1's sandbox only the per-instance clone of the
@@ -42,7 +43,10 @@ receipt, the planning prompts) names the missing ones by comparing that list
 with the sealed utility names. Relative search-path entries depend on the cwd
 and are ignored.
 
-Default search path (E6-0). Homebrew only: `/opt/homebrew/bin`, then the
+Default search path (E6-0). `searchPath` is optional (section 2.13; card X1z,
+errata E8-X item 1): when it is absent, discovery uses
+`cccToolchainDefaultSearchPath()`, so G0, SF and WR call it with its defaults.
+That path is Homebrew only: `/opt/homebrew/bin`, then the
 `opt/<formula>/bin` and `libexec/gnubin` directories of the formulae this
 catalogue names. User-writable directories (`~/.local/bin`, `~/go/bin`,
 `~/.cargo/bin` and the like) and the operator's PATH are never on it, nor is
@@ -203,24 +207,29 @@ function toolList(value: unknown, label: "required" | "optional"): readonly stri
 }
 
 /**
- * Finds and seals the writer shell's toolchain on `searchPath` (see the file
- * header). Refuses a missing role or required tool with
+ * Finds and seals the writer shell's toolchain on `searchPath`, which defaults
+ * to `cccToolchainDefaultSearchPath()` when absent (see the file header).
+ * Refuses a missing role or required tool with
  * `CCC_PLANNING_CONFINEMENT_UNQUALIFIED` / `toolchain-missing:<tool>`, and
  * seals each optional tool only when it is found; a malformed `searchPath` or
  * tool name is a caller bug (`TypeError`). Errors from `sealCccToolchain` (for
  * example a git that cannot report its exec path) pass through unchanged.
  */
 export async function discoverCccToolchain(i: Readonly<{
-  searchPath: readonly string[];
+  searchPath?: readonly string[];
   required?: readonly string[];
   optional?: readonly string[];
 }>): Promise<CccSealedToolchain> {
-  if (!Array.isArray(i.searchPath) || i.searchPath.some((entry) => typeof entry !== "string")) {
+  // FNXC:CccToolchainDiscovery 2026-10-14-20:44: E8-X item 1: section 2.13 (E6-0) declares searchPath optional, and
+  // G0 step 11, SF and WR call discovery with its defaults, so an absent value defaults here. A present value, an
+  // empty array included, is the caller's search path; a present but malformed one still throws the TypeError below.
+  const searchPath = i.searchPath ?? cccToolchainDefaultSearchPath();
+  if (!Array.isArray(searchPath) || searchPath.some((entry) => typeof entry !== "string")) {
     throw new TypeError("discoverCccToolchain: searchPath must be an array of strings");
   }
   const required = toolList(i.required ?? CCC_TOOLCHAIN_REQUIRED_TOOLS, "required");
   const optional = toolList(i.optional ?? CCC_TOOLCHAIN_OPTIONAL_TOOLS, "optional");
-  const dirs = [...new Set(i.searchPath.filter((entry) => isAbsolute(entry)))];
+  const dirs = [...new Set(searchPath.filter((entry) => isAbsolute(entry)))];
 
   const bash = findTool(dirs, "bash") ?? missing("bash");
   const sh = findTool(dirs, "dash") ?? bash;

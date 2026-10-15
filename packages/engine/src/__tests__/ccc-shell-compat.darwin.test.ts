@@ -48,6 +48,18 @@ broke without failing the check:
   mutant N7 (no `isRealDirectory(install.wrapperDir)`) fails, because nothing
   else in the check notices the redirection.
 Every new positive case keeps its raw-shell control, which cannot run the shim.
+
+FNXC:CccShellCompat 2026-10-14-20:44:
+Card X1z (errata E8-X item 2; test-only, the shim layer's source is
+unchanged). The decorator keeps the raw shell's `dispose`: on a fresh X1
+instance, the decorated operations' `dispose` is the raw shell's own function,
+disposing through the decorator returns the raw shell's closure result (the
+same frozen object a later raw `dispose()` returns), removes that instance's
+toolchain clone, and makes a later exec on the raw shell refuse
+`instance-disposed`. The positive control is an exec through the decorator on
+the same instance, which loads the dispatcher from the clone. Mutant X2
+(`return { exec } as unknown as T`) drops `dispose` and fails the identity
+assertion.
 */
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -58,6 +70,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import {
   CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256,
+  CccConfinementRefusedError,
   createCccConfinedBashOperations,
   readCccConfinementOsBuild,
   type CccConfinedBashOperations,
@@ -166,14 +179,20 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
     await chmod(join(bin, "envs-tool"), 0o755);
     await chmod(join(bin, "bash-tool"), 0o755);
     await chmod(join(bin, "plain-tool"), 0o755);
-    raw = createCccConfinedBashOperations({
+    raw = createConfined(scratchRoot);
+    compat = withCccShellCompat(raw, { toolchain, scratchRoot });
+  });
+
+  /** An X1 operations instance over the fixture worktree, with its own scratch root. */
+  function createConfined(scratch: string): CccConfinedBashOperations {
+    return createCccConfinedBashOperations({
       profileId: "ccc-writer-shell.v1",
       worktreeRoot: worktree,
       gitDirs: [],
       writeRoots: [join(worktree, "src")],
       deniedNames: [],
       deniedRoots: [],
-      scratchRoot,
+      scratchRoot: scratch,
       toolchain,
       taskEnv: {},
       limits: { wallMsCeiling: 600_000, cpuSeconds: 600, fileSizeBlocks: 2_097_152, maxOutputBytes: 1_048_576, maxReapPasses: 20 },
@@ -183,8 +202,7 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
         osBuild: readCccConfinementOsBuild(),
       },
     });
-    compat = withCccShellCompat(raw, { toolchain, scratchRoot });
-  });
+  }
 
   afterAll(async () => {
     await raw?.dispose();
@@ -454,6 +472,42 @@ describe.skipIf(process.platform !== "darwin")("CCC shell compatibility layer (D
     expect(redirected.output).toBe("");
     expect(restored.error).toBeNull();
     expect(line(restored.output, "ran-rc")).toBe("0");
+  });
+
+  it("keeps the raw shell's own dispose on the decorated operations, so disposing through the decorator returns the raw shell's closure result, removes its toolchain clone and makes a later raw exec refuse instance-disposed", async () => {
+    const ownScratch = join(root, "dispose-scratch");
+    await mkdir(ownScratch);
+    const inner = createConfined(ownScratch);
+    const decorated = withCccShellCompat(inner, { toolchain, scratchRoot: ownScratch });
+    const decoratedDispose = (decorated as Partial<CccConfinedBashOperations>).dispose;
+    const instanceClones = () => readdirSync(join(ownScratch, "toolchains")).filter((entry) => /^[0-9a-f]{16}$/u.test(entry));
+    let ran: Ran;
+    let clonesBefore: string[];
+    let viaDecorator: unknown;
+    try {
+      // Positive control: the decorator runs a command on this instance, from its clone, through the dispatcher.
+      ran = await run(decorated, 'echo "bash-env=${BASH_ENV-}"; echo "bash=$BASH"', worktree);
+      clonesBefore = instanceClones();
+      viaDecorator = typeof decoratedDispose === "function" ? await decoratedDispose() : "no dispose on the decorated operations";
+    } finally {
+      await inner.dispose();
+    }
+    const viaRaw = await inner.dispose();
+    const after = await run(inner, 'echo "never-ran"', worktree);
+
+    expect(ran.error).toBeNull();
+    const install = await installCccShellCompat({ toolchain, scratchRoot: ownScratch });
+    expect(line(ran.output, "bash-env")).toBe(install.bashEnv);
+    expect(dirname(line(ran.output, "bash") ?? "")).toMatch(CLONE_BIN);
+    expect(clonesBefore).toHaveLength(1);
+    // The decorator replaces only exec: dispose is the raw shell's own function, and its result is the raw shell's.
+    expect(decoratedDispose).toBe(inner.dispose);
+    expect(viaDecorator).toEqual({ closure: "confirmed" });
+    expect(viaRaw).toBe(viaDecorator);
+    expect(instanceClones()).toEqual([]);
+    expect(after.error).toBeInstanceOf(CccConfinementRefusedError);
+    expect((after.error as CccConfinementRefusedError).reason).toBe("instance-disposed");
+    expect(after.output).not.toContain("never-ran");
   });
 });
 

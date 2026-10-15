@@ -55,12 +55,34 @@ unchanged). Recorded limits of the default discovery, none of them a defect:
   Homebrew formula that installs an unprefixed coreutils or awk name in
   `/opt/homebrew/bin` (BWK `awk`, md5sha1sum's `md5sum`) would be sealed in
   place of the GNU build found by its `g` name in that same directory.
+
+FNXC:CccToolchainDiscovery 2026-10-14-20:44:
+Card X1z (errata E8-X item 1; section 2.13 and E6-0 declare `searchPath`
+optional, and G0 step 11, SF and WR call discovery with its defaults). Two
+tests pin it:
+- Runtime: `discoverCccToolchain({})` seals the same toolchain digest as an
+  explicit `{ searchPath: cccToolchainDefaultSearchPath() }` (the positive
+  control), even with a stub bash and node planted first on the operator's
+  PATH, so the default is resolved inside the function and is the Homebrew-only
+  default, not PATH. An explicit empty `searchPath` is kept (it refuses
+  toolchain-missing:bash rather than falling back to the default), and a
+  present but malformed value (a string, an array holding a number) still
+  throws the existing TypeError. On INT-2d bytes `{}` throws that TypeError.
+- Type level: the engine's `typecheck` excludes tests and vitest strips types,
+  so the frozen signature is checked by running the TypeScript compiler (the
+  engine's options, `@fusion/core` pointed at core source) over two virtual
+  snippets: one that passes `{}` and asserts the optional key and the
+  `Promise<CccSealedToolchain>` result with no diagnostic, and one that passes a
+  string `searchPath`, which must report exactly TS2322, so the compiler is
+  shown to be checking the import at all.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CccPlanningRefusal } from "@fusion/core";
 import {
@@ -118,6 +140,85 @@ async function settle<T>(promise: Promise<T>): Promise<{ value: T | null; error:
     return { value: null, error };
   }
 }
+
+// ------------------------------------------------------------ compiler harness (E8-X item 1, type level)
+
+const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
+const ENGINE_ROOT = join(TESTS_DIR, "..", "..");
+const CORE_SRC = join(ENGINE_ROOT, "..", "core", "src");
+
+/** The engine's compiler options, with `@fusion/core` pointed at core source so the check needs no core build. */
+function engineCompilerOptions(): ts.CompilerOptions {
+  const configPath = join(ENGINE_ROOT, "tsconfig.json");
+  const read = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (read.error) throw new Error(ts.flattenDiagnosticMessageText(read.error.messageText, "\n"));
+  const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, ENGINE_ROOT, undefined, configPath);
+  const { rootDir: _rootDir, ...options } = parsed.options;
+  return {
+    ...options,
+    paths: { ...options.paths, "@fusion/core": [join(CORE_SRC, "index.ts")], "@fusion/core/*": [join(CORE_SRC, "*")] },
+    noEmit: true,
+    incremental: false,
+    composite: false,
+    declaration: false,
+    declarationMap: false,
+    sourceMap: false,
+  };
+}
+
+/** Type-checks virtual sources (keyed by absolute path) in one program; returns each file's diagnostics as code and line. */
+function typecheckVirtual(files: Readonly<Record<string, string>>): ReadonlyMap<string, readonly Readonly<{ code: number; line: number; message: string }>[]> {
+  const options = engineCompilerOptions();
+  const host = ts.createCompilerHost(options);
+  host.getCurrentDirectory = () => ENGINE_ROOT;
+  const virtual = new Map(Object.entries(files));
+  const readFile = host.readFile.bind(host);
+  const fileExists = host.fileExists.bind(host);
+  const getSourceFile = host.getSourceFile.bind(host);
+  host.readFile = (fileName) => virtual.get(fileName) ?? readFile(fileName);
+  host.fileExists = (fileName) => virtual.has(fileName) || fileExists(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
+    const text = virtual.get(fileName);
+    return text === undefined
+      ? getSourceFile(fileName, languageVersion, onError, shouldCreate)
+      : ts.createSourceFile(fileName, text, languageVersion, true);
+  };
+  const program = ts.createProgram({ rootNames: [...virtual.keys()], options, host });
+  const byFile = new Map<string, Readonly<{ code: number; line: number; message: string }>[]>();
+  for (const fileName of virtual.keys()) {
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) throw new Error(`compiler did not load ${fileName}`);
+    byFile.set(fileName, [...program.getSyntacticDiagnostics(sourceFile), ...program.getSemanticDiagnostics(sourceFile)].map((diagnostic) => ({
+      code: diagnostic.code,
+      line: diagnostic.start === undefined ? 0 : sourceFile.getLineAndCharacterOfPosition(diagnostic.start).line + 1,
+      message: ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
+    })));
+  }
+  return byFile;
+}
+
+/** `{}` is an accepted input, `searchPath` is optional, and the result is a sealed toolchain (section 2.13, E6-0). */
+const SIGNATURE_ACCEPTS: readonly [string, string] = [join(TESTS_DIR, "__x1z_signature_accepts.ts"), [
+  'import type { CccSealedToolchain } from "../ccc-confinement/confined-shell.js";',
+  'import { cccToolchainDefaultSearchPath, discoverCccToolchain } from "../ccc-confinement/toolchain-discovery.js";',
+  "type Assert<T extends true> = T;",
+  "type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;",
+  "type Input = Parameters<typeof discoverCccToolchain>[0];",
+  "export type EmptyAccepted = Assert<{} extends Input ? true : false>;",
+  "export type SearchPathOptional = Assert<Same<Input[\"searchPath\"], readonly string[] | undefined>>;",
+  "export type Result = Assert<Same<ReturnType<typeof discoverCccToolchain>, Promise<CccSealedToolchain>>>;",
+  "export function probe(): readonly Promise<CccSealedToolchain>[] {",
+  "  return [discoverCccToolchain({}), discoverCccToolchain({ searchPath: cccToolchainDefaultSearchPath() }), discoverCccToolchain({ required: [\"cat\"], optional: [] })];",
+  "}",
+  "",
+].join("\n")];
+
+/** Control: a string search path is a type error, so the compiler is really checking the import. */
+const SIGNATURE_REJECTS: readonly [string, string] = [join(TESTS_DIR, "__x1z_signature_rejects.ts"), [
+  'import { discoverCccToolchain } from "../ccc-confinement/toolchain-discovery.js";',
+  'export const wrong = discoverCccToolchain({ searchPath: "/opt/homebrew/bin" });',
+  "",
+].join("\n")];
 
 describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)", () => {
   const roots: string[] = [];
@@ -440,6 +541,54 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(defaults).not.toContain(userBin);
       expect(defaults[0]).toBe("/opt/homebrew/bin");
       expect(defaults.filter((entry) => !entry.startsWith("/opt/homebrew/"))).toEqual([]);
+    });
+
+    it("defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError", async () => {
+      const root = await fixtureRoot();
+      // A PATH directory with usable-looking bash and node: a default taken from PATH would seal them.
+      const pathBin = join(root, "path-bin");
+      await mkdir(pathBin);
+      await stub(pathBin, "bash");
+      await stub(pathBin, "node");
+
+      // Positive control: the explicit default search path seals on this host.
+      const explicit = await settle(discoverCccToolchain({ searchPath: cccToolchainDefaultSearchPath() }));
+      const savedPath = process.env.PATH;
+      process.env.PATH = `${pathBin}:${savedPath ?? ""}`;
+      let absent: { value: CccSealedToolchain | null; error: unknown };
+      try {
+        absent = await settle(discoverCccToolchain({}));
+      } finally {
+        if (savedPath === undefined) delete process.env.PATH;
+        else process.env.PATH = savedPath;
+      }
+      const empty = await settle(discoverCccToolchain({ searchPath: [] }));
+      const notArray = await settle(discoverCccToolchain({ searchPath: "/opt/homebrew/bin" as unknown as readonly string[] }));
+      const notStrings = await settle(discoverCccToolchain({ searchPath: [42] as unknown as readonly string[] }));
+
+      expect(explicit.error).toBeNull();
+      expect(explicit.value!.bash.path.startsWith("/opt/homebrew/")).toBe(true);
+      expect(explicit.value!.utilities.length).toBeGreaterThan(0);
+      expect(absent.error).toBeNull();
+      expect(absent.value!.toolchainSha256).toBe(explicit.value!.toolchainSha256);
+      expect(absent.value).toEqual(explicit.value);
+      expect(absent.value!.bash.path.startsWith(`${pathBin}/`)).toBe(false);
+      // A present empty array is the caller's search path, not a request for the default.
+      expect(refusalOf(empty.error)).toEqual({ code: REFUSAL_CODE, detail: "toolchain-missing:bash" });
+      for (const malformed of [notArray, notStrings]) {
+        expect(malformed.error).toBeInstanceOf(TypeError);
+        expect((malformed.error as Error).message).toBe("discoverCccToolchain: searchPath must be an array of strings");
+      }
+    });
+  });
+
+  describe("frozen signature (compiler-checked)", () => {
+    it("type-checks discoverCccToolchain({}) with searchPath optional and a Promise<CccSealedToolchain> result with no diagnostic, while a string searchPath reports exactly TS2322", () => {
+      const findings = typecheckVirtual(Object.fromEntries([SIGNATURE_ACCEPTS, SIGNATURE_REJECTS]));
+
+      expect(findings.get(SIGNATURE_ACCEPTS[0])).toEqual([]);
+      // Control: the same import with a wrong searchPath type is refused, so the clean result above is not vacuous.
+      expect(findings.get(SIGNATURE_REJECTS[0])?.map(({ code, line }) => ({ code, line }))).toEqual([{ code: 2322, line: 2 }]);
     });
   });
 
