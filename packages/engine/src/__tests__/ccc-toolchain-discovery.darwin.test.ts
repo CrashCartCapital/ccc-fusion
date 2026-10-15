@@ -63,11 +63,12 @@ tests pin it:
 - Runtime: `discoverCccToolchain({})` seals the same toolchain digest as an
   explicit `{ searchPath: cccToolchainDefaultSearchPath() }` (the positive
   control), even with a stub bash and node planted first on the operator's
-  PATH, so the default is resolved inside the function and is the Homebrew-only
-  default, not PATH. An explicit empty `searchPath` is kept (it refuses
-  toolchain-missing:bash rather than falling back to the default), and a
-  present but malformed value (a string, an array holding a number) still
-  throws the existing TypeError. On INT-2d bytes `{}` throws that TypeError.
+  PATH, so the default is resolved inside the function and PATH does not come
+  first (repair 1 below pins that PATH is not on it at all). An explicit empty
+  `searchPath` is kept (it refuses toolchain-missing:bash rather than falling
+  back to the default), and a present but malformed value (a string, an array
+  holding a number) still throws the existing TypeError. On INT-2d bytes `{}`
+  throws that TypeError.
 - Type level: the engine's `typecheck` excludes tests and vitest strips types,
   so the frozen signature is checked by running the TypeScript compiler (the
   engine's options, `@fusion/core` pointed at core source) over two virtual
@@ -75,6 +76,20 @@ tests pin it:
   `Promise<CccSealedToolchain>` result with no diagnostic, and one that passes a
   string `searchPath`, which must report exactly TS2322, so the compiler is
   shown to be checking the import at all.
+
+FNXC:CccToolchainDiscovery 2026-10-14-21:15:
+X1z repair 1 (test-only; E6-0: no PATH or user-writable directory is ever on
+the default search path). The stub bash and node first on PATH only showed
+that PATH does not come first: Homebrew supplies its own bash and node, so a
+default that appends PATH or the home directories after Homebrew sealed the
+same digest and passed every test. Two assertions now use a randomly named
+tool no Homebrew installs, so they do not depend on what this host has:
+- the absent-`searchPath` test plants that tool only in its PATH directory and
+  asserts toolchain-missing (kills M2, PATH first, and M2c, PATH appended);
+- a new test plants it last on PATH and in ~/.local/bin, ~/go/bin and
+  ~/.cargo/bin under a fixture HOME, asserts toolchain-missing by default, and
+  finds it in each directory passed explicitly (kills m4, PATH appended, and
+  m5, the home directories and /usr/local/bin appended).
 */
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readFileSync, realpathSync } from "node:fs";
@@ -543,21 +558,29 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(defaults.filter((entry) => !entry.startsWith("/opt/homebrew/"))).toEqual([]);
     });
 
-    it("defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError", async () => {
+    it("defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, a tool found only in that PATH directory refuses toolchain-missing, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError", async () => {
       const root = await fixtureRoot();
       // A PATH directory with usable-looking bash and node: a default taken from PATH would seal them.
       const pathBin = join(root, "path-bin");
       await mkdir(pathBin);
       await stub(pathBin, "bash");
       await stub(pathBin, "node");
+      // FNXC:CccToolchainDiscovery 2026-10-14-21:15: X1z repair 1: Homebrew hides the stub bash and node behind its
+      // own, so a default that appends PATH (mutant M2c) sealed the same digest. A tool that exists only in this PATH
+      // directory is reached by any default that searches PATH at all; B4 finds the same kind of stub when its
+      // directory is passed explicitly (positive control).
+      const pathOnlyTool = `ccc-x1z-path-only-${randomBytes(4).toString("hex")}`;
+      await stub(pathBin, pathOnlyTool);
 
       // Positive control: the explicit default search path seals on this host.
       const explicit = await settle(discoverCccToolchain({ searchPath: cccToolchainDefaultSearchPath() }));
       const savedPath = process.env.PATH;
       process.env.PATH = `${pathBin}:${savedPath ?? ""}`;
       let absent: { value: CccSealedToolchain | null; error: unknown };
+      let pathOnly: { value: CccSealedToolchain | null; error: unknown };
       try {
         absent = await settle(discoverCccToolchain({}));
+        pathOnly = await settle(discoverCccToolchain({ required: [pathOnlyTool], optional: [] }));
       } finally {
         if (savedPath === undefined) delete process.env.PATH;
         else process.env.PATH = savedPath;
@@ -573,12 +596,50 @@ describe.skipIf(process.platform !== "darwin")("CCC toolchain discovery (Darwin)
       expect(absent.value!.toolchainSha256).toBe(explicit.value!.toolchainSha256);
       expect(absent.value).toEqual(explicit.value);
       expect(absent.value!.bash.path.startsWith(`${pathBin}/`)).toBe(false);
+      expect(refusalOf(pathOnly.error)).toEqual({ code: REFUSAL_CODE, detail: `toolchain-missing:${pathOnlyTool}` });
       // A present empty array is the caller's search path, not a request for the default.
       expect(refusalOf(empty.error)).toEqual({ code: REFUSAL_CODE, detail: "toolchain-missing:bash" });
       for (const malformed of [notArray, notStrings]) {
         expect(malformed.error).toBeInstanceOf(TypeError);
         expect((malformed.error as Error).message).toBe("discoverCccToolchain: searchPath must be an array of strings");
       }
+    });
+
+    it("never searches PATH or the user-writable home directories when searchPath is absent: a tool planted only last on PATH and in ~/.local/bin, ~/go/bin and ~/.cargo/bin under the fixture HOME refuses toolchain-missing, while each of those directories passed explicitly finds it", async () => {
+      // FNXC:CccToolchainDiscovery 2026-10-14-21:15: X1z repair 1 (E6-0: no PATH or user-writable directory is ever on
+      // the default search path). The tool is one no Homebrew installs, so the result does not depend on this host:
+      // a default that appends PATH (mutant m4) or the home directories (m5) finds it, and the Homebrew-only default does not.
+      const root = await fixtureRoot();
+      const tool = `ccc-x1z-home-only-${randomBytes(4).toString("hex")}`;
+      const home = join(root, "home");
+      const pathDir = join(root, "path-last", "bin");
+      const homeDirs = [join(home, ".local", "bin"), join(home, "go", "bin"), join(home, ".cargo", "bin")];
+      const planted = [pathDir, ...homeDirs];
+      for (const dir of planted) {
+        await mkdir(dir, { recursive: true });
+        await stub(dir, tool);
+      }
+
+      const saved = { PATH: process.env.PATH, HOME: process.env.HOME };
+      process.env.PATH = `${saved.PATH ?? ""}:${pathDir}`;
+      process.env.HOME = home;
+      let absent: { value: CccSealedToolchain | null; error: unknown };
+      try {
+        absent = await settle(discoverCccToolchain({ required: [tool], optional: [] }));
+      } finally {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+      // Positive control: each planted stub is a tool discovery accepts once its directory is on the search path.
+      const explicit = await Promise.all(planted.map((dir) =>
+        settle(discoverCccToolchain({ searchPath: [...cccToolchainDefaultSearchPath(), dir], required: [tool], optional: [] }))));
+
+      expect(absent.value).toBeNull();
+      expect(refusalOf(absent.error)).toEqual({ code: REFUSAL_CODE, detail: `toolchain-missing:${tool}` });
+      expect(explicit.map(({ value, error }) => ({ error, path: value === null ? null : utilityByName(value).get(tool)?.path })))
+        .toEqual(planted.map((dir) => ({ error: null, path: join(dir, tool) })));
     });
   });
 

@@ -96,6 +96,29 @@ load (other agents' suites running, no CPU burners): 26 of 26 passed in 24.4 s
 search path), 1.7 s (compiler check) and 2.3 s (dispose). The 120 s bound stays,
 well above 1.5 x the worst run here (36.6 s); it is a hang bound, and no test
 timeout is changed.
+
+FNXC:CccPlanningProofInventory 2026-10-14-21:20:
+Card X1z repair 1 (test-only; E6-0: no PATH or user-writable directory is ever
+on the default search path). The closed check now holds twenty-seven tests:
+fifteen in discovery, twelve in the shim layer. The absent-searchPath test is
+renamed: it also plants a randomly named tool only in its PATH directory and
+asserts toolchain-missing. New: a tool planted only last on PATH and in
+~/.local/bin, ~/go/bin and ~/.cargo/bin under a fixture HOME refuses
+toolchain-missing by default and is found in each directory passed explicitly.
+Mutants added to the list above, each of which passed all fourteen discovery
+tests before this repair (the reviews' runs) and now fails the check with an
+assertion (a run against this repair's tests): M2c, also
+called m4 (`i.searchPath ?? [...cccToolchainDefaultSearchPath(),
+...PATH]`, PATH appended after Homebrew), and m5 (the default plus
+$HOME/.local/bin, $HOME/go/bin, $HOME/.cargo/bin and /usr/local/bin). M2 (PATH
+first) still fails, now in both tests.
+
+Measured with the prescribed command on the M5 Max on 2026-10-14 at ambient
+load (other agents' suites running, no CPU burners): 27 of 27 passed in 26.6 s
+(load 13.4 to 12.1), 24.2 s (11.8 to 13.6) and, in the JSON run, 25.6 s
+(12.2 to 11.2); there the renamed test took 1.4 s and the new one 0.6 s. The
+120 s bound stays, well above 1.5 x the worst run here (39.9 s); it is a hang
+bound, and no test timeout is changed.
 */
 
 const DISCOVERY = "CCC toolchain discovery (Darwin)";
@@ -117,7 +140,8 @@ const NAMES = Object.freeze([
   `${FIXTURE} > takes the first directory on the path that holds a usable candidate, and inside one directory the unprefixed name before the g-prefixed one`,
   `${FIXTURE} > rejects a malformed required or optional name with a TypeError before any search, and ignores relative search-path entries, while the absolute entry is searched`,
   `${DEFAULT_PATH} > keeps user-writable directories off the default search path, so a tool found only in a PATH directory such as ~/.local/bin is missing by default and found when the caller passes that directory explicitly`,
-  `${DEFAULT_PATH} > defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError`,
+  `${DEFAULT_PATH} > defaults an absent searchPath inside the function: discoverCccToolchain({}) seals the same toolchain digest as an explicit default searchPath even with a stub bash first on PATH, a tool found only in that PATH directory refuses toolchain-missing, an explicit empty searchPath is kept and refuses toolchain-missing:bash, and a present but malformed searchPath still throws a TypeError`,
+  `${DEFAULT_PATH} > never searches PATH or the user-writable home directories when searchPath is absent: a tool planted only last on PATH and in ~/.local/bin, ~/go/bin and ~/.cargo/bin under the fixture HOME refuses toolchain-missing, while each of those directories passed explicitly finds it`,
   `${SIGNATURE} > type-checks discoverCccToolchain({}) with searchPath optional and a Promise<CccSealedToolchain> result with no diagnostic, while a string searchPath reports exactly TS2322`,
   `${HOST} > discovers the default toolchain on this host from the Homebrew-only default search path, every sealed file under /opt/homebrew, and the sealed cat (from gcat) runs as cat inside X1's sandbox with task, rg and git`,
   `${COMPAT} > every wrapper carries a toolchain shebang and the npm wrapper runs npm inside the sandbox, while the raw shell has no npm`,
