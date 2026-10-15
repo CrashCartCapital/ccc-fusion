@@ -34,6 +34,7 @@ import {type TaskRow} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {withTaskBranchContextInSourceMetadata} from "../task-store/branch-context.js";
 import {upsertTaskRowInTransaction, readTaskRowInTransaction, buildTaskInsertValues} from "../task-store/async-persistence.js";
+import {assertCccPlanningSnapshotWritePreservesCustody} from "./ccc-planning-custody.js";
 import {listDueWorkflowWorkItems as listDueWorkflowWorkItemsAsync} from "../task-store/async-workflow-workitems.js";
 import {getTaskMovedCountsByDay as getTaskMovedCountsByDayAsync} from "../task-store/async-audit.js";
 import {getAllDocuments as getAllDocumentsAsync} from "../task-store/async-comments-attachments.js";
@@ -146,6 +147,8 @@ export async function atomicWriteTaskJsonImpl2(store: TaskStore, dir: string, ta
         if (changedColumns.size === 0) {
           return;
         }
+        // FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 2): custody backstop on the row read above, inside this transaction; a write that changes a custody column of a held planning task rolls back before the UPDATE.
+        await assertCccPlanningSnapshotWritePreservesCustody(tx, layer.projectId, id, existingRow, changedColumns);
         const context = store.createTaskPersistSerializationContext(task, existingRow);
         const allValues = buildTaskInsertValues(task as unknown as Record<string, unknown>, context);
         const setValues: Record<string, unknown> = { updatedAt: task.updatedAt };

@@ -24,7 +24,7 @@ import {applyOriginalDescription} from "../original-description-policy.js";
 import {normalizeTaskReviewState} from "../task-store/review-state.js";
 import {hasOwnDeclaredSymbols, normalizeDeclaredSymbols, extractDeclaredSymbolsFromPrompt, resolveTaskSymbolsForTask} from "../task-symbol-resolution.js";
 import {CccPlanningTaskCustodyError} from "../ccc-planning/errors.js";
-import {assertCccPlanningCustodyPreserved, cccPlanningCustodyReleasingUpdate, cccPlanningCustodySnapshot, isCccPlanningTaskHeld} from "./ccc-planning-custody.js";
+import {cccPlanningCustodyReleasingUpdate, isCccPlanningTaskHeld} from "./ccc-planning-custody.js";
 
 export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext,): Promise<Task> {
     {
@@ -43,12 +43,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
 
       /*
       FNXC:CccPlanningCustody 2026-10-14-13:41:
-      This is the one write path under updateTask and updateTaskAtomic (task-mutation-ops.ts updateTaskAtomicImpl calls updateTaskUnlocked directly and skips updateTaskImpl), so the custody guard lives here (D22, challenge 11). A held planning task still takes non-custody fields such as a summary; inputs that release or move it are refused before any field or side effect is written, and the custody fields are compared again just before the write as the backstop for any path not listed.
+      This is the one write path under updateTask and updateTaskAtomic (task-mutation-ops.ts updateTaskAtomicImpl calls updateTaskUnlocked directly and skips updateTaskImpl), so the custody guard lives here (D22, challenge 11). A held planning task still takes non-custody fields such as a summary; inputs that release or move it are refused before any field or side effect is written.
+      FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 3):
+      The round-1 before/after comparison just before the write was removed because no input could reach it: this pre-check mirrors the only three places below that change a custody field (the paused input, the auto-unpause on reassigning the pausing agent, the todo-to-triage move on a new dependency), so every custody change is refused here first. The snapshot-writer backstop in atomicWriteTaskJson and atomicWriteTaskJsonWithAudit, which this function writes through, now refuses any future custody change at the write itself.
       */
-      const cccPlanningCustodyBefore = await isCccPlanningTaskHeld(store.asyncLayer, task)
-        ? cccPlanningCustodySnapshot(task)
-        : null;
-      if (cccPlanningCustodyBefore) {
+      if (await isCccPlanningTaskHeld(store.asyncLayer, task)) {
         const refused = cccPlanningCustodyReleasingUpdate(task, updates);
         if (refused) throw new CccPlanningTaskCustodyError(id, refused);
       }
@@ -754,9 +753,6 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         task.sliceId = updates.sliceId;
       }
       task.updatedAt = new Date().toISOString();
-      if (cccPlanningCustodyBefore) {
-        assertCccPlanningCustodyPreserved(id, cccPlanningCustodyBefore, task);
-      }
 
       // FNXC:TaskDetailPromptResilience 2026-07-10-17:00 (merge port from main):
       // Perform the explicit PROMPT.md write (and its File Scope validation)

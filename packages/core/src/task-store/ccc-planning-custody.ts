@@ -1,13 +1,15 @@
 /*
 FNXC:CccPlanningCustody 2026-10-14-13:41:
-Store-level custody for request-to-code planning tasks (card G1, D22, critic 1, challenges 11 and 24). A planning task is held when two facts agree: the pure K1 marker (`isCccPlanningCustodyTask`: lineage is a `ccc-plan:` run id, `paused` is true, `userPaused` is not true) and the database fact that an anchor row in `project.ccc_planning_runs` names the task as its planning task. The marker alone is only suspicion, the same contract as the imported campaign lineage; the anchor is the proof. Every guard site asks the pure marker first, so an ordinary task never pays for the anchor query.
+Store-level custody for request-to-code planning tasks (card G1, D22, critic 1, challenges 11 and 24). A planning task is held when two facts agree: the pure K1 marker (`isCccPlanningCustodyTask`: lineage is a `ccc-plan:` run id, `paused` is true, `userPaused` is not true) and the database fact that an anchor row in `project.ccc_planning_runs` names the task as its planning task. The marker alone is only suspicion, the same contract as the imported campaign lineage; the anchor is the proof. Every guard site that already holds the task or its row asks the pure marker first, so an ordinary task never pays for the anchor query there. The id-only archive and delete checks have no row yet, so they ask the anchor first (one indexed lookup) and read the row's marker only when an anchor exists.
+
+FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1): on PostgreSQL the id-only checks sit on the backend leaves (deleteTaskBackendImpl, deleteTaskIfBackendImpl, archiveTaskBackendImpl), and both snapshot write primitives carry a backstop, so dependency edits and any other snapshot writer cannot change a held task's custody columns either.
 
 A held task may still take non-custody writes (a summary, a log line, a status the native host records), but no store path may release it (clear `paused`, set `userPaused`), move it, archive it or delete it. Those paths throw `CccPlanningTaskCustodyError`, named after the refused operation, before any write. A failed anchor lookup propagates, so the guarded operation fails closed instead of proceeding unguarded.
 */
 import { and, eq, type SQL } from "drizzle-orm";
 import { CccPlanningTaskCustodyError } from "../ccc-planning/errors.js";
 import { isCccPlanningCustodyTask } from "../ccc-planning/marker.js";
-import { projectOwnershipPartition, type AsyncDataLayer } from "../postgres/data-layer.js";
+import { projectOwnershipPartition, type AsyncDataLayer, type DbTransaction } from "../postgres/data-layer.js";
 import { cccPlanningRuns } from "../postgres/schema/ccc-planning.js";
 import * as schema from "../postgres/schema/index.js";
 import type { Task } from "../types.js";
@@ -20,22 +22,17 @@ export type CccPlanningCustodyLayer = Pick<AsyncDataLayer, "db" | "projectId">;
 
 type CustodyTaskView = Pick<Task, "id" | "lineageId" | "paused" | "userPaused">;
 
-/** Fields whose change would release, move, archive or delete a held task. */
-export type CccPlanningCustodySnapshot = Readonly<{
-  paused: boolean;
-  userPaused: boolean;
-  lineageId: string | null;
-  column: string;
-  deletedAt: string | null;
-}>;
+/** Anything that can run a Drizzle `select`: the layer's database handle or an open transaction. */
+type CustodyQueryHandle = Pick<DbTransaction, "select">;
 
 /**
- * Task-table columns (Drizzle property names) that carry custody. A raw `updateTaskColumns` write that changes
- * any of them on a held task is refused.
+ * Task-table columns (Drizzle property names, which are also the `TaskRow` keys the snapshot writers diff) that
+ * carry custody. A raw `updateTaskColumns` write or a snapshot write that changes any of them on a held task is
+ * refused.
  */
 export const CCC_PLANNING_CUSTODY_TASK_COLUMNS = Object.freeze(["paused", "userPaused", "column", "lineageId", "deletedAt"] as const);
 
-function boundProject(layer: CccPlanningCustodyLayer): string | undefined {
+function boundProject(layer: Pick<CccPlanningCustodyLayer, "projectId">): string | undefined {
   const trimmed = layer.projectId?.trim();
   return trimmed ? trimmed : undefined;
 }
@@ -50,9 +47,13 @@ export async function hasCccPlanningAnchorForTask(
   taskId: string,
   projectId?: string,
 ): Promise<boolean> {
+  return anchorExists(layer.db, taskId, projectId);
+}
+
+async function anchorExists(handle: CustodyQueryHandle, taskId: string, projectId: string | undefined): Promise<boolean> {
   const conditions: SQL[] = [eq(cccPlanningRuns.planningTaskId, taskId)];
   if (projectId !== undefined) conditions.push(eq(cccPlanningRuns.projectId, projectId));
-  const rows = await layer.db
+  const rows = await handle
     .select({ runId: cccPlanningRuns.runId })
     .from(cccPlanningRuns)
     .where(and(...conditions))
@@ -102,7 +103,7 @@ async function readCustodyRow(layer: CccPlanningCustodyLayer, taskId: string, pa
   return rows[0] as CustodyRow | undefined;
 }
 
-function rowMarkerView(taskId: string, row: CustodyRow): CustodyTaskView {
+function rowMarkerView(taskId: string, row: Pick<CustodyRow, "lineageId" | "paused" | "userPaused">): CustodyTaskView {
   return {
     id: taskId,
     lineageId: row.lineageId ?? undefined,
@@ -130,39 +131,14 @@ export async function assertCccPlanningTaskIdNotHeld(
   }
 }
 
-/** Snapshot of the custody fields, taken before an update mutates the task in place. */
-export function cccPlanningCustodySnapshot(task: Pick<Task, "paused" | "userPaused" | "lineageId" | "column" | "deletedAt">): CccPlanningCustodySnapshot {
-  return {
-    paused: task.paused === true,
-    userPaused: task.userPaused === true,
-    lineageId: task.lineageId ?? null,
-    column: task.column,
-    deletedAt: task.deletedAt ?? null,
-  };
-}
-
-/** Throws when the mutated task no longer has the custody fields it had before the update. */
-export function assertCccPlanningCustodyPreserved(
-  taskId: string,
-  before: CccPlanningCustodySnapshot,
-  after: Pick<Task, "paused" | "userPaused" | "lineageId" | "column" | "deletedAt">,
-): void {
-  const next = cccPlanningCustodySnapshot(after);
-  if (
-    next.paused !== before.paused
-    || next.userPaused !== before.userPaused
-    || next.lineageId !== before.lineageId
-    || next.column !== before.column
-    || next.deletedAt !== before.deletedAt
-  ) {
-    throw new CccPlanningTaskCustodyError(taskId, "update");
-  }
-}
-
 /**
  * The update inputs that release or move a held task before any field is written, mirroring `updateTaskUnlocked`:
  * `paused` other than true clears the hold; reassigning the agent that paused the task auto-unpauses it; a new
  * dependency on a `todo` task moves it to triage. Returns the refused operation, or null.
+ *
+ * These are the only three places `updateTaskUnlocked` changes a custody field, so this pre-check is complete for
+ * that writer; the snapshot-writer backstop (`assertCccPlanningSnapshotWritePreservesCustody`) catches any future
+ * change at the write itself.
  */
 export function cccPlanningCustodyReleasingUpdate(
   task: Pick<Task, "paused" | "pausedByAgentId" | "assignedAgentId" | "column" | "dependencies">,
@@ -215,4 +191,29 @@ export async function assertCccPlanningTaskColumnsPreserveCustody(
       throw new CccPlanningTaskCustodyError(taskId, "update-columns");
     }
   }
+}
+
+/**
+ * FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 2):
+ * Backstop for the two snapshot write primitives (`atomicWriteTaskJson` and `atomicWriteTaskJsonWithAudit`), run
+ * inside their write transaction on the row they already read and the changed-column set they already computed.
+ * Every generic store writer that persists a task snapshot ends here (dependency edits, done and unarchive moves,
+ * pause flows), so a held planning task cannot have a custody column changed by any of them.
+ *
+ * The two pure checks come first, so an ordinary task (no K1 marker on its row) and a non-custody write on a held
+ * task pay no extra query; only a marked row whose custody column changes looks up the anchor, through the same
+ * transaction. A later card that must change a held task's custody columns does so through a dedicated custody
+ * operation, never through these store writers.
+ */
+export async function assertCccPlanningSnapshotWritePreservesCustody(
+  tx: CustodyQueryHandle,
+  layerProjectId: string | undefined,
+  taskId: string,
+  existingRow: Readonly<{ lineageId: string | null; paused: number | null; userPaused: number | null }>,
+  changedColumns: ReadonlySet<string>,
+): Promise<void> {
+  if (!isCccPlanningCustodyTask(rowMarkerView(taskId, existingRow))) return;
+  if (!CCC_PLANNING_CUSTODY_TASK_COLUMNS.some((column) => changedColumns.has(column))) return;
+  if (!await anchorExists(tx, taskId, boundProject({ projectId: layerProjectId }))) return;
+  throw new CccPlanningTaskCustodyError(taskId, "update-columns");
 }

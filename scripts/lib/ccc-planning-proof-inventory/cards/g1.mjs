@@ -5,6 +5,8 @@ Proof inventory for request-to-code v3 card G1 (store-level planning-task guards
 TARGETED is file-closed over the card's three check files, one command per package because each runs under its own package filter: the core PostgreSQL file (needs PostgreSQL, `vitest.pg.config.ts`), the engine file (pinned to `engine-default`, whose aliases point @fusion/core at source, so no build runs) and the dashboard file (`dashboard-api-quality-backfill`, the project the card's DASH check names). OFFLINE is name-closed over the same files: the names below are exactly their tests, built the way `assertionName` in `scripts/run-ccc-pg-proof.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly. The field is `needsPostgres` (errata E1-1).
 
 Measured on the M5 Max under a load average near 17 (parallel agents): core 8.5 s wall (8 tests), engine 6.5 s (5 tests), dashboard 11.3 s (5 tests), each including transform and import. The command timeouts are hang bounds over those measurements; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProof 2026-10-14-17:19 (errata E5-G1, repair 1): the core file grows from 8 to 15 names (PostgreSQL delete and archive leaves, the snapshot-writer backstop, and coverage of the marker half and of the in-lock move guard). Re-measured under a load average near 10: core about 6 s vitest duration for 15 tests, well inside the unchanged 180 s hang bound.
 */
 
 const CORE_FILE = "src/__tests__/postgres/ccc-planning-task-guard.pg.test.ts";
@@ -68,6 +70,13 @@ export const OFFLINE = Object.freeze([
       `${CORE} > a direct updateTaskColumns write of paused is refused for a held planning task; the twin's write lands`,
       `${CORE} > archiveTask refuses a held planning task; the twin archives`,
       `${CORE} > deleteTask refuses a held planning task; the twin deletes`,
+      `${CORE} > deleteTaskIf refuses a held planning task before its predicate runs and leaves the row unchanged; the twin is soft-deleted`,
+      `${CORE} > direct deleteTaskBackend and archiveTaskBackend calls refuse a held planning task; the twin is deleted and another twin archived`,
+      `${CORE} > updateTaskDependencies adding a dependency to a held todo planning task is refused and the row is unchanged; the twin moves to triage`,
+      `${CORE} > a direct snapshot write that changes any custody column of a held planning task is refused by both snapshot writers; a summary write lands and the twin's column write lands`,
+      `${CORE} > an anchored task whose marker is cleared is not held: pauseTask(false), moveTask and deleteTaskIf go through`,
+      `${CORE} > the snapshot backstop queries nothing for an unmarked row or a non-custody change, and looks up the anchor only for a custody change on a marked row`,
+      `${CORE} > moveTaskIf and handoffToReview refuse a held planning task under the task lock; the twins move and hand off`,
     ]),
   }),
   Object.freeze({

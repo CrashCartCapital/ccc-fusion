@@ -20,6 +20,8 @@ import * as schema from "../../postgres/schema/index.js";
 import { cccPlanningRuns, type CccPlanningRunInsert } from "../../postgres/schema/ccc-planning.js";
 import { CccPlanningTaskCustodyError } from "../../ccc-planning/errors.js";
 import { updateTaskColumns } from "../../task-store/async-persistence.js";
+import { assertCccPlanningSnapshotWritePreservesCustody } from "../../task-store/ccc-planning-custody.js";
+import type { Task } from "../../types.js";
 
 const NOW = "2026-10-14T12:00:00.000Z";
 const FAR = "2999-01-01T00:00:00.000Z";
@@ -64,6 +66,8 @@ function anchorValues(projectId: string, runId: string, planningTaskId: string):
   };
 }
 
+type SeedColumn = "triage" | "todo" | "in-progress";
+
 type CustodyRow = {
   column: string;
   paused: number | null;
@@ -101,7 +105,7 @@ pgDescribe("ccc planning task custody guards (PostgreSQL)", () => {
   }
 
   /** One task in the held shape: the K1 marker, an explicit `user_paused = 0`, and the held status. */
-  async function seedMarkedTask(id: string, column: "triage" | "todo"): Promise<string> {
+  async function seedMarkedTask(id: string, column: SeedColumn): Promise<string> {
     const store = h.store();
     const runId = nextRunId();
     await store.createTaskWithReservedId(
@@ -120,7 +124,7 @@ pgDescribe("ccc planning task custody guards (PostgreSQL)", () => {
   /** The held planning task (marker plus anchor) and its twin (the same marker, no anchor). */
   async function seedPair(
     label: string,
-    column: "triage" | "todo" = "triage",
+    column: SeedColumn = "triage",
   ): Promise<{ held: string; twin: string }> {
     const held = `FN-G1-${label}-HELD`;
     const twin = `FN-G1-${label}-TWIN`;
@@ -252,5 +256,161 @@ pgDescribe("ccc planning task custody guards (PostgreSQL)", () => {
 
     await h.store().deleteTask(twin);
     expect((await readRow(twin)).deletedAt).not.toBeNull();
+  });
+
+  /*
+  FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 1):
+  On PostgreSQL, `TaskStore.deleteTaskIf` dispatches straight to `deleteTaskIfBackendImpl` and never enters `deleteTaskIfImpl`, so the custody check must live on the backend leaves. The predicate spy proves the check runs before the predicate, which a guard only inside `deleteTaskBackendImpl` would not.
+  */
+  it("deleteTaskIf refuses a held planning task before its predicate runs and leaves the row unchanged; the twin is soft-deleted", async () => {
+    const { held, twin } = await seedPair("DELETEIF");
+    const before = await readRow(held);
+    let predicateCalls = 0;
+    const predicate = (): boolean => {
+      predicateCalls += 1;
+      return true;
+    };
+
+    await expectCustodyRefusal(h.store().deleteTaskIf(held, predicate), held, "delete");
+    expect(predicateCalls).toBe(0);
+    expect(await readRow(held)).toEqual(before);
+
+    const result = await h.store().deleteTaskIf(twin, predicate);
+    expect(result.deleted).toBe(true);
+    expect(predicateCalls).toBe(1);
+    expect((await readRow(twin)).deletedAt).not.toBeNull();
+  });
+
+  it("direct deleteTaskBackend and archiveTaskBackend calls refuse a held planning task; the twin is deleted and another twin archived", async () => {
+    const { held, twin } = await seedPair("BACKEND");
+    const archiveTwin = "FN-G1-BACKEND-ARCHIVE-TWIN";
+    await seedMarkedTask(archiveTwin, "triage");
+    const before = await readRow(held);
+
+    await expectCustodyRefusal(h.store().deleteTaskBackend(held), held, "delete");
+    expect(await readRow(held)).toEqual(before);
+    await expectCustodyRefusal(h.store().archiveTaskBackend(held, { cleanup: false }), held, "archive");
+    expect(await readRow(held)).toEqual(before);
+
+    await h.store().deleteTaskBackend(twin);
+    expect((await readRow(twin)).deletedAt).not.toBeNull();
+    const archived = await h.store().archiveTaskBackend(archiveTwin, { cleanup: false });
+    expect(archived.column).toBe("archived");
+  });
+
+  /*
+  FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 2):
+  `updateTaskDependencies` writes its todo-to-triage move through the snapshot writer `atomicWriteTaskJsonWithAudit`, never through `updateTaskUnlocked` or `updateTaskColumns`. The backstop inside both snapshot write primitives refuses it inside the write transaction, so the dependency, the log line and the audit row all roll back.
+  */
+  it("updateTaskDependencies adding a dependency to a held todo planning task is refused and the row is unchanged; the twin moves to triage", async () => {
+    const { held, twin } = await seedPair("DEPS", "todo");
+    const dependency = "FN-G1-DEPS-DEP";
+    await h.store().createTaskWithReservedId(
+      { description: "dependency", column: "todo" },
+      { taskId: dependency, createdAt: NOW, updatedAt: NOW, applyDefaultWorkflowSteps: false },
+    );
+    const before = await readRow(held);
+
+    await expectCustodyRefusal(
+      h.store().updateTaskDependencies(held, { operation: "add", dependency }),
+      held,
+      "update-columns",
+    );
+    expect(await readRow(held)).toEqual(before);
+    expect((await h.store().getTask(held)).dependencies ?? []).toEqual([]);
+
+    await h.store().updateTaskDependencies(twin, { operation: "add", dependency });
+    expect(await readRow(twin)).toMatchObject({ column: "triage", status: null });
+  });
+
+  it("a direct snapshot write that changes any custody column of a held planning task is refused by both snapshot writers; a summary write lands and the twin's column write lands", async () => {
+    const { held, twin } = await seedPair("SNAPSHOT");
+    const store = h.store();
+    const before = await readRow(held);
+    const releases: ReadonlyArray<Partial<Task>> = [
+      { column: "todo" },
+      { paused: false },
+      { userPaused: true },
+      { lineageId: "lineage-g1-released" },
+      { deletedAt: NOW },
+    ];
+
+    for (const release of releases) {
+      const task = await store.getTask(held);
+      await expectCustodyRefusal(store.atomicWriteTaskJson(store.taskDir(held), { ...task, ...release }), held, "update-columns");
+      expect(await readRow(held)).toEqual(before);
+      await expectCustodyRefusal(
+        store.atomicWriteTaskJsonWithAudit(store.taskDir(held), { ...task, ...release }),
+        held,
+        "update-columns",
+      );
+      expect(await readRow(held)).toEqual(before);
+    }
+
+    const current = await store.getTask(held);
+    await store.atomicWriteTaskJson(store.taskDir(held), { ...current, summary: "snapshot summary" });
+    expect(await readRow(held)).toEqual({ ...before, summary: "snapshot summary" });
+    await store.atomicWriteTaskJsonWithAudit(store.taskDir(held), { ...current, summary: "audited summary" });
+    expect(await readRow(held)).toEqual({ ...before, summary: "audited summary" });
+
+    const twinTask = await store.getTask(twin);
+    await store.atomicWriteTaskJson(store.taskDir(twin), { ...twinTask, column: "todo" });
+    expect((await readRow(twin)).column).toBe("todo");
+    await store.atomicWriteTaskJsonWithAudit(store.taskDir(twin), { ...twinTask, column: "todo", userPaused: true });
+    expect((await readRow(twin)).userPaused).toBe(1);
+  });
+
+  /*
+  FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 3):
+  Coverage of the guards round 1 already had. An anchored task whose K1 marker is cleared is not held, which proves the marker half of the custody predicate matters; moveTaskIf and handoffToReview reach only the in-lock guard in moveTaskInternal.
+  */
+  it("an anchored task whose marker is cleared is not held: pauseTask(false), moveTask and deleteTaskIf go through", async () => {
+    const { held } = await seedPair("CLEARED");
+    await h.adminDb().update(schema.project.tasks).set({ userPaused: 1 }).where(eq(schema.project.tasks.id, held));
+    h.store().taskCache.delete(held);
+    const anchors = await h.adminDb().select({ runId: cccPlanningRuns.runId }).from(cccPlanningRuns).where(eq(cccPlanningRuns.planningTaskId, held));
+    expect(anchors).toHaveLength(1);
+
+    await h.store().pauseTask(held, false);
+    expect(await readRow(held)).toMatchObject({ paused: 0, userPaused: 0 });
+    await h.store().moveTask(held, "todo");
+    expect((await readRow(held)).column).toBe("todo");
+    const result = await h.store().deleteTaskIf(held, () => true);
+    expect(result.deleted).toBe(true);
+    expect((await readRow(held)).deletedAt).not.toBeNull();
+  });
+
+  it("the snapshot backstop queries nothing for an unmarked row or a non-custody change, and looks up the anchor only for a custody change on a marked row", async () => {
+    const noQuery = {
+      select: () => {
+        throw new Error("unexpected anchor query");
+      },
+    } as unknown as Parameters<typeof assertCccPlanningSnapshotWritePreservesCustody>[0];
+    const marked = { lineageId: nextRunId(), paused: 1, userPaused: 0 };
+    const ordinary = { lineageId: "lineage-g1-ordinary", paused: 1, userPaused: 0 };
+
+    await expect(assertCccPlanningSnapshotWritePreservesCustody(noQuery, undefined, "FN-G1-PURE", ordinary, new Set(["column", "paused"]))).resolves.toBeUndefined();
+    await expect(assertCccPlanningSnapshotWritePreservesCustody(noQuery, undefined, "FN-G1-PURE", { ...marked, userPaused: 1 }, new Set(["column"]))).resolves.toBeUndefined();
+    await expect(assertCccPlanningSnapshotWritePreservesCustody(noQuery, undefined, "FN-G1-PURE", marked, new Set(["summary", "log"]))).resolves.toBeUndefined();
+    await expect(assertCccPlanningSnapshotWritePreservesCustody(noQuery, undefined, "FN-G1-PURE", marked, new Set(["column"]))).rejects.toThrow("unexpected anchor query");
+  });
+
+  it("moveTaskIf and handoffToReview refuse a held planning task under the task lock; the twins move and hand off", async () => {
+    const { held, twin } = await seedPair("MOVEIF");
+    const handoff = await seedPair("HANDOFF", "in-progress");
+    const beforeMove = await readRow(held);
+    const beforeHandoff = await readRow(handoff.held);
+    const evidence = { reason: "fn_task_done", runId: "run-g1", agentId: "agent-g1" };
+
+    await expectCustodyRefusal(h.store().moveTaskIf(held, "todo", () => true), held, "move");
+    expect(await readRow(held)).toEqual(beforeMove);
+    await expectCustodyRefusal(h.store().handoffToReview(handoff.held, { ownerAgentId: "agent-g1", evidence }), handoff.held, "move");
+    expect(await readRow(handoff.held)).toEqual(beforeHandoff);
+
+    const moved = await h.store().moveTaskIf(twin, "todo", () => true);
+    expect(moved.moved).toBe(true);
+    expect((await readRow(twin)).column).toBe("todo");
+    await h.store().handoffToReview(handoff.twin, { ownerAgentId: "agent-g1", evidence });
+    expect((await readRow(handoff.twin)).column).toBe("in-review");
   });
 });

@@ -24,6 +24,7 @@ import {findLiveLineageChildren as findLiveLineageChildrenAsync, projectPartitio
 import {archiveParentTaskWithLineageGate, findArchivedTaskEntry, deleteArchivedTaskEntry, restoreTaskFromArchive} from "../task-store/async-archive-lineage.js";
 import {getArchivedRowCount, listArchivedTaskEntriesPage} from "../async-archive-db.js";
 import {disposeArchivedWorkspaceWorktrees, disposeArchivedWorktree, prepareArchivedWorkspaceWorktrees, releasePreparedWorkspaceArchiveDisposal} from "./archive-lifecycle.js";
+import {assertCccPlanningTaskIdNotHeld} from "./ccc-planning-custody.js";
 
 export async function taskToArchiveEntryImpl(store: TaskStore, task: Task, archivedAt: string): Promise<ArchivedTaskEntry> {
     const settings = await store.getSettingsFast();
@@ -111,6 +112,11 @@ export async function deleteTaskBackendImpl(store: TaskStore, id: string, option
   if (options?.auditContext?.taskId === id) {
     throw new TaskSelfDeleteError(id);
   }
+  /*
+  FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 1):
+  On PostgreSQL every soft delete ends in this function: deleteTask dispatches here, deleteTaskIf reaches it from deleteTaskIfBackendImpl under the task lock, and direct deleteTaskBackend callers call it as is. A held request-to-code planning task (K1 marker plus anchor row) is refused here before the row read, the lineage gate and the soft delete, so no delete path can orphan its anchor, artifacts and work item.
+  */
+  await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "delete");
     const layer = store.asyncLayer!;
     // Read the task row (forensic: include soft-deleted).
     const pgRow = await readTaskRowAsync(layer, id, { includeDeleted: true });
@@ -189,6 +195,8 @@ export async function deleteTaskIfBackendImpl(
 ): Promise<{ task: Task; deleted: boolean }> {
   if (options?.auditContext?.taskId === id) throw new TaskSelfDeleteError(id);
   return store.withTaskLock(id, async () => {
+    // FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 1): a held planning task is refused under the task lock before the caller's predicate runs, so the predicate never observes or acts on it.
+    await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "delete");
     const layer = store.asyncLayer!;
     const row = await readTaskRowAsync(layer, id, { includeDeleted: true });
     if (!row) throw new Error(`Task ${id} not found`);
@@ -216,6 +224,8 @@ export async function deleteTaskIfBackendImpl(
 }
 
 export async function archiveTaskBackendImpl(store: TaskStore, id: string, optionsOrCleanup: boolean | { cleanup?: boolean; removeLineageReferences?: boolean },): Promise<Task> {
+    // FNXC:CccPlanningCustody 2026-10-14-17:19 (errata E5-G1 item 1): direct archiveTaskBackend callers skip archiveTaskImpl, so the PostgreSQL archive leaf refuses a held planning task itself, before the read, the archive snapshot and the workspace cleanup.
+    await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "archive");
     const layer = store.asyncLayer!;
     const cleanup = typeof optionsOrCleanup === "boolean" ? optionsOrCleanup : optionsOrCleanup.cleanup !== false;
     const removeLineageRefs = typeof optionsOrCleanup === "object" && optionsOrCleanup.removeLineageReferences === true;

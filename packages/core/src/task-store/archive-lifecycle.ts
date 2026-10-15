@@ -346,8 +346,6 @@ export async function deleteTaskIfImpl(
   options?: { removeDependencyReferences?: boolean; removeLineageReferences?: boolean; allowResurrection?: boolean; githubIssueAction?: GithubIssueAction; auditContext?: { agentId: string; runId: string; sessionId?: string; taskId?: string } },
 ): Promise<DeleteTaskIfResult> {
   if (options?.auditContext?.taskId === id) throw new TaskSelfDeleteError(id);
-  // FNXC:CccPlanningCustody 2026-10-14-13:41: conditional deletion refuses a held planning task like deleteTask, before the predicate runs.
-  await assertCccPlanningTaskIdNotHeld(store.asyncLayer, id, "delete");
   if (store.backendMode) return store.deleteTaskIf(id, predicate, options);
   const result = await store.withTaskLock(id, async () => {
     store.flushAgentLogBuffer();
