@@ -1,3 +1,4 @@
+// port-4040-allowlist: this module refuses port 4040 (FORBIDDEN_PORT) and never binds or kills it; every mention is that refusal or its documentation.
 /*
 FNXC:CccPlanningServeLane 2026-10-14-19:00:
 Serve lane for the planning proof (card IP, CONTRACT-v3.3 section 4.2 step 5a, D26, ADR D Q2 decision 4). It launches the installed `fn serve` under a dedicated Pueue group and proves, from the serve log and the kernel, that exactly one serve bound exactly one loopback port that is not 4040:

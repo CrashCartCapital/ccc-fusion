@@ -2689,3 +2689,6 @@ export * from "./ccc-planning/index.js";
 // import one definition through @fusion/core instead of reaching into core's task-store files.
 export * from "./task-store/ccc-planning-artifact-ops.js";
 export * from "./task-store/ccc-planning-ops.js";
+// FNXC:CccPlanning 2026-10-14-22:25 (INT-3a, D34 parent barrel): card AD1's one-transaction run admission, for the
+// engine and CLI callers (G0, CL1 deps, CL2); core modules keep importing it relatively (errata E10 B-1).
+export * from "./task-store/ccc-planning-admission-ops.js";

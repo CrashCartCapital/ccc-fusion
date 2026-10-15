@@ -57,3 +57,27 @@ export {
   renderCccPrdOperatorContextMarkdown,
 } from "./operator-context.js";
 export type { CccPrdOperatorContext } from "./operator-context.js";
+// FNXC:CccPlanning 2026-10-14-22:25 (INT-3a, D34 parent barrel): card B3 moved the `fn prd import` packet and
+// target preflight into one engine module that the planning import bridge shares; the CLI reads it through this barrel.
+export {
+  CCC_PRD_PRODUCT_PREVIEW_SCHEMA,
+  CccPrdProductPreflightError,
+  assertCccPrdProductBundleComplete,
+  assertCccPrdProductRequestBudgetFloor,
+  cccPrdProductRequestBudget,
+  compileCccPrdProductBundle,
+  computeCccPrdProductConfirmationDigest,
+  createCccPrdProductPreviewIdentity,
+  preflightCccPrdProductPacket,
+  preflightCccPrdProductTarget,
+} from "./product-import-preflight.js";
+export type {
+  CccPrdProductCompileRefusal,
+  CccPrdProductExecutionPlanReader,
+  CccPrdProductImportPreflightDependencies,
+  CccPrdProductPacketPreflight,
+  CccPrdProductPacketPreflightInput,
+  CccPrdProductPreviewIdentity,
+  CccPrdProductRequestBudget,
+  CccPrdProductTargetPreflight,
+} from "./product-import-preflight.js";
