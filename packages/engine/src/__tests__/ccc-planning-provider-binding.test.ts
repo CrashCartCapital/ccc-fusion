@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   CCC_PLANNING_DENIED_NAMES,
   CCC_PLANNING_LINKED_WRITER_TOOLSET,
+  CCC_PLANNING_PROBE_TOOL,
   CCC_PLANNING_TOOLSETS,
   CccProviderAttemptIdentityError,
   type CccCampaignProviderDispatchInput,
@@ -12,11 +13,15 @@ import {
 } from "@fusion/core";
 import { CCC_PROVIDER_ATTEMPT_ROUTE_MARKER, createFnAgent } from "../pi.js";
 import { createCccPlanningProviderAttemptBinding } from "../ccc-planning/provider-binding.js";
-import type { CccSessionToolPolicy } from "../agent-runtime.js";
+import type { CccConfinement, CccProviderPinCheck, CccSessionToolPolicy } from "../agent-runtime.js";
 
 /*
 FNXC:CccPlanningProviderSeam 2026-10-14-14:30:
 Card P1 proof for binding a planning session to one exact route (CONTRACT-v3 section 2.12, D48). The binding factory refuses any dispatch whose provider, model or transport differs from the planning route binding, and records that route on the frozen controller under a symbol key. Session creation refuses a planning binding whose provider is not the session's default provider, because Pi selects the Fusion receipt adapter only for the default provider and any other provider would stream through unpatched pi-ai. It also refuses a planning binding without a tool policy, the receipt adapter, a stream guard, a provider pin check or a confinement. Each refusal has a positive control on the same fixture.
+*/
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-17:22:
+Repair 1 (errata E5-P1). D48 fails closed for linked writers too: a planning-linked-writer binding without the bound-route marker, or with a bound provider that is not the default provider, is refused at session creation (item 3; card BF attaches the marker). When the tool policy allows bash the confinement must carry a confined bash with exec and dispose, and the confined file operations are shape-checked (items 8 and 12). The tool policy must match the binding: allowed tools equal K1's cccPlanningSessionToolNames, denied names include CCC_PLANNING_DENIED_NAMES, and the toolset digest and role class equal the route binding's (item 9). The bound-route marker therefore carries the route binding's role class and toolset digest, and the fixtures pair matching digests.
 */
 
 vi.mock("../skill-resolver.js", () => ({
@@ -121,10 +126,11 @@ const ROUTE: CccPlanningRouteBinding = Object.freeze({
   bindingHash: "5".repeat(64),
 });
 
+/** The critic policy carries the route binding's own toolset digest (E5-P1 item 9). */
 const CRITIC_POLICY: CccSessionToolPolicy = Object.freeze({
   policyId: "ccc-critic-tools.v1",
   allowedTools: CCC_PLANNING_TOOLSETS.critic,
-  toolsetDigest: "6".repeat(64),
+  toolsetDigest: ROUTE.toolsetDigest,
   readRoots: Object.freeze(["/test/project"]),
   writeRoots: Object.freeze([]),
   deniedNames: Object.freeze([...CCC_PLANNING_DENIED_NAMES]),
@@ -139,7 +145,18 @@ const LINKED_WRITER_POLICY: CccSessionToolPolicy = Object.freeze({
   deniedNames: Object.freeze([...CCC_PLANNING_DENIED_NAMES]),
 });
 
-const FS_OPERATIONS = Object.freeze({ read: {}, write: {}, edit: {}, ls: {}, find: {} });
+/** The confined file operations, shaped as Pi 0.81.1's seams; nothing here touches a file. */
+const FS_OPERATIONS: CccConfinement["fs"] = Object.freeze({
+  read: Object.freeze({ readFile: async () => Buffer.alloc(0), access: async () => undefined }),
+  write: Object.freeze({ writeFile: async () => undefined, mkdir: async () => undefined }),
+  edit: Object.freeze({ readFile: async () => Buffer.alloc(0), writeFile: async () => undefined, access: async () => undefined }),
+  ls: Object.freeze({ exists: () => true, stat: () => ({ isDirectory: () => true }), readdir: () => [] }),
+  find: Object.freeze({ exists: () => true, glob: () => [] }),
+});
+const CONFINED_BASH: NonNullable<CccConfinement["bash"]> = Object.freeze({
+  exec: async () => ({ exitCode: 0 }),
+  dispose: async () => Object.freeze({ closure: "confirmed" as const }),
+});
 const STREAM_GUARD = Object.freeze({
   observeDelta: () => ({ degenerate: false as const }),
   observeMessage: () => ({ degenerate: false as const }),
@@ -173,14 +190,47 @@ function innerController() {
   };
 }
 
-function planningBinding(inner = innerController(), toolPolicy: CccSessionToolPolicy = CRITIC_POLICY) {
+function planningBinding(
+  inner = innerController(),
+  toolPolicy: CccSessionToolPolicy = CRITIC_POLICY,
+  route: CccPlanningRouteBinding = ROUTE,
+) {
   return createCccPlanningProviderAttemptBinding({
-    controller: Object.freeze({ preDispatch: inner.preDispatch, reconcile: inner.reconcile }) as any,
-    binding: ROUTE,
+    controller: Object.freeze({ preDispatch: inner.preDispatch, reconcile: inner.reconcile }),
+    binding: route,
     turnKey: TURN_KEY,
     toolPolicy,
   });
 }
+
+type BoundRouteMarker = Readonly<{ providerId: string; modelId: string; transport: string; roleClass: string; toolsetDigest: string }>;
+
+const LINKED_WRITER_ROUTE: BoundRouteMarker = Object.freeze({
+  providerId: M3_KEY,
+  modelId: "minimax/MiniMax-M3",
+  transport: "pi",
+  roleClass: "writer",
+  toolsetDigest: LINKED_WRITER_POLICY.toolsetDigest,
+});
+
+/** A planning-linked writer binding as card BF builds it: the linked writer policy, plus the bound-route marker unless `route` is null. */
+function linkedWriterBinding(route: BoundRouteMarker | null = LINKED_WRITER_ROUTE, toolPolicy: CccSessionToolPolicy = LINKED_WRITER_POLICY) {
+  const inner = innerController();
+  return Object.freeze({
+    turnKey: TURN_KEY,
+    controller: Object.freeze({
+      preDispatch: inner.preDispatch,
+      reconcile: inner.reconcile,
+      ...(route === null ? {} : { [CCC_PROVIDER_ATTEMPT_ROUTE_MARKER]: route }),
+    }),
+    receiptAdapterId: ADAPTER,
+    scopeKind: "planning-linked-writer" as const,
+    toolPolicy,
+  });
+}
+
+/** A frozen copy of the critic policy with some fields replaced. */
+const criticPolicyWith = (fields: Record<string, unknown>) => Object.freeze({ ...CRITIC_POLICY, ...fields });
 
 const MATCHING_DISPATCH: CccCampaignProviderDispatchInput = Object.freeze({
   turnKey: TURN_KEY,
@@ -229,21 +279,23 @@ describe("createCccPlanningProviderAttemptBinding binds one exact route", () => 
     expect(binding).toMatchObject({ turnKey: TURN_KEY, receiptAdapterId: ADAPTER, scopeKind: "planning", toolPolicy: CRITIC_POLICY });
     expect(Object.isFrozen(binding.controller)).toBe(true);
     expect(Object.keys(binding.controller).sort()).toEqual(["preDispatch", "reconcile"]);
-    expect((binding.controller as any)[CCC_PROVIDER_ATTEMPT_ROUTE_MARKER]).toEqual({
+    expect((binding.controller as unknown as Record<symbol, unknown>)[CCC_PROVIDER_ATTEMPT_ROUTE_MARKER]).toEqual({
       providerId: M3_KEY,
       modelId: "minimax/MiniMax-M3",
       transport: "pi",
+      roleClass: "critic",
+      toolsetDigest: ROUTE.toolsetDigest,
     });
   });
 });
 
 describe("planning session creation enforces the bound route and the planning seams (D48)", () => {
-  let pinCheck: ReturnType<typeof vi.fn>;
+  let pinCheck: Mock<CccProviderPinCheck>;
 
   beforeEach(() => {
     vi.mocked(ModelRuntime.create).mockReset();
     vi.mocked(ModelRegistry).mockClear();
-    pinCheck = vi.fn();
+    pinCheck = vi.fn<CccProviderPinCheck>();
   });
 
   function prepareSession(model: Readonly<{ provider: string; id: string }>) {
@@ -370,18 +422,7 @@ describe("planning session creation enforces the bound route and the planning se
     { label: "a missing confinement", overrides: () => ({ cccConfinement: undefined }), message: /cccConfinement/ },
     {
       label: "a linked writer whose policy allows bash without a confined bash",
-      overrides: () => {
-        const factory = planningBinding();
-        return {
-          cccProviderAttemptBinding: Object.freeze({
-            turnKey: TURN_KEY,
-            controller: factory.controller,
-            receiptAdapterId: ADAPTER,
-            scopeKind: "planning-linked-writer",
-            toolPolicy: LINKED_WRITER_POLICY,
-          }),
-        };
-      },
+      overrides: () => ({ cccProviderAttemptBinding: linkedWriterBinding() }),
       message: /bash/,
     },
     {
@@ -394,6 +435,106 @@ describe("planning session creation enforces the bound route and the planning se
       overrides: () => ({ cccProviderAttemptBinding: Object.freeze({ ...planningBinding(), toolPolicy: { ...CRITIC_POLICY } }) }),
       message: /toolPolicy/,
     },
+    // E5-P1 item 3: D48 fails closed for linked writers.
+    {
+      label: "a planning-linked-writer binding whose controller carries no bound route",
+      overrides: () => ({ cccProviderAttemptBinding: linkedWriterBinding(null), cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }) }),
+      message: /no bound route.*CCC_PROVIDER_ATTEMPT_ROUTE_MARKER/,
+    },
+    {
+      label: "a planning-linked-writer binding whose bound provider is not the session's default provider",
+      overrides: () => ({
+        cccProviderAttemptBinding: linkedWriterBinding(Object.freeze({ ...LINKED_WRITER_ROUTE, providerId: GLM_KEY, modelId: "glm/glm-5.3" })),
+        cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }),
+      }),
+      message: /provider omniroute-glm-pinned.*default provider omniroute-minimax-m3-pinned/,
+    },
+    // E5-P1 items 8 and 12: the confinement's runtime shape.
+    {
+      label: "an empty confinement object under a policy that allows bash",
+      overrides: () => ({ cccProviderAttemptBinding: linkedWriterBinding(), cccConfinement: Object.freeze({}) }),
+      message: /cccConfinement\.fs/,
+    },
+    {
+      label: "a confinement with no bash key under a policy that allows bash",
+      overrides: () => ({ cccProviderAttemptBinding: linkedWriterBinding(), cccConfinement: Object.freeze({ fs: FS_OPERATIONS }) }),
+      message: /cccConfinement\.bash/,
+    },
+    {
+      label: "a confined bash with no exec function",
+      overrides: () => ({
+        cccProviderAttemptBinding: linkedWriterBinding(),
+        cccConfinement: Object.freeze({ bash: Object.freeze({ dispose: CONFINED_BASH.dispose }), fs: FS_OPERATIONS }),
+      }),
+      message: /cccConfinement\.bash/,
+    },
+    {
+      label: "a confined bash with no dispose function",
+      overrides: () => ({
+        cccProviderAttemptBinding: linkedWriterBinding(),
+        cccConfinement: Object.freeze({ bash: Object.freeze({ exec: CONFINED_BASH.exec }), fs: FS_OPERATIONS }),
+      }),
+      message: /cccConfinement\.bash/,
+    },
+    {
+      label: "confined file operations whose find has no glob",
+      overrides: () => ({
+        cccConfinement: Object.freeze({ bash: null, fs: Object.freeze({ ...FS_OPERATIONS, find: Object.freeze({ exists: () => true }) }) }),
+      }),
+      message: /cccConfinement\.fs\.find\.glob/,
+    },
+    {
+      label: "confined file operations with a missing operation set",
+      overrides: () => ({
+        cccConfinement: Object.freeze({ bash: null, fs: Object.freeze({ read: FS_OPERATIONS.read, write: FS_OPERATIONS.write }) }),
+      }),
+      message: /cccConfinement\.fs/,
+    },
+    // E5-P1 item 9: the tool policy matches the binding.
+    {
+      label: "a tool policy whose allowed tools are not the role class toolset",
+      overrides: () => ({ cccProviderAttemptBinding: planningBinding(undefined, criticPolicyWith({ allowedTools: CCC_PLANNING_TOOLSETS.author })) }),
+      message: /allowedTools/,
+    },
+    {
+      label: "a probe tool policy without the probe tool",
+      overrides: () => ({ cccProviderAttemptBinding: planningBinding(undefined, criticPolicyWith({ policyId: "ccc-critic-probe-tools.v1" })) }),
+      message: /allowedTools/,
+    },
+    {
+      label: "a tool policy whose denied names omit one of CCC_PLANNING_DENIED_NAMES",
+      overrides: () => ({
+        cccProviderAttemptBinding: planningBinding(undefined, criticPolicyWith({
+          deniedNames: Object.freeze(CCC_PLANNING_DENIED_NAMES.filter((name) => name !== ".envrc")),
+        })),
+      }),
+      message: /deniedNames/,
+    },
+    {
+      label: "a tool policy whose toolset digest is not the route binding's",
+      overrides: () => ({ cccProviderAttemptBinding: planningBinding(undefined, criticPolicyWith({ toolsetDigest: "6".repeat(64) })) }),
+      message: /toolsetDigest/,
+    },
+    {
+      label: "a tool policy whose role class is not the route binding's",
+      overrides: () => ({ cccProviderAttemptBinding: planningBinding(undefined, CRITIC_POLICY, Object.freeze({ ...ROUTE, roleClass: "author" as const })) }),
+      message: /role class/,
+    },
+    {
+      label: "a tool policy on a campaign-scope binding",
+      overrides: () => {
+        const factory = planningBinding();
+        return {
+          cccProviderAttemptBinding: Object.freeze({
+            turnKey: TURN_KEY,
+            controller: factory.controller,
+            receiptAdapterId: ADAPTER,
+            toolPolicy: CRITIC_POLICY,
+          }),
+        };
+      },
+      message: /toolPolicy is only for planning/,
+    },
   ];
 
   for (const { label, overrides, message } of SESSION_REFUSALS) it(`refuses ${label} at session creation`, async () => {
@@ -405,19 +546,31 @@ describe("planning session creation enforces the bound route and the planning se
 
   it("positive control: a linked writer with a confined bash and the linked writer policy creates its session", async () => {
     prepareSession({ provider: M3_KEY, id: "minimax/MiniMax-M3" });
-    const factory = planningBinding();
-    const linked = Object.freeze({
-      turnKey: TURN_KEY,
-      controller: factory.controller,
-      receiptAdapterId: ADAPTER,
-      scopeKind: "planning-linked-writer" as const,
-      toolPolicy: LINKED_WRITER_POLICY,
+
+    await expect(createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "planning provider binding",
+      defaultProvider: M3_KEY,
+      defaultModelId: "minimax/MiniMax-M3",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      cccProviderAttemptBinding: linkedWriterBinding(),
+      cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }),
+      cccStreamGuard: STREAM_GUARD,
+      cccProviderPinCheck: pinCheck,
+    })).resolves.toBeDefined();
+    expect(pinCheck).toHaveBeenCalledWith(PROVIDERS);
+  });
+
+  it("positive control: a probe tool policy with exactly the role toolset plus the probe tool creates its session", async () => {
+    prepareSession({ provider: M3_KEY, id: "minimax/MiniMax-M3" });
+    const probePolicy = criticPolicyWith({
+      policyId: "ccc-critic-probe-tools.v1",
+      allowedTools: Object.freeze([...CCC_PLANNING_TOOLSETS.critic, CCC_PLANNING_PROBE_TOOL].sort()),
     });
 
-    await expect(createFnAgent(sessionOptions({
-      cccProviderAttemptBinding: linked,
-      cccConfinement: Object.freeze({ bash: {}, fs: FS_OPERATIONS }),
-    }) as any)).resolves.toBeDefined();
-    expect(pinCheck).toHaveBeenCalledWith(PROVIDERS);
+    await expect(createFnAgent(sessionOptions({ cccProviderAttemptBinding: planningBinding(undefined, probePolicy) }) as any))
+      .resolves.toBeDefined();
+    expect(pinCheck).toHaveBeenCalledTimes(1);
   });
 });

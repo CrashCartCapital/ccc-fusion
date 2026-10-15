@@ -22,6 +22,20 @@ export type CccTerminalRouteSseCommentParser = {
   finish(): CccTerminalRouteReceiptObservation;
 };
 
+/*
+FNXC:CccRouteReceiptFailureMarker 2026-10-14-17:37:
+Errata E5-P1 item 4 (grant: an additive structural marker on error events). A planning session must tell a terminal-receipt failure from a lost connection, and both from the upstream's own error. The parser tags each terminal-receipt refusal with cccRouteFailure, and the adapter copies that tag, or cccTransportFailure: true for a terminated stream, socket reset, fetch failure or adapter timeout, onto the error event it emits. An upstream-reported error (an HTTP status or finish_reason error) and a caller abort carry neither field. The markers sit on the event only; the error message and the result message are unchanged.
+*/
+type CccTerminalRouteFailureKind =
+  | "receipt-missing"
+  | "receipt-conflicting"
+  | "receipt-incomplete"
+  | "receipt-not-terminal";
+
+function terminalRouteFailure(kind: CccTerminalRouteFailureKind, message: string): Error {
+  return Object.assign(new Error(message), { cccRouteFailure: kind });
+}
+
 function takeCompleteSseLines(value: string, final = false): {
   lines: string[];
   remainder: string;
@@ -87,16 +101,16 @@ export function createCccTerminalRouteSseCommentParser(): CccTerminalRouteSseCom
       const { lines } = takeCompleteSseLines(buffer, true);
       for (const line of lines) consumeLine(line);
       if (conflict) {
-        throw new Error("CCC SSE stream contains a conflicting terminal route receipt");
+        throw terminalRouteFailure("receipt-conflicting", "CCC SSE stream contains a conflicting terminal route receipt");
       }
       if (nonTerminalReceipt) {
-        throw new Error("CCC SSE stream route receipt is not terminal");
+        throw terminalRouteFailure("receipt-not-terminal", "CCC SSE stream route receipt is not terminal");
       }
       if (provider === undefined && model === undefined) {
-        throw new Error("CCC SSE stream terminal route receipt is missing");
+        throw terminalRouteFailure("receipt-missing", "CCC SSE stream terminal route receipt is missing");
       }
       if (!provider || !model) {
-        throw new Error("CCC SSE stream terminal route receipt is incomplete");
+        throw terminalRouteFailure("receipt-incomplete", "CCC SSE stream terminal route receipt is incomplete");
       }
       return Object.freeze({ provider, model });
     },
@@ -173,16 +187,26 @@ async function runCccTerminalRouteReceiptRequest(
       options.timeoutMs,
     );
   let responseBody: ReadableStream<Uint8Array> | undefined;
+  // Set when the connection itself failed: fetch rejected, the body read rejected, or the stream ended without [DONE].
+  const transport = { failed: false };
   if (options.signal?.aborted) forwardAbort();
   else options.signal?.addEventListener("abort", forwardAbort, { once: true });
   try {
     const payload = await createReceiptAdapterPayload(model, context, options);
-    const response = await fetch(`${model.baseUrl.replace(/\/+$/u, "")}/chat/completions`, {
-      method: "POST",
-      headers: createReceiptAdapterHeaders(model, options),
-      body: JSON.stringify(payload),
-      signal: requestController.signal,
-    });
+    const headers = createReceiptAdapterHeaders(model, options);
+    const body = JSON.stringify(payload);
+    let response: Response;
+    try {
+      response = await fetch(`${model.baseUrl.replace(/\/+$/u, "")}/chat/completions`, {
+        method: "POST",
+        headers,
+        body,
+        signal: requestController.signal,
+      });
+    } catch (fetchError) {
+      transport.failed = true;
+      throw fetchError;
+    }
     responseBody = response.body ?? undefined;
     await options.onResponse?.({
       status: response.status,
@@ -204,10 +228,13 @@ async function runCccTerminalRouteReceiptRequest(
       stream,
       output,
       model,
+      transport,
     );
     if (requestController.signal.aborted || options.signal?.aborted === true) {
       throw new Error("CCC terminal route receipt request was aborted");
     }
+    // A stream that ends without [DONE] was cut off, whatever its receipt says.
+    if (!completion.sawDone) transport.failed = true;
     const receipt = receiptParser.finish();
     (output as TransportOutput & { omniRoute?: CccTerminalRouteReceiptObservation }).omniRoute = receipt;
     if (!completion.sawDone) {
@@ -225,6 +252,17 @@ async function runCccTerminalRouteReceiptRequest(
     stream.push({ type: "done", reason: output.stopReason, message: output as never });
     stream.end();
   } catch (error) {
+    const callerAborted = options.signal?.aborted === true;
+    // Only the timeout aborts the request controller without a caller abort, so this is the adapter timeout.
+    const timedOut = requestController.signal.aborted && !callerAborted;
+    const routeFailure = (error as { cccRouteFailure?: unknown } | null)?.cccRouteFailure;
+    const marker = callerAborted
+      ? {}
+      : transport.failed || timedOut
+        ? { cccTransportFailure: true as const }
+        : typeof routeFailure === "string"
+          ? { cccRouteFailure: routeFailure }
+          : {};
     let abortReason = error;
     if (responseBody && !responseBody.locked) {
       try {
@@ -244,7 +282,7 @@ async function runCccTerminalRouteReceiptRequest(
     else output.stopReason = "error";
     for (const block of output.content) delete block.partialArgs;
     output.errorMessage = error instanceof Error ? error.message : String(error);
-    stream.push({ type: "error", reason: output.stopReason, error: output as never });
+    stream.push({ type: "error", reason: output.stopReason, error: output as never, ...marker } as never);
     stream.end();
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
@@ -331,6 +369,7 @@ async function consumeReceiptAdapterSse(
   stream: AssistantMessageEventStream,
   output: TransportOutput,
   model: Model<Api>,
+  transport: { failed: boolean },
 ): Promise<{ sawDone: boolean; sawFinishReason: boolean }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -523,7 +562,13 @@ async function consumeReceiptAdapterSse(
 
   try {
     while (true) {
-      const next = await reader.read();
+      let next: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        next = await reader.read();
+      } catch (readError) {
+        transport.failed = true;
+        throw readError;
+      }
       if (next.done) {
         break;
       }

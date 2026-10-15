@@ -17,6 +17,10 @@ import type { createCccPlanningProviderAttemptBinding } from "../ccc-planning/pr
 FNXC:CccPlanningProviderSeam 2026-10-14-14:40:
 Card P1 proof that the Pi seam types still carry the real campaign controller (CONTRACT-v3 section 2.12, verify-v2 item 51). K1 could only assign a structural copy of the engine controller to its view type, because core cannot import the engine; this test assigns the real controller returned by `createCccCampaignProviderAttemptBinding`, both to the engine's `CccProviderAttemptController<CccProviderAttemptScope>` and to K1's own `CccProviderAttemptControllerView<CccProviderAttemptScope>`. The engine's `typecheck` script excludes tests and vitest strips types, so the assertions only mean something when a compiler checks them: the test runs the TypeScript compiler once, with the engine's options and `@fusion/core` pointed at core source, over its own file and a few snippets, and asserts the exact diagnostics.
 */
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-17:22:
+Repair 1 (errata E5-P1). The planning binding the factory returns is passed to createFnAgent's options and to AgentRuntimeOptions with no cast, because both option properties are typed with the K1 view scope while the binding alias keeps its campaign default (item 5). The engine's view type names are re-exports of K1's, so the compiler resolves each one to its declaration in core (item 6). CccConfinement.bash is typed structurally with the dispose result X1c returns, without importing X1c (items 12, E6-0).
+*/
 
 // ------------------------------------------------------------ compile-time fixtures
 
@@ -76,7 +80,7 @@ function engineCompilerOptions(): ts.CompilerOptions {
 type Finding = Readonly<{ file: string; line: number; code: number; message: string }>;
 
 /** Type-checks the given files in one program (real paths, or virtual sources keyed by absolute path). */
-function typecheck(files: Readonly<Record<string, string | null>>): ReadonlyMap<string, readonly Finding[]> {
+function typecheck(files: Readonly<Record<string, string | null>>): Readonly<{ program: ts.Program; byFile: ReadonlyMap<string, readonly Finding[]> }> {
   const options = engineCompilerOptions();
   const host = ts.createCompilerHost(options);
   host.getCurrentDirectory = () => ENGINE_ROOT;
@@ -104,7 +108,7 @@ function typecheck(files: Readonly<Record<string, string | null>>): ReadonlyMap<
     }
     byFile.set(fileName, findings);
   }
-  return byFile;
+  return { program, byFile };
 }
 
 const K1_PROVIDER_CONTROLLER = join(CORE_SRC, "ccc-campaign", "provider-controller.js");
@@ -148,6 +152,54 @@ const WRONG_SCOPE = snippet("wrong_scope", [
   "  return view;",
 ].join("\n"));
 
+/** E5-P1 items 5 and 12: written without a cast, so any assignability error is a finding. */
+const PLANNING_OPTIONS: [string, string] = [join(TESTS_DIR, "__p1_seam_planning_options.ts"), [
+  'import type { BashOperations } from "@earendil-works/pi-coding-agent";',
+  'import type { CccProviderAttemptScope } from "@fusion/core";',
+  'import type { AgentOptions } from "../pi.js";',
+  'import type * as Engine from "../agent-runtime.js";',
+  'import type { createCccPlanningProviderAttemptBinding } from "../ccc-planning/provider-binding.js";',
+  "type Assert<T extends true> = T;",
+  "type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;",
+  "type FactoryBinding = ReturnType<typeof createCccPlanningProviderAttemptBinding>;",
+  "export function probe(binding: FactoryBinding): unknown {",
+  '  const fnAgentOptions: Pick<AgentOptions, "cccProviderAttemptBinding"> = { cccProviderAttemptBinding: binding };',
+  '  const runtimeOptions: Pick<Engine.AgentRuntimeOptions, "cccProviderAttemptBinding"> = { cccProviderAttemptBinding: binding };',
+  "  return [fnAgentOptions, runtimeOptions];",
+  "}",
+  "// The campaign alias keeps its campaign default, so campaign code reads campaign-typed scopes back.",
+  "export type CampaignDefault = Assert<Same<Engine.CccProviderAttemptBinding, Engine.CccProviderAttemptBinding<CccProviderAttemptScope>>>;",
+  "// E4-9 and E6-0: the structural dispose result, with no X1c import.",
+  'export type ConfinedBash = Assert<Same<Engine.CccConfinement["bash"], (BashOperations & { dispose(): Promise<Readonly<{ closure: "confirmed" | "unconfirmed" }>> }) | null>>;',
+  "",
+].join("\n")];
+
+/** The K1 view types the engine must take from core instead of redefining (E5-P1 item 6). */
+const K1_VIEW_TYPES = Object.freeze([
+  ["CccProviderAttemptRouteBindingView", join(CORE_SRC, "ccc-campaign", "types.ts")],
+  ["CccProviderAttemptScopeView", join(CORE_SRC, "ccc-campaign", "types.ts")],
+  ["CccProviderAttemptRefusalReason", join(CORE_SRC, "ccc-campaign", "types.ts")],
+  ["CccProviderAttemptSettlementInputOf", join(CORE_SRC, "ccc-campaign", "types.ts")],
+  ["CccProviderControllerDecisionView", join(CORE_SRC, "ccc-campaign", "provider-controller.ts")],
+  ["CccProviderAttemptControllerView", join(CORE_SRC, "ccc-campaign", "provider-controller.ts")],
+] as const);
+const AGENT_RUNTIME = join(ENGINE_ROOT, "src", "agent-runtime.ts");
+
+/** Where the compiler finds the declaration behind each named export of a module, following re-export aliases. */
+function exportDeclarationFiles(program: ts.Program, moduleFile: string): ReadonlyMap<string, readonly string[]> {
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(moduleFile);
+  if (!source) throw new Error(`compiler did not load ${moduleFile}`);
+  const moduleSymbol = checker.getSymbolAtLocation(source);
+  if (!moduleSymbol) throw new Error(`${moduleFile} is not a module`);
+  const declarations = new Map<string, readonly string[]>();
+  for (const exported of checker.getExportsOfModule(moduleSymbol)) {
+    const target = exported.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(exported) : exported;
+    declarations.set(exported.name, (target.declarations ?? []).map((declaration) => declaration.getSourceFile().fileName));
+  }
+  return declarations;
+}
+
 const NON_VACUOUS = snippet("non_vacuous", [
   "  // Same<> is strict: a campaign scope is a view but not the view itself.",
   "  type _NotSame = Assert<Same<Engine.CccProviderAttemptScopeView, CccProviderAttemptScope>>;",
@@ -157,9 +209,18 @@ const NON_VACUOUS = snippet("non_vacuous", [
 
 describe("Pi seam types carry the real campaign controller (type-only, compiled in-test)", () => {
   let findings: ReadonlyMap<string, readonly Finding[]>;
+  let program: ts.Program;
 
   beforeAll(() => {
-    findings = typecheck({ [TEST_FILE]: null, [ITEM_51[0]]: ITEM_51[1], [WRONG_SCOPE[0]]: WRONG_SCOPE[1], [NON_VACUOUS[0]]: NON_VACUOUS[1] });
+    const checked = typecheck({
+      [TEST_FILE]: null,
+      [ITEM_51[0]]: ITEM_51[1],
+      [WRONG_SCOPE[0]]: WRONG_SCOPE[1],
+      [NON_VACUOUS[0]]: NON_VACUOUS[1],
+      [PLANNING_OPTIONS[0]]: PLANNING_OPTIONS[1],
+    });
+    findings = checked.byFile;
+    program = checked.program;
   });
 
   it("the campaign controller still satisfies CccProviderAttemptController<CccProviderAttemptScope>", () => {
@@ -185,5 +246,16 @@ describe("Pi seam types carry the real campaign controller (type-only, compiled 
   it("the equality check is strict and the scope kind is a closed set", () => {
     const codes = (findings.get(NON_VACUOUS[0]) ?? []).map((finding) => finding.code).sort();
     expect(codes).toEqual([2322, 2344]);
+  });
+
+  it("passes the planning factory binding to createFnAgent options and AgentRuntimeOptions with no cast, and types the confined bash dispose structurally (E5-P1 items 5 and 12)", () => {
+    expect(findings.get(PLANNING_OPTIONS[0])).toEqual([]);
+  });
+
+  it("re-exports K1's view types from core instead of keeping engine copies (E5-P1 item 6)", () => {
+    const declared = exportDeclarationFiles(program, AGENT_RUNTIME);
+    for (const [name, coreFile] of K1_VIEW_TYPES) {
+      expect({ name, files: declared.get(name) }).toEqual({ name, files: [coreFile] });
+    }
   });
 });

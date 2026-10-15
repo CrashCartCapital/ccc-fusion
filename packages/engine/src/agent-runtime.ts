@@ -26,15 +26,13 @@ import type {
   WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import type {
-  CccCampaignProviderControllerHoldReason,
-  CccCampaignProviderDispatchInput,
   CccCampaignRouteReceiptAdapterId,
   CccCampaignTerminalRouteMember,
-  CccCampaignTransport,
   CccEffectReceiptStore,
   CccPlanningRoleClass,
-  CccProviderAttemptReconciliation,
+  CccProviderAttemptControllerView,
   CccProviderAttemptScope,
+  CccProviderAttemptScopeView,
   CustomProvider,
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
@@ -84,41 +82,17 @@ export interface CccEffectReceiptBinding {
 }
 
 /*
-FNXC:CccProviderAttemptViews 2026-10-14-13:46:
-Request-to-code planning sessions reuse this Pi provider-attempt seam with their own scope type (CONTRACT-v3 section 2.12, D9). The seam is generic over a scope "view": any scope whose binding names the route (task, provider, model, transport). K1 defines these views in core (`ccc-campaign/types.ts`, `ccc-campaign/provider-controller.ts`), but the INT-1 core barrel does not export them yet and engine may import only what `@fusion/core` exports (D34). So the six view types below are member-for-member copies of K1's, built only from exported core names, and `ccc-provider-seam.typecheck.test.ts` compiles them against K1's own definitions in both directions. When the parent exports K1's names from the barrel, these collapse into re-exports and `CccProviderAttemptController` becomes a plain alias of K1's `CccProviderAttemptControllerView`.
+FNXC:CccProviderAttemptViews 2026-10-14-17:37:
+Request-to-code planning sessions reuse this Pi provider-attempt seam with their own scope type (CONTRACT-v3 section 2.12, D9). The seam is generic over a scope "view": any scope whose binding names the route (task, provider, model, transport). Repair 1 (errata E5-P1 item 6): the views have one definition, K1's in core, which the core barrel exports since INT-2a, so the engine re-exports them instead of keeping copies.
 */
-export type CccProviderAttemptRouteBindingView = Readonly<{
-  taskId: string;
-  providerId: string;
-  modelId: string;
-  transport: CccCampaignTransport;
-}>;
-
-export type CccProviderAttemptScopeView = Readonly<Omit<CccProviderAttemptScope, "binding"> & {
-  binding: CccProviderAttemptRouteBindingView;
-}>;
-
-/** Why a planning or planning-linked terminal settled as a known-effect refusal (D10). */
-export type CccProviderAttemptRefusalReason =
-  | "receipt-missing"
-  | "receipt-mismatch"
-  | "effective-route-drift"
-  | "provider-error-event";
-
-/** `refusalReason` is supplied only in planning and planning-linked scope; campaign settlement never carries it. */
-export type CccProviderAttemptSettlementInputOf<S extends CccProviderAttemptScopeView> =
-  CccProviderAttemptReconciliation
-  & Pick<S, "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding">
-  & Readonly<{ refusalReason?: CccProviderAttemptRefusalReason }>;
-
-export type CccProviderControllerDecisionView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> =
-  | Readonly<{ kind: "dispatch-permit"; scope: S }>
-  | Readonly<{ kind: "hold"; reason: CccCampaignProviderControllerHoldReason; scope: S }>;
-
-export type CccProviderAttemptControllerView<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> = Readonly<{
-  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccProviderControllerDecisionView<S>>;
-  reconcile(input: CccProviderAttemptSettlementInputOf<S>): Promise<S>;
-}>;
+export type {
+  CccProviderAttemptControllerView,
+  CccProviderAttemptRefusalReason,
+  CccProviderAttemptRouteBindingView,
+  CccProviderAttemptScopeView,
+  CccProviderAttemptSettlementInputOf,
+  CccProviderControllerDecisionView,
+} from "@fusion/core";
 
 /** Frozen, runtime-neutral admission/settlement binding for one CCC PI turn (one definition: the K1 view). */
 export type CccProviderAttemptController<S extends CccProviderAttemptScopeView = CccProviderAttemptScopeView> =
@@ -150,7 +124,14 @@ export type CccConfinedFsOperations = Readonly<{
   find: FindOperations;
 }>;
 
-export type CccConfinement = Readonly<{ bash: BashOperations | null; fs: CccConfinedFsOperations }>;
+/*
+FNXC:CccSessionToolPolicy 2026-10-14-17:37:
+Errata E5-P1 item 12 (E4-9, E6-0). The confined bash carries the dispose that card X1c's confined shell returns, typed structurally so the engine seam imports nothing from X1c. createFnAgent checks the same shape at runtime when the tool policy allows bash.
+*/
+export type CccConfinement = Readonly<{
+  bash: (BashOperations & { dispose(): Promise<Readonly<{ closure: "confirmed" | "unconfirmed" }>> }) | null;
+  fs: CccConfinedFsOperations;
+}>;
 
 export type CccStreamGuardVerdict =
   | Readonly<{ degenerate: false }>
@@ -166,7 +147,11 @@ export type CccProviderPinCheck = (providers: readonly CustomProvider[]) => void
 
 /*
 FNXC:CccProviderAttemptViews 2026-10-14-13:52:
-The binding defaults to the campaign scope, not the view the contract names. Existing campaign code reads `CccProviderAttemptBinding["controller"]` and needs campaign-typed scopes back (ccc-campaign-provider-controller.ts reconcile, in-process-runtime.ts node resolver); both files are outside card P1, and a view default fails their typecheck. A planning binding is written `CccProviderAttemptBinding<CccPlanningCallScope>`, and pi.ts validates any view-scoped binding. Reported as a contract gap; pinning `<CccProviderAttemptScope>` in those two files would allow the view default.
+The binding defaults to the campaign scope, not the view the contract names. Existing campaign code reads `CccProviderAttemptBinding["controller"]` and needs campaign-typed scopes back (ccc-campaign-provider-controller.ts reconcile, in-process-runtime.ts node resolver); both files are outside card P1, and a view default fails their typecheck. A planning binding is written `CccProviderAttemptBinding<CccPlanningCallScope>`, and pi.ts validates any view-scoped binding.
+*/
+/*
+FNXC:CccProviderAttemptViews 2026-10-14-17:37:
+Repair 1 (errata E5-P1 item 5). The alias keeps its campaign default for campaign code, and the two option properties that accept a binding (AgentRuntimeOptions here and createFnAgent's AgentOptions) take `CccProviderAttemptBinding<CccProviderAttemptScopeView>`, so the planning factory's binding is passed with no cast.
 */
 export type CccProviderAttemptBinding<S extends CccProviderAttemptScopeView = CccProviderAttemptScope> = Readonly<{
   turnKey: string;
@@ -324,8 +309,8 @@ export interface AgentRuntimeOptions extends CccPlanningSessionOptions {
   cccEffectReceiptControllerToken?: string;
   /** Late-bound durable CCC receipt ownership for the final PI tool boundary. */
   cccEffectReceiptBinder?: CccEffectReceiptBinder;
-  /** Frozen CCC provider-attempt controller passed only to the native PI runtime. */
-  cccProviderAttemptBinding?: CccProviderAttemptBinding;
+  /** Frozen CCC provider-attempt controller passed only to the native PI runtime; campaign or planning scoped (E5-P1 item 5). */
+  cccProviderAttemptBinding?: CccProviderAttemptBinding<CccProviderAttemptScopeView>;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;

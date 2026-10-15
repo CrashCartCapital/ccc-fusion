@@ -16,6 +16,10 @@ import { CCC_PROVIDER_ATTEMPT_ROUTE_MARKER } from "../pi.js";
 FNXC:CccPlanningProviderBinding 2026-10-14-14:50:
 A planning session is bound to exactly one route: the provider, model and transport of its planning route binding (CONTRACT-v3 section 2.12). The binding's controller refuses any dispatch that names another route with a `route-drift` identity error before the planning controller sees it, so a swapped model never reserves a call. The bound route is also recorded on the frozen controller under a symbol key, so Pi can refuse at session creation a session whose default provider is not the bound provider (D48); a symbol key leaves the controller's own keys exactly `preDispatch` and `reconcile`, as Pi's binding validation requires.
 */
+/*
+FNXC:CccPlanningProviderBinding 2026-10-14-17:37:
+Repair 1 (errata E5-P1 item 9). The recorded route also carries the route binding's role class and toolset digest, so session creation can refuse a tool policy that was not issued for this binding. Only the provider, model and transport take part in the route-drift check.
+*/
 export function createCccPlanningProviderAttemptBinding(i: Readonly<{
   controller: CccProviderAttemptController<CccPlanningCallScope>;
   binding: CccPlanningRouteBinding;
@@ -27,6 +31,8 @@ export function createCccPlanningProviderAttemptBinding(i: Readonly<{
     providerId: i.binding.providerId,
     modelId: i.binding.modelId,
     transport: i.binding.transport,
+    roleClass: i.binding.roleClass,
+    toolsetDigest: i.binding.toolsetDigest,
   });
   const controller: CccProviderAttemptController<CccPlanningCallScope> = Object.freeze({
     preDispatch: async (input: CccCampaignProviderDispatchInput) => {
