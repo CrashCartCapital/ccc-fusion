@@ -15,6 +15,11 @@ FNXC:CccConfinedFsTools 2026-10-14-22:56:
 Card C2 repair 1 (time-of-check to time-of-use). A file operation checks a real path and then opens it by name, so a process that swaps an in-root directory for a symlink between the two can steer the engine, which runs unsandboxed, outside the roots, past the .git refusal included. The main fix is in session-tool-policy.ts: under a tool policy the confined bash, write and edit run sequentially, so no in-session process runs during a file operation. This file adds defense in depth for reads and writes: the checked real path is opened with O_NOFOLLOW, and the open file's device and inode must equal an lstat of that path whose real path is still itself, else the operation is refused before any byte is read or written. A write opens with O_CREAT before that check, so a swap in that window can still leave an empty file outside; it never receives content.
 */
 
+/*
+FNXC:CccConfinedFsTools 2026-10-15-00:26:
+Card C2 repair 2 (errata E14 item C2-1). A confined writer shell may create a FIFO inside its write root, and opening one blocks until the other end opens: a read waits for a writer, a write for a reader. The engine runs unsandboxed and its file opens share libuv's four file-system threads, so four such calls froze every file read in the process and its shutdown. Every checked landing is therefore opened with O_NONBLOCK, so a FIFO opens at once for reading or fails with ENXIO for writing, and the open file must be a regular file by fstat, else the call is refused as not-a-regular-file before any byte is read and, for a write, before the truncate. ENXIO and EOPNOTSUPP (a FIFO with no reader, a socket) are refused the same way.
+*/
+
 /** Carried by every Fusion confined tool definition, so a session check can tell it from Pi's tool of the same name (D11). */
 export const CCC_CONFINED_TOOL_MARK: unique symbol = Symbol.for("ccc-fusion.confined-tool.v1");
 
@@ -22,6 +27,7 @@ export type CccConfinedPathRefusalReason =
   | "not-absolute"
   | "parent-segment"
   | "outside-read-roots"
+  | "not-a-regular-file"
   | CccConfinedWriteRefusal;
 
 /** A confined file operation refused its path. It deliberately has no `code`, so Pi's edit tool reports the reason. */
@@ -105,20 +111,27 @@ function hasParentSegment(path: string): boolean {
   return path.split(/[\\/]+/u).includes("..");
 }
 
+/** open(2) codes for a landing that is not a regular file: a FIFO opened for writing with no reader, or a socket. */
+const NOT_REGULAR_OPEN_CODES: ReadonlySet<string> = new Set(["ENXIO", "EOPNOTSUPP"]);
+
 /**
  * Opens `landing`, the real path a check approved, and proves the open file is still that path: O_NOFOLLOW refuses a
  * final symlink, and the file's device and inode must equal an lstat of `landing`, whose real path must still be itself.
+ * O_NONBLOCK keeps a FIFO from blocking the open, and anything fstat does not call a regular file is refused (repair 2).
  */
 async function openCheckedLanding(landing: string, flags: number, reason: CccConfinedPathRefusalReason, spelled: string): Promise<FileHandle> {
   let handle: FileHandle;
   try {
-    handle = await open(landing, flags | fsConstants.O_NOFOLLOW, 0o666);
+    handle = await open(landing, flags | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, 0o666);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException | null)?.code === "ELOOP") throw new CccConfinedPathRefusedError(reason, spelled);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ELOOP") throw new CccConfinedPathRefusedError(reason, spelled);
+    if (code !== undefined && NOT_REGULAR_OPEN_CODES.has(code)) throw new CccConfinedPathRefusedError("not-a-regular-file", spelled);
     throw error;
   }
   try {
     const opened = await handle.stat();
+    if (!opened.isFile()) throw new CccConfinedPathRefusedError("not-a-regular-file", spelled);
     const current = await lstat(landing).catch(() => null);
     let real: string | null;
     try {

@@ -22,7 +22,12 @@ FNXC:CccConfinedGrepTool 2026-10-14-22:34:
 Card C2 repair 1 (review findings on the confined grep). A model's pattern runs in a worker thread, never on the engine thread: JavaScript regular expressions backtrack, so a pattern such as ^(\w+\s?)+$ on one 40-character line can take hours, and on the engine thread that froze every timer, abort, watchdog and lease heartbeat. A worker thread is not a process, so the grep still spawns nothing. The main thread reads each file through the confined read operation and sends its text to one worker per call; the worker returns the formatted match lines. The time the worker spends matching is bounded by matchDeadlineMs (default CCC_CONFINED_GREP_MATCH_DEADLINE_MS); on that deadline, or when the signal aborts, the worker is terminated and the call rejects with a short "grep timed out" or "Operation aborted" error. The walk enters each directory once, keyed by the device and inode of the stat it already makes (symlinks to an ancestor would otherwise make it exponential), and skips a directory whose stat has no identity. A file whose stat size exceeds maxBytesPerFile is skipped before it is read. A search that stops at maxFiles says so, also when nothing matched, so a truncated search never reads as proof that a symbol is absent.
 */
 
-export type CccConfinedGrepLimits = Readonly<{ maxFiles: number; maxBytesPerFile: number; maxMatches: number }>;
+/*
+FNXC:CccConfinedGrepTool 2026-10-15-00:28:
+Card C2 repair 2 (errata E14 item C2-1). A FIFO inside a root hung the grep in its read, past any abort, and held one of libuv's file-system threads. The walk now searches a child only when its stat says a regular file (a directory is walked as before), and a search of one named path does the same, so a FIFO, socket or device is skipped before any open. A stat without isFile is not trusted to be a regular file. The confined read refuses a non-regular file as well, which covers a swap after the stat.
+*/
+
+export type CccConfinedGrepLimits =Readonly<{ maxFiles: number; maxBytesPerFile: number; maxMatches: number }>;
 
 export const CCC_CONFINED_GREP_DEFAULT_LIMITS: CccConfinedGrepLimits = Object.freeze({
   maxFiles: 10_000,
@@ -182,6 +187,12 @@ function directoryIdentity(stat: unknown): string | null {
   return usable(dev) && usable(ino) ? `${String(dev)}:${String(ino)}` : null;
 }
 
+/** True only when the operations' stat says a regular file; a stat without isFile is not trusted to be one. */
+function isRegularFile(stat: unknown): boolean {
+  const { isFile } = (stat ?? {}) as { isFile?: unknown };
+  return typeof isFile === "function" && (isFile as () => unknown).call(stat) === true;
+}
+
 function statSize(stat: unknown): number | null {
   const { size } = (stat ?? {}) as { size?: unknown };
   return typeof size === "number" ? size : typeof size === "bigint" ? Number(size) : null;
@@ -275,13 +286,15 @@ export function createCccConfinedGrepTool(i: Readonly<{ fs: CccConfinedFsOperati
           await walk(child, depth + 1);
           continue;
         }
+        // Repair 2: a FIFO, socket or device is never opened; only a regular file is searched.
+        if (!isRegularFile(childStat)) continue;
         if (globPattern !== undefined && !cccConfinedGlobMatches(relative(searchPath, child), globPattern)) continue;
         if (oversized(childStat)) continue;
         files.push(child);
       }
     };
     if (isDirectory) await walk(searchPath, 0);
-    else if (!oversized(searchStat)) files.push(searchPath);
+    else if (isRegularFile(searchStat) && !oversized(searchStat)) files.push(searchPath);
 
     const formatPath = (file: string): string => {
       if (isDirectory) {

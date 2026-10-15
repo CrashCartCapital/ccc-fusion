@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentSession, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   canonicalCccPrdJson,
   CCC_PLANNING_DENIED_NAMES,
-  CCC_PLANNING_LINKED_WRITER_TOOLSET,
   CCC_PLANNING_TOOLSETS,
   type CccPlanningCallScope,
   type CccPlanningRouteBinding,
@@ -17,6 +19,9 @@ import {
 import { CCC_PROVIDER_ATTEMPT_ROUTE_MARKER, createFnAgent, CccProviderRouteReceiptError } from "../pi.js";
 import { createCccPlanningProviderAttemptBinding } from "../ccc-planning/provider-binding.js";
 import { CCC_TERMINAL_ROUTE_RECEIPT_API, streamCccTerminalRouteReceipt } from "../ccc-route-receipt-adapter.js";
+import { createCccCampaignReadyTool } from "../ccc-campaign-ready.js";
+import { buildCccSessionToolPolicy, createCccConfinedSessionTools } from "../ccc-confinement/session-tool-policy.js";
+import { createCccVerdictTool } from "../ccc-confinement/verdict-tool.js";
 import type { CccConfinement, CccProviderAttemptBinding, CccSessionToolPolicy } from "../agent-runtime.js";
 
 /*
@@ -111,6 +116,56 @@ const ADAPTER = "terminal-route-sse-comments.v1" as const;
 const TURN_KEY = "ccc-plan-turn:intent:acceptance-reviewer:1";
 const REQUESTED_UPSTREAM = { provider: "minimax", model: "MiniMax-M3" } as const;
 
+/** The confined file operations, shaped as Pi 0.81.1's seams; nothing here touches a file. */
+const FS_OPERATIONS: CccConfinement["fs"] = Object.freeze({
+  read: Object.freeze({ readFile: async () => Buffer.alloc(0), access: async () => undefined }),
+  write: Object.freeze({ writeFile: async () => undefined, mkdir: async () => undefined }),
+  edit: Object.freeze({ readFile: async () => Buffer.alloc(0), writeFile: async () => undefined, access: async () => undefined }),
+  ls: Object.freeze({ exists: () => true, stat: () => ({ isDirectory: () => true }), readdir: () => [] }),
+  find: Object.freeze({ exists: () => true, glob: () => [] }),
+});
+const CONFINED_BASH: NonNullable<CccConfinement["bash"]> = Object.freeze({
+  exec: async () => ({ exitCode: 0 }),
+  dispose: async () => Object.freeze({ closure: "confirmed" as const }),
+});
+
+/*
+FNXC:CccPlanningProviderSeam 2026-10-15-00:42:
+Card C2 repair 2 (errata E14 item C2-3, a fixture-only grant over this file). createFnAgent now refuses any tool policy that buildCccSessionToolPolicy did not build and checks the final tool set in full, so the fixture policies are built there from the tools a session really gets: the confined tools over FS_OPERATIONS (Pi's tool factories are mocked above), the Fusion grep, and ccc_submit_verdict or fn_complete_phase. The policies need real roots, so they live in a temporary directory; the route binding and the linked writer's bound route carry the built toolset digests (E5-P1 item 9), and each session is given its policy's non-confined tool. Only fixture construction changed; every assertion is as before.
+*/
+const POLICY_PARENT = realpathSync(mkdtempSync(join(tmpdir(), "ccc-p1-settlement-")));
+const POLICY_ROOT = join(POLICY_PARENT, "project");
+mkdirSync(join(POLICY_ROOT, "src"), { recursive: true });
+afterAll(() => {
+  rmSync(POLICY_PARENT, { recursive: true, force: true });
+});
+
+const VERDICT_TOOL = createCccVerdictTool({ requirementIds: null, artifactKeys: [], reviewedPaths: null, onVerdict: vi.fn() });
+const READY_TOOL = createCccCampaignReadyTool({ mode: "phase-signal", signalPhaseCompletion: vi.fn() });
+const fixtureConfinedTools = (names: readonly string[], bash: CccConfinement["bash"]) => createCccConfinedSessionTools({
+  names,
+  confinement: Object.freeze({ bash, fs: FS_OPERATIONS }),
+  cwd: "/test/project",
+  readRoots: [POLICY_ROOT],
+  deniedNames: [...CCC_PLANNING_DENIED_NAMES],
+});
+
+const CRITIC_POLICY: CccSessionToolPolicy = buildCccSessionToolPolicy({
+  roleClass: "critic",
+  readRoots: [POLICY_ROOT],
+  writeRoots: [],
+  tools: [...fixtureConfinedTools(["find", "grep", "ls", "read"], null), VERDICT_TOOL],
+});
+
+const LINKED_WRITER_POLICY: CccSessionToolPolicy = buildCccSessionToolPolicy({
+  roleClass: "writer",
+  linkedWriter: true,
+  readRoots: [POLICY_ROOT],
+  writeRoots: [join(POLICY_ROOT, "src")],
+  tools: [...fixtureConfinedTools(CCC_PLANNING_TOOLSETS.writer, CONFINED_BASH), READY_TOOL],
+});
+
+/** The route binding carries the critic policy's own toolset digest (E5-P1 item 9). */
 const ROUTE: CccPlanningRouteBinding = Object.freeze({
   kind: "ccc-planning-route.v1",
   projectId: "project-plan",
@@ -127,43 +182,11 @@ const ROUTE: CccPlanningRouteBinding = Object.freeze({
   modelId: "minimax/MiniMax-M3",
   transport: "pi",
   receiptAdapterId: ADAPTER,
-  toolsetDigest: "1".repeat(64),
+  toolsetDigest: CRITIC_POLICY.toolsetDigest,
   promptDigest: "2".repeat(64),
   policyDigest: "3".repeat(64),
   grantDigest: "4".repeat(64),
   bindingHash: "5".repeat(64),
-});
-
-/** The critic policy carries the route binding's own toolset digest (E5-P1 item 9). */
-const CRITIC_POLICY: CccSessionToolPolicy = Object.freeze({
-  policyId: "ccc-critic-tools.v1",
-  allowedTools: CCC_PLANNING_TOOLSETS.critic,
-  toolsetDigest: ROUTE.toolsetDigest,
-  readRoots: Object.freeze(["/test/project"]),
-  writeRoots: Object.freeze([]),
-  deniedNames: Object.freeze([...CCC_PLANNING_DENIED_NAMES]),
-});
-
-const LINKED_WRITER_POLICY: CccSessionToolPolicy = Object.freeze({
-  policyId: "ccc-linked-writer-tools.v1",
-  allowedTools: CCC_PLANNING_LINKED_WRITER_TOOLSET,
-  toolsetDigest: "7".repeat(64),
-  readRoots: Object.freeze(["/test/project"]),
-  writeRoots: Object.freeze(["/test/project/src"]),
-  deniedNames: Object.freeze([...CCC_PLANNING_DENIED_NAMES]),
-});
-
-/** The confined file operations, shaped as Pi 0.81.1's seams; nothing here touches a file. */
-const FS_OPERATIONS: CccConfinement["fs"] = Object.freeze({
-  read: Object.freeze({ readFile: async () => Buffer.alloc(0), access: async () => undefined }),
-  write: Object.freeze({ writeFile: async () => undefined, mkdir: async () => undefined }),
-  edit: Object.freeze({ readFile: async () => Buffer.alloc(0), writeFile: async () => undefined, access: async () => undefined }),
-  ls: Object.freeze({ exists: () => true, stat: () => ({ isDirectory: () => true }), readdir: () => [] }),
-  find: Object.freeze({ exists: () => true, glob: () => [] }),
-});
-const CONFINED_BASH: NonNullable<CccConfinement["bash"]> = Object.freeze({
-  exec: async () => ({ exitCode: 0 }),
-  dispose: async () => Object.freeze({ closure: "confirmed" as const }),
 });
 const STREAM_GUARD = Object.freeze({
   observeDelta: () => ({ degenerate: false as const }),
@@ -412,6 +435,7 @@ async function createPlanningAgent(input: {
         cccConfinement: Object.freeze({ bash: scopeKind === "planning-linked-writer" ? CONFINED_BASH : null, fs: FS_OPERATIONS }),
         cccStreamGuard: STREAM_GUARD,
         cccProviderPinCheck: vi.fn(),
+        customTools: [scopeKind === "planning-linked-writer" ? READY_TOOL : VERDICT_TOOL],
       }),
   });
 

@@ -1,4 +1,19 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -223,7 +238,8 @@ describe("confined grep (card C2, D11)", () => {
     const sizeless = spiedReadOps();
     const sizelessOps = { ...sizeless.ops, ls: { ...sizeless.ops.ls, stat: async (path: string) => {
       const real = await sizeless.ops.ls.stat(path);
-      return { isDirectory: () => real.isDirectory() };
+      // Repair 2: no size, but still a file type, because the grep searches only what its stat calls a regular file.
+      return { isDirectory: () => real.isDirectory(), isFile: () => (real as { isFile?: () => boolean }).isFile?.() === true };
     } } };
     expect(text(await runGrep(confinedGrep(sizelessOps as never, smallLimits), { pattern: "needle", path: "src/a.ts" }))).toBe("No matches found");
     expect(sizeless.readFile).toHaveBeenCalledWith(aTs);
@@ -298,5 +314,57 @@ describe("confined grep (card C2, D11)", () => {
     expect((truncated as { details?: { fileLimitReached?: boolean } }).details?.fileLimitReached).toBe(true);
 
     expect(text(await runGrep(grep, { pattern: "NEEDLE_SYMBOL", path: "capped/src" }))).toBe("target.ts:1: export const NEEDLE_SYMBOL = 1;");
+  });
+
+  it("skips a FIFO inside a root without opening it: a whole-root search and a search of the FIFO itself settle at once, and the FIFO is never read; positive control: the regular file beside it is read and matched", async () => {
+    /*
+    FNXC:CccConfinedGrepTool 2026-10-15-00:20:
+    Card C2 repair 2 (errata E14 item C2-1). A FIFO a confined writer made inside a root used to hang the grep in its read (no abort could end it) and hold a file-system thread. The walk now searches only regular files, and so does a search of one named path. The read spy shows the skip happens in the walk, before any open. A run on bytes without the fix is freed afterwards by opening the FIFO both ways for a moment.
+    */
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "ccc-c2-grep-fifo-")));
+    const fifoRoot = join(base, "root");
+    mkdirSync(join(fifoRoot, "src"), { recursive: true });
+    writeFileSync(join(fifoRoot, "src", "a.txt"), "needle alpha\n");
+    const fifo = join(fifoRoot, "src", "pipe.txt");
+    execFileSync("/usr/bin/mkfifo", [fifo], { stdio: ["ignore", "ignore", "pipe"] });
+    const confined = createCccConfinedFsOperations({ readRoots: [fifoRoot], writeRoots: [], deniedNames: DENIED });
+    const readFileSpy = vi.fn((path: string) => confined.read.readFile(path));
+    const grep = createCccConfinedGrepTool({
+      fs: { ...confined, read: { ...confined.read, readFile: readFileSpy } },
+      readRoots: [fifoRoot],
+      deniedNames: DENIED,
+      limits: CCC_CONFINED_GREP_DEFAULT_LIMITS,
+    });
+    const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    const pending: Promise<string>[] = [];
+    const watch = (params: GrepParams) => {
+      const outcome = runGrep(grep, params).then((result) => text(result), (error: unknown) => `rejected: ${(error as Error)?.message}`);
+      pending.push(outcome);
+      return Promise.race([outcome, delay(2_000).then(() => "still pending")]);
+    };
+    let wholeRoot = "";
+    let fifoOnly = "";
+    try {
+      wholeRoot = await watch({ pattern: "needle" });
+      fifoOnly = await watch({ pattern: "needle", path: "src/pipe.txt" });
+    } finally {
+      const settled = Promise.allSettled(pending).then(() => true);
+      for (let round = 0; round < 50 && !(await Promise.race([settled, delay(0).then(() => false)])); round += 1) {
+        const descriptor = openSync(fifo, fsConstants.O_RDWR | fsConstants.O_NONBLOCK);
+        await delay(50);
+        closeSync(descriptor);
+        await delay(20);
+      }
+    }
+    try {
+      expect(wholeRoot).toBe("src/a.txt:1: needle alpha");
+      expect(fifoOnly).toBe("No matches found");
+      expect(readFileSpy).not.toHaveBeenCalledWith(fifo);
+      // Positive control: the regular file beside the FIFO was read, and the FIFO really is one.
+      expect(readFileSpy).toHaveBeenCalledWith(join(fifoRoot, "src", "a.txt"));
+      expect(statSync(fifo).isFIFO()).toBe(true);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

@@ -1,4 +1,22 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -7,7 +25,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { CCC_PLANNING_DENIED_NAMES } from "@fusion/core";
 import { cccConfinedEffectiveDeniedNames, cccConfinedWriteRefusal } from "../ccc-confinement/confined-shell.js";
-import { createCccConfinedFsOperations } from "../ccc-confinement/confined-fs-tools.js";
+import { CccConfinedPathRefusedError, createCccConfinedFsOperations } from "../ccc-confinement/confined-fs-tools.js";
 import { createCccConfinedSessionTools } from "../ccc-confinement/session-tool-policy.js";
 
 /*
@@ -100,6 +118,38 @@ function writerOps() {
 function text(result: unknown): string {
   const content = (result as { content?: Array<{ type: string; text?: string }> }).content ?? [];
   return content.map((block) => block.text ?? "").join("\n");
+}
+
+/*
+FNXC:CccConfinedFsTools 2026-10-15-00:16:
+Card C2 repair 2 (errata E14 item C2-1). A confined writer shell can make a FIFO inside its write root, and before this repair opening one blocked forever: a read waits for a writer, a write for a reader, the open holds one of libuv's four file-system threads, so four such calls froze every file read in the engine and its shutdown. These helpers watch each confined call for a short window instead of awaiting it, and afterwards free any call still blocked by opening the FIFO both ways for a moment, so a run on bytes without the fix reports the hang and still ends.
+*/
+const PROMPT_WINDOW_MS = 2_000;
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** How a confined call settled: its resolved value, its refusal reason, or another error's message. */
+function outcomeOf(call: Promise<unknown>): Promise<string> {
+  return call.then(
+    (value) => `resolved: ${Buffer.isBuffer(value) ? value.toString("utf8") : String(value)}`,
+    (error: unknown) => (error instanceof CccConfinedPathRefusedError ? `refused (${error.reason})` : `rejected: ${(error as Error)?.message}`),
+  );
+}
+
+/** The outcome if it settles within the window, else "still pending". */
+function settleWithin(outcome: Promise<string>, ms = PROMPT_WINDOW_MS): Promise<string> {
+  return Promise.race([outcome, delay(ms).then(() => "still pending")]);
+}
+
+/** Frees every call still blocked on `fifo`: opening it read-write never blocks and gives each waiting open its other end. */
+async function releaseFifo(fifo: string, pending: readonly Promise<unknown>[]): Promise<void> {
+  const settled = Promise.allSettled(pending).then(() => true);
+  for (let round = 0; round < 50; round += 1) {
+    if (await Promise.race([settled, delay(0).then(() => false)])) return;
+    const descriptor = openSync(fifo, fsConstants.O_RDWR | fsConstants.O_NONBLOCK);
+    await delay(50);
+    closeSync(descriptor);
+    await delay(20);
+  }
 }
 
 describe("confined file operations (card C2)", () => {
@@ -317,6 +367,74 @@ describe("confined file operations (card C2)", () => {
       expect(readFileSync(join(swapRoot, "d", "t.txt"), "utf8")).toBe("planted\n");
     } finally {
       raceHook.beforeNextOpen = null;
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("a FIFO inside a root never blocks a confined read, edit or write: each settles at once with a not-a-regular-file refusal, four reads leave the thread pool free for an unrelated read, and a write with a reader present refuses before any byte reaches it; positive control: a regular file beside it still reads and writes", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "ccc-c2-fifo-")));
+    const fifoRoot = join(base, "root");
+    mkdirSync(join(fifoRoot, "src"), { recursive: true });
+    writeFileSync(join(fifoRoot, "src", "a.txt"), "alpha\n");
+    writeFileSync(join(base, "control.txt"), "control bytes\n");
+    const fifo = join(fifoRoot, "src", "pipe.txt");
+    execFileSync("/usr/bin/mkfifo", [fifo], { stdio: ["ignore", "ignore", "pipe"] });
+    const ops = createCccConfinedFsOperations({ readRoots: [fifoRoot], writeRoots: [fifoRoot], deniedNames: DENIED });
+    const pending: Promise<string>[] = [];
+    const watch = (call: () => Promise<unknown>) => {
+      const outcome = outcomeOf(call());
+      pending.push(outcome);
+      return settleWithin(outcome);
+    };
+    let reads: string[] = [];
+    let unrelated = "";
+    let writes: string[] = [];
+    let readerPresent = "";
+    let bytesThrough = -1;
+    try {
+      // Four opens for reading: before the fix each held one of libuv's four file-system threads until a writer came.
+      reads = await Promise.all([
+        watch(() => ops.read.readFile(fifo)),
+        watch(() => ops.edit.readFile(fifo)),
+        watch(() => ops.read.readFile(fifo)),
+        watch(() => ops.edit.readFile(fifo)),
+      ]);
+      unrelated = await settleWithin(outcomeOf(readFile(join(base, "control.txt"))));
+      await releaseFifo(fifo, pending);
+      // Two opens for writing with no reader: before the fix each waited for a reader.
+      writes = await Promise.all([
+        watch(() => ops.write.writeFile(fifo, "planted\n")),
+        watch(() => ops.edit.writeFile(fifo, "planted\n")),
+      ]);
+      await releaseFifo(fifo, pending);
+      // With a reader present the open succeeds, so only the file-type check stands between the write and the FIFO.
+      const reader = openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+      try {
+        readerPresent = await watch(() => ops.write.writeFile(fifo, "planted\n"));
+        const buffer = Buffer.alloc(64);
+        try {
+          bytesThrough = readSync(reader, buffer, 0, buffer.length, null);
+        } catch (error) {
+          bytesThrough = (error as NodeJS.ErrnoException).code === "EAGAIN" ? 0 : -2;
+        }
+      } finally {
+        closeSync(reader);
+      }
+    } finally {
+      await releaseFifo(fifo, pending);
+    }
+    try {
+      expect(reads).toEqual(Array(4).fill("refused (not-a-regular-file)"));
+      expect(unrelated).toBe("resolved: control bytes\n");
+      expect(writes).toEqual(Array(2).fill("refused (not-a-regular-file)"));
+      expect(readerPresent).toBe("refused (not-a-regular-file)");
+      expect(bytesThrough).toBe(0);
+
+      // Positive control: a regular file beside the FIFO still reads and is still written.
+      expect(await outcomeOf(ops.read.readFile(join(fifoRoot, "src", "a.txt")))).toBe("resolved: alpha\n");
+      await ops.write.writeFile(join(fifoRoot, "src", "b.txt"), "fresh\n");
+      expect(readFileSync(join(fifoRoot, "src", "b.txt"), "utf8")).toBe("fresh\n");
+    } finally {
       rmSync(base, { recursive: true, force: true });
     }
   });
