@@ -357,6 +357,41 @@ describe("G4 importer and custody parity", () => {
   });
 
   /*
+  FNXC:CccPlanningG4ImporterParity 2026-10-15-00:02:
+  Card GGz repair 1 (adversary finding, the sibling of E12 item 1: a closure path git cannot address literally). `git init` on the I2 host's APFS volume writes core.precomposeunicode=true into the repository's own config, and the custody check still reads that config (it scrubs only the global and system config), so git composes a decomposed (NFD) `ls-tree -- <path>` argument to NFC. A bundle committed through the working tree, as this harness and B1 do, holds the NFC name, so the one entry listed differs from the path asked and the custody check refuses (semantic-proof-custody.ts:150, :164-167); a bundle that kept the NFD name through plumbing lists nothing and is refused the same way. Every earlier G4 layer, IB1 and K1's bundle validator accept the NFD path, so G4 refuses any closure path that is not NFC. Git precomposes only on Darwin: elsewhere the custody check admits the NFD path and G4's refusal is a fail-closed over-refusal, consistent with K1's Darwin-first comparison key, so the custody verdict pinned here is the one for the platform the test runs on.
+  */
+  it("a verifier closure path that is not in Unicode NFC fails G4, as git's precomposeunicode on the Darwin host makes the custody check miss it", async () => {
+    const withFixture = (path: string) => edit(BASE_FIXTURE, (draft) => {
+      draft.verifierBundle.files.push({ path, mode: "100644", content: "words\n" });
+      draft.verifierBundle.proofs[0]!.files.push(path);
+    });
+    const nfd = "fixtures/café.txt";
+    const nfc = "fixtures/café.txt";
+    expect(nfd).not.toBe(nfc);
+    expect(nfd.normalize("NFC")).toBe(nfc);
+    const red = g4Input(withFixture(nfd));
+    expect(red.proposal.proofs[0]!.verifierClosure.map(({ role, path }) => `${role} ${path}`)).toContain(`fixture ${nfd}`);
+    const diagnostics = runCccPlanningG4(red);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(byRule(diagnostics, "closure-path-git-literal")).toHaveLength(1);
+    expect(diagnostics[0]!.message).toContain("proof tokenizer");
+    expect(diagnostics[0]!.message).toContain(`path ${nfd}:`);
+    expect(diagnostics[0]!.message).toContain("NFC");
+    const custodyRed = await custodyVerdict(red);
+    if (process.platform === "darwin") {
+      const asked = nfd.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      expect(custodyRed).toMatch(new RegExp(`^refused: CCC semantic-proof path is missing, non-regular, or ambiguous at [0-9a-f]{40}: ${asked}$`, "u"));
+    } else {
+      expect(custodyRed).toBe("admitted");
+    }
+    // Control: the same name composed (NFC) is admitted by G4 and by the custody hydration.
+    const control = g4Input(withFixture(nfc));
+    expect(runCccPlanningG4(control)).toEqual([]);
+    expect(await custodyVerdict(control)).toBe("admitted");
+  });
+
+  /*
   FNXC:CccPlanningG4ImporterParity 2026-10-14-23:14:
   Errata E12 item 2. The importer refuses any task, edge, workflow, document or artifact id, and any import intent id or entity id, outside `^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$` (import-admission.ts:22, :113-125). IB1 turns each edge into the intent `IMPORT-EDGE-<edge id>` and each task into `IMPORT-TASK-<task id>`, so the prefix counts against the 192-character limit: a 180-character edge id is admitted and a 181-character one is refused, through its intent id alone.
   */
