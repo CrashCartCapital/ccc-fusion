@@ -61,6 +61,16 @@ import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
+import { createCccPlanningStageHandler } from "../ccc-planning/controller.js";
+import {
+  createCccPlanningArtifactPort,
+  createCccPlanningLedgerPort,
+  type CccPlanningSessionFactory,
+  type CccPlanningStageFn,
+} from "../ccc-planning/ports.js";
+import { recoverCccPlanningRuns } from "../ccc-planning/recovery.js";
+import { registerCccRunningRuntimeAtEngineStart, resolveCccRuntimeDistRoot } from "../ccc-planning/runtime-digest.js";
+import type { CccPlanningIrStageId, CccPlanningLinkedOutcomePorts } from "@fusion/core";
 import { claimDueWorkflowWorkItem } from "../workflow-work-scheduler.js";
 import { TriageProcessor } from "../triage.js";
 import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
@@ -109,6 +119,20 @@ export type PlanningContinuationResolution =
       item: WorkflowWorkItem;
       reason: "task-not-found" | "task-terminal";
     };
+
+/** Card H1: the wiring `setCccPlanningHost` takes (section 2.16 stage registry, session factory, optional BF port). */
+export type CccPlanningHostWiring = Readonly<{
+  stages: Readonly<Record<CccPlanningIrStageId, CccPlanningStageFn>>;
+  sessions: CccPlanningSessionFactory;
+  linkedOutcomePorts?: CccPlanningLinkedOutcomePorts;
+}>;
+
+/** A request-to-code planning work item: the run's single task item, keyed by its `ccc-plan:` run id (D1). */
+function isCccPlanningWorkItem(item: WorkflowWorkItem): boolean {
+  return item.kind === "task"
+    && /^ccc-plan:[0-9a-f]{24}$/u.test(item.runId)
+    && item.stableWorkflowRunId === item.runId;
+}
 
 /**
  * FNXC:WorkflowScheduling 2026-07-21-22:31:
@@ -337,6 +361,9 @@ export class InProcessRuntime
   private cccCampaignProofBootstrapPromise?: Promise<void>;
   private cccCampaignProofBootstrapError?: Error;
   private cccCampaignWorkflowRuntime?: WorkflowTaskRuntime;
+  /** Card H1: the planning stage registry and session factory, set before start() (null until wired). */
+  private cccPlanningHost?: CccPlanningHostWiring;
+  private cccPlanningWorkflowRuntime?: WorkflowTaskRuntime;
   private messageStore?: MessageStore;
   private chatStore?: ChatStore;
   private detachAgentLinkSync?: () => void;
@@ -473,6 +500,37 @@ export class InProcessRuntime
         if (recoveries.length > 0) {
           runtimeLog.warn(
             `Parked ${recoveries.length} prior-boot CCC campaign uncertain effect(s) for explicit operator resolution`,
+          );
+        }
+      }
+      /*
+      FNXC:CccPlanningHost 2026-10-14-22:17:
+      D44: register this process's installed dist digest once (a source run has no dist and registers nothing, so
+      planning stages refuse). D3/D45: the planning engine-start recovery runs beside the campaign one, under the same
+      engine-instance gate; it completes cancellations and parks unknown effects but never requeues a work item.
+      */
+      try {
+        await registerCccRunningRuntimeAtEngineStart({ distRoot: resolveCccRuntimeDistRoot(import.meta.url) });
+      } catch (error) {
+        runtimeLog.warn(
+          `CCC planning runtime digest not registered; planning stages will refuse: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (this.config.engineInstanceId) {
+        try {
+          const planningRecoveries = await recoverCccPlanningRuns({
+            store: this.taskStore,
+            ...(this.cccPlanningHost?.linkedOutcomePorts ? { ports: this.cccPlanningHost.linkedOutcomePorts } : {}),
+          });
+          const recovered = planningRecoveries.filter((entry) => entry.outcome !== "none");
+          if (recovered.length > 0) {
+            runtimeLog.warn(
+              `Recovered ${recovered.length} prior-boot CCC planning run(s): ${recovered.map((entry) => `${entry.runId}=${entry.outcome}`).join(", ")}`,
+            );
+          }
+        } catch (error) {
+          runtimeLog.warn(
+            `CCC planning engine-start recovery failed: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
       }
@@ -1717,6 +1775,18 @@ export class InProcessRuntime
   }
 
   /**
+   * FNXC:CccPlanningHost 2026-10-14-22:17:
+   * Card H1 planning runtime wiring. The stage registry (`ccc-planning/stages`, parent-owned) and the session factory
+   * arrive from their own cards, so the host takes them here, before start(). Until they are set, request-to-code
+   * planning items are left exactly as before (the drain skips them); linked-outcome ports, when given, are passed to
+   * engine-start recovery (verify-v2 item 35).
+   */
+  setCccPlanningHost(host: CccPlanningHostWiring): void {
+    this.cccPlanningHost = host;
+    this.cccPlanningWorkflowRuntime = undefined;
+  }
+
+  /**
    * Wire the workflow-graph merge seam to ProjectEngine.onMerge. Late-bindable:
    * forwards immediately when the executor already exists, and is re-applied at
    * executor construction during start().
@@ -2196,6 +2266,58 @@ export class InProcessRuntime
     }
   }
 
+  /** Card H1: one planning WorkflowTaskRuntime per wiring; its stage gates run through the planning stage handler. */
+  private ensureCccPlanningWorkflowRuntime(
+    settings: Awaited<ReturnType<TaskStore["getSettings"]>>,
+  ): WorkflowTaskRuntime | undefined {
+    if (this.cccPlanningWorkflowRuntime) return this.cccPlanningWorkflowRuntime;
+    const host = this.cccPlanningHost;
+    const layer = this.taskStore.getAsyncLayer();
+    if (!host || !layer) return undefined;
+    this.cccPlanningWorkflowRuntime = new WorkflowTaskRuntime({
+      store: this.taskStore,
+      primitives: this.executor.createAuthoritativeWorkflowPrimitives(settings),
+      runCustomNode: this.executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
+      runCccPlanningStage: createCccPlanningStageHandler({
+        stages: host.stages,
+        ledger: createCccPlanningLedgerPort(layer),
+        artifacts: createCccPlanningArtifactPort(layer),
+        sessions: host.sessions,
+      }),
+      handlers: {},
+    });
+    return this.cccPlanningWorkflowRuntime;
+  }
+
+  /** Card H1: claim one planning item under planning custody; the same in-flight fence as campaign continuations. */
+  private async dispatchCccPlanningContinuation(item: WorkflowWorkItem): Promise<void> {
+    const processingKey = JSON.stringify([item.id, item.runId, item.attempt]);
+    if (this.campaignWorkflowContinuationsInFlight.has(processingKey)) return;
+    const settings = await this.taskStore.getSettings();
+    const planningRuntime = this.ensureCccPlanningWorkflowRuntime(settings);
+    if (!planningRuntime) return;
+    const releaseExecution = this.executor.tryBeginAuthoritativeWorkflowExecution(item.taskId);
+    if (!releaseExecution) {
+      runtimeLog.log(`Workflow continuation ${item.id}: task ${item.taskId} already has a live execution owner`);
+      return;
+    }
+    const continuation = processDueWorkflowWorkItem(this.taskStore, planningRuntime, settings, {
+      leaseOwner: this.campaignWorkflowLeaseOwner(),
+      leaseDurationMs: 10 * 60_000,
+      kinds: [item.kind],
+      custody: "planning",
+      exactCandidate: { id: item.id, runId: item.runId, attempt: item.attempt },
+    })
+      .catch((error) => {
+        runtimeLog.error(`Workflow continuation ${item.id} planning processor failed:`, error);
+      })
+      .finally(() => {
+        releaseExecution();
+        this.campaignWorkflowContinuationsInFlight.delete(processingKey);
+      });
+    this.campaignWorkflowContinuationsInFlight.set(processingKey, continuation);
+  }
+
   private async drainWorkflowContinuations(): Promise<void> {
     /*
     FNXC:WorkflowScheduling 2026-07-21-12:20:
@@ -2226,6 +2348,15 @@ export class InProcessRuntime
         states: ["runnable", "retrying"],
         limit: 20,
       });
+      /*
+      FNXC:CccPlanningHost 2026-10-14-22:17:
+      D3: a planning item whose lease expired stays `running`; the existing acquire path reclaims it, so once the
+      planning host is wired the drain also offers lease-expired planning items (campaign items are unchanged).
+      */
+      if (this.cccPlanningHost) {
+        const expiredPlanning = await this.taskStore.listDueWorkflowWorkItems({ kinds: ["task"], states: ["running"], limit: 20 });
+        items.push(...expiredPlanning.filter(isCccPlanningWorkItem));
+      }
       for (const item of items) {
         let task: Task | undefined;
         let taskLookupFailed = false;
@@ -2242,6 +2373,11 @@ export class InProcessRuntime
         const resolved = resolvePlanningContinuationCandidate(item, task, { taskLookupFailed });
         if (resolved.kind === "orphan") {
           await this.cancelOrphanedWorkflowWorkItem(resolved.item);
+          continue;
+        }
+        // Card H1: a request-to-code planning item (paused task, `ccc-plan:` run) runs under planning custody.
+        if (this.cccPlanningHost && isCccPlanningWorkItem(item)) {
+          await this.dispatchCccPlanningContinuation(item);
           continue;
         }
         if (resolved.kind !== "actionable") continue;

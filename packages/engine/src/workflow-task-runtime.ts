@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import type { CccCampaignTaskContext, RunAuditEventInput, Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
+import type { CccCampaignTaskContext, CccPlanningRunState, RunAuditEventInput, Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
 import {
+  buildCccPlanningWorkflowIr,
   canonicalCccPrdJson,
+  cccPlanningWorkflowIrHash,
   getBuiltinWorkflow,
   isBuiltinWorkflowId,
   parseWorkflowIr,
@@ -38,6 +40,45 @@ import {
   isImportedCccCampaignTask,
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
+import {
+  CCC_PLANNING_STAGE_HOST_KEY,
+  cccPlanningRunLookup,
+  type CccPlanningDescendantRegistry,
+  type CccPlanningStageHost,
+} from "./ccc-planning/ports.js";
+
+/*
+FNXC:CccPlanningHost 2026-10-14-22:17:
+Card H1 (CONTRACT-v3.4 section 2.16, D1, D2). The work processor and this runtime take one of two custody kinds. A
+planning run is one leased work item that executes the K1 planning workflow; its stage gates (config.cccPlanningStage)
+are routed to the planning stage handler, and a stage that parks the run reports it under
+CCC_PLANNING_HOLD_CONTEXT_KEY, which the processor maps to the work item state `held` (or, for `cancel` and
+`lease-lost`, to the D45 settlement).
+*/
+export type WorkflowWorkCustodyKind = "campaign" | "planning";
+export const CCC_PLANNING_HOLD_CONTEXT_KEY = "ccc:planning:hold" as const;
+
+/** The value a planning stage leaves under CCC_PLANNING_HOLD_CONTEXT_KEY when the run must stop at this stage. */
+export type CccPlanningHoldContext = Readonly<{
+  /** `held`: the run rests (operator wait, blocked, unknown effect); `cancel`: the run is cancelling;
+   * `lease-lost`: the ledger refused the fence, so the lease is no longer this engine's. */
+  disposition: "held" | "cancel" | "lease-lost";
+  runState: CccPlanningRunState;
+  code: string | null;
+  decisionId?: string;
+}>;
+
+/**
+ * Every workflow node kind, so the planning executor can route each one explicitly and never fall back to a default
+ * handler (a Record over the kind union fails to compile when a kind is added and not listed here).
+ */
+const CCC_PLANNING_NODE_KINDS: Readonly<Record<WorkflowIrNode["kind"], true>> = {
+  start: true, prompt: true, script: true, gate: true, end: true, hold: true, split: true, join: true, foreach: true,
+  loop: true, "optional-group": true, "step-review": true, "parse-steps": true, code: true, notify: true,
+  "merge-gate": true, "merge-attempt": true, "manual-merge-hold": true, "retry-backoff": true, "recovery-router": true,
+  "branch-group-member-integration": true, "branch-group-promotion": true, "pr-create": true, "pr-respond": true,
+  "pr-merge": true, "ask-user": true, "exit-gate": true,
+};
 
 export type WorkflowTaskRuntimeDisposition = "completed" | "failed" | "manual-required" | "cancelled";
 
@@ -55,6 +96,10 @@ export interface WorkflowTaskRuntimeRunOptions {
   signal?: AbortSignal;
   workItemFence?: WorkflowWorkItemFence;
   deferCompletionSummary?: boolean;
+  /** "planning" runs the K1 planning workflow under the planning run's custody (card H1). */
+  custody?: WorkflowWorkCustodyKind;
+  /** Planning custody only: the processor's registry of everything a stage started (D45). */
+  cccPlanningDescendants?: CccPlanningDescendantRegistry;
 }
 
 export interface WorkflowTaskRuntimeResult {
@@ -231,6 +276,8 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
   }) => Promise<unknown>;
   /** Campaign-only executor for the final PRD proof-suite gate. */
   runCccProofSuite?: WorkflowNodeHandler;
+  /** Planning-only handler for gate nodes with config.cccPlanningStage (card H1, section 2.16). */
+  runCccPlanningStage?: WorkflowNodeHandler;
   onEvent?: (event: { type: "start" | "terminal"; taskId: string; detail: string }) => void;
 }
 
@@ -238,6 +285,8 @@ type WorkflowTaskRuntimeRunOptionsSnapshot = Readonly<{
   signal?: AbortSignal;
   workItemFence?: WorkflowWorkItemFence;
   deferCompletionSummary?: boolean;
+  custody?: WorkflowWorkCustodyKind;
+  cccPlanningDescendants?: CccPlanningDescendantRegistry;
 }>;
 
 function snapshotWorkItemFence(fence: WorkflowWorkItemFence | undefined): WorkflowWorkItemFence | undefined {
@@ -257,6 +306,8 @@ function snapshotRunOptions(options: WorkflowTaskRuntimeRunOptions): WorkflowTas
     signal: options.signal,
     workItemFence: snapshotWorkItemFence(options.workItemFence),
     deferCompletionSummary: options.deferCompletionSummary,
+    custody: options.custody,
+    cccPlanningDescendants: options.cccPlanningDescendants,
   });
 }
 
@@ -328,6 +379,7 @@ export class WorkflowTaskRuntime {
     options: WorkflowTaskRuntimeRunOptions = {},
   ): Promise<WorkflowTaskRuntimeResult> {
     const runOptions = snapshotRunOptions(options);
+    if (runOptions.custody === "planning") return this.runPlanning(task, settings, runOptions);
     const campaignCustody = await this.campaignCustodyAdmission(task, runOptions);
     if (campaignCustody.refusal) return campaignCustody.refusal;
     const campaignFenceRefusal = await this.campaignFenceRefusal(task, runOptions);
@@ -505,6 +557,147 @@ export class WorkflowTaskRuntime {
     return {
       disposition,
       outcome: result.outcome,
+      visitedNodeIds: result.visitedNodeIds,
+      context: result.context,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  /**
+   * FNXC:CccPlanningHost 2026-10-14-22:17:
+   * Planning custody (card H1, D1, D2). The run must belong to this task and to the work item's run id, the work item
+   * lease must still be this engine's, and only the K1 planning workflow may execute: its start and end nodes pass,
+   * its stage gates go to the planning stage handler, and every other node kind is refused, so no default handler,
+   * worktree preparation, campaign admission or provider controller ever runs for a planning item. Each node gets one
+   * attempt (`maxRetriesPerNode: 1`, E2-14: the graph treats the IR's `maxRetries: 0` as unset). When the stored IR is
+   * not the K1 IR for the run's mode, no stored node runs at all: the stage handler is given K1's first stage gate, so
+   * its own checks record RUNTIME_NOT_PERMITTED or WORKFLOW_IR_DRIFT exactly as they would at a stage start.
+   */
+  private async runPlanning(
+    task: TaskDetail,
+    settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
+    runOptions: WorkflowTaskRuntimeRunOptionsSnapshot,
+  ): Promise<WorkflowTaskRuntimeResult> {
+    const fence = runOptions.workItemFence;
+    const descendants = runOptions.cccPlanningDescendants;
+    const runStage = this.deps.runCccPlanningStage;
+    if (!fence) return this.campaignCustodyFailure(task.id, "ccc-planning-work-item-fence-required");
+    if (!descendants) return this.campaignCustodyFailure(task.id, "ccc-planning-descendant-registry-required");
+    if (!runStage) return this.campaignCustodyFailure(task.id, "ccc-planning-stage-handler-unwired");
+    const lookup = cccPlanningRunLookup(this.deps.store);
+    if (!lookup) return this.campaignCustodyFailure(task.id, "ccc-planning-custody-lookup-unwired");
+    let custody: Awaited<ReturnType<typeof lookup>>;
+    try {
+      custody = await lookup(task.id);
+    } catch {
+      return this.campaignCustodyFailure(task.id, "ccc-planning-custody-lookup-error");
+    }
+    if (!custody || custody.runId !== fence.runId || custody.planningTaskId !== task.id) {
+      return this.campaignCustodyFailure(task.id, "ccc-planning-custody-missing");
+    }
+    const assertFence = this.deps.store.assertCccCampaignWorkflowLeaseFence;
+    if (typeof assertFence !== "function") {
+      return this.campaignCustodyFailure(task.id, "ccc-planning-work-item-fence-validator-unwired");
+    }
+    try {
+      await assertFence.call(this.deps.store, {
+        workItemId: fence.workItemId,
+        originTaskId: task.id,
+        leaseOwner: fence.leaseOwner,
+        attempt: fence.attempt,
+        runId: fence.runId,
+      });
+    } catch {
+      return this.campaignCustodyFailure(task.id, "ccc-planning-work-item-fence-refused");
+    }
+    this.emit("start", task.id, "resolve-workflow");
+    let target: WorkflowRuntimeTarget;
+    try {
+      target = await this.resolveRuntimeTarget(task.id);
+    } catch (err) {
+      return this.campaignCustodyFailure(
+        task.id,
+        `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const signal = runOptions.signal ?? new AbortController().signal;
+    const host: CccPlanningStageHost = Object.freeze({
+      fence: Object.freeze({
+        kind: "planning" as const,
+        workItemId: fence.workItemId,
+        runId: fence.runId,
+        attempt: fence.attempt,
+        leaseOwner: fence.leaseOwner,
+        originTaskId: task.id,
+      }),
+      descendants,
+      workItemIrHash: fence.irHash ?? null,
+      executedIrHash: cccPlanningWorkflowIrHash(target.ir),
+      signal,
+    });
+    const withHost = (context: Parameters<WorkflowNodeHandler>[1]) =>
+      Object.assign({ ...context }, { [CCC_PLANNING_STAGE_HOST_KEY]: host });
+    const k1 = buildCccPlanningWorkflowIr(custody.mode);
+    let result: Awaited<ReturnType<WorkflowGraphExecutor["run"]>>;
+    try {
+      if (host.executedIrHash !== cccPlanningWorkflowIrHash(k1)) {
+        const firstStage = k1.nodes.find((node) => node.kind === "gate")!;
+        const stage = await runStage(firstStage, withHost({ task, settings: buildWorkflowRuntimeSettings(settings), context: {}, signal }));
+        result = {
+          executed: false,
+          outcome: "failure",
+          visitedNodeIds: [],
+          context: {
+            ...(stage.contextPatch ?? {}),
+            [`node:${firstStage.id}:outcome`]: "failure",
+            ...(stage.value !== undefined ? { [`node:${firstStage.id}:value`]: stage.value } : {}),
+          },
+        };
+      } else {
+        const handlers: Partial<Record<WorkflowIrNode["kind"], WorkflowNodeHandler>> = {};
+        for (const kind of Object.keys(CCC_PLANNING_NODE_KINDS) as Array<WorkflowIrNode["kind"]>) {
+          handlers[kind] = async (node, context) => {
+            if (node.kind === "start" || node.kind === "end") return { outcome: "success" };
+            if (node.kind === "gate" && typeof node.config?.cccPlanningStage === "string") {
+              return runStage(node, withHost(context));
+            }
+            return { outcome: "failure", value: `ccc-planning-node-refused:${node.kind}` };
+          };
+        }
+        const executor = new WorkflowGraphExecutor({
+          handlers,
+          runId: fence.runId,
+          signal,
+          maxRetriesPerNode: 1,
+        });
+        result = await executor.run(task, buildWorkflowRuntimeSettings(settings), target.ir);
+      }
+    } catch (err) {
+      return this.campaignCustodyFailure(
+        task.id,
+        `workflow-execution-error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const hold = result.context[CCC_PLANNING_HOLD_CONTEXT_KEY] as CccPlanningHoldContext | undefined;
+    const aborted = signal.aborted;
+    const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success" && !aborted
+      ? "completed"
+      : hold?.disposition === "held"
+        ? "manual-required"
+        : hold?.disposition === "cancel"
+          ? "cancelled"
+          : "failed";
+    const reason = disposition === "completed"
+      ? undefined
+      : aborted
+        ? "workflow-aborted"
+        : hold
+          ? `ccc-planning-${hold.disposition}:${hold.runState}${hold.code ? `:${hold.code}` : ""}`
+          : graphFailureReason(result);
+    this.emit("terminal", task.id, reason ? `${disposition}:${reason}` : disposition);
+    return {
+      disposition,
+      outcome: disposition === "completed" ? "success" : "failure",
       visitedNodeIds: result.visitedNodeIds,
       context: result.context,
       ...(reason ? { reason } : {}),
@@ -1097,6 +1290,13 @@ export class WorkflowTaskRuntime {
     const handlers = { ...defaultHandlers, ...(this.deps.handlers ?? {}) };
     const ordinaryGate = handlers.gate;
     handlers.gate = (node, context) => {
+      // FNXC:CccPlanningHost 2026-10-14-22:17: a planning stage gate runs only under planning custody (runPlanning).
+      if (node.config?.cccPlanningStage !== undefined) {
+        return Promise.resolve({
+          outcome: "failure" as const,
+          value: "ccc-planning-stage-requires-planning-custody",
+        });
+      }
       const isCccProofGate = node.config?.cccProofSuite === true
         || node.config?.cccProofGate === true
         || node.config?.cccProofPhase !== undefined;

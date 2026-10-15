@@ -4,6 +4,7 @@ import {
   getCccCampaignExecutionAuthorizationForImport,
   isTaskMoveDisposalActive,
   registerTaskMoveDisposer,
+  type CccPlanningRunCustody,
   type Settings,
   type TaskDetail,
   type TaskStore,
@@ -12,7 +13,15 @@ import {
   type WorkflowWorkItemState,
 } from "@fusion/core";
 import { claimDueWorkflowWorkItem, type ExactWorkflowWorkCandidate, type WorkflowWorkSchedulerStore } from "./workflow-work-scheduler.js";
-import { WorkflowTaskRuntime, type WorkflowTaskRuntimeResult } from "./workflow-task-runtime.js";
+import {
+  CCC_PLANNING_HOLD_CONTEXT_KEY,
+  WorkflowTaskRuntime,
+  type CccPlanningHoldContext,
+  type WorkflowTaskRuntimeResult,
+  type WorkflowWorkCustodyKind,
+} from "./workflow-task-runtime.js";
+import { createCccPlanningDescendantRegistry, settleCccPlanningRun } from "./ccc-planning/controller.js";
+import { cccPlanningCancellationCompleter, cccPlanningRunLookup } from "./ccc-planning/ports.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
 import { CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON } from "./ccc-campaign-product-control.js";
@@ -25,7 +34,11 @@ export interface WorkflowWorkProcessorOptions {
   kinds?: WorkflowWorkItemKind[];
   exactCandidate?: ExactWorkflowWorkCandidate;
   campaignRequired?: boolean;
+  /** Card H1: "campaign" is the campaign custody path (`campaignRequired: true` aliases it); "planning" the planning run. */
+  custody?: WorkflowWorkCustodyKind;
 }
+
+export type { WorkflowWorkCustodyKind } from "./workflow-task-runtime.js";
 
 export interface WorkflowWorkProcessorResult {
   claimed: boolean;
@@ -49,6 +62,7 @@ type WorkflowWorkProcessorStore = WorkflowWorkSchedulerStore & {
     opts: { leaseDurationMs: number; now?: string },
   ) => WorkflowWorkItem | null | Promise<WorkflowWorkItem | null>;
   getCccCampaignContextForTask?: (taskId: string) => Promise<unknown | null> | unknown | null;
+  getCccPlanningRunForTask?: (taskId: string) => Promise<CccPlanningRunCustody | null>;
   getWorkflowWorkItem?: (id: string) => WorkflowWorkItem | null | Promise<WorkflowWorkItem | null>;
   updateTask?: (taskId: string, updates: { summary: string }) => Promise<unknown> | unknown;
 };
@@ -84,6 +98,15 @@ export async function processDueWorkflowWorkItem(
     */
     throw new Error("workflow work processor requires transitionWorkflowWorkItem");
   }
+  /*
+  FNXC:CccPlanningHost 2026-10-14-22:17:
+  D2: `campaignRequired: true` is an alias for custody "campaign"; "planning" is the request-to-code planning run. The
+  two cannot be asked for at once, and that is refused before any lease is consumed.
+  */
+  if (opts.custody === "planning" && opts.campaignRequired === true) {
+    throw new Error("workflow work processor custody \"planning\" cannot also require campaign custody");
+  }
+  const custody: WorkflowWorkCustodyKind | undefined = opts.custody ?? (opts.campaignRequired === true ? "campaign" : undefined);
   /* FNXC:MissionSymbolAdmission 2026-07-31-12:00: await the async symbol-lock admission before runtime may consume the workflow work lease. */
   const dispatch = await claimDueWorkflowWorkItem(store, {
     now: opts.now,
@@ -91,7 +114,7 @@ export async function processDueWorkflowWorkItem(
     leaseDurationMs: opts.leaseDurationMs,
     kinds: opts.kinds,
     exactCandidate: opts.exactCandidate,
-    bypassMissionSymbolAdmission: opts.campaignRequired === true,
+    bypassMissionSymbolAdmission: custody !== undefined,
   });
   if (!dispatch) return { claimed: false };
   const diagnostics: string[] = [];
@@ -155,8 +178,12 @@ export async function processDueWorkflowWorkItem(
     }, (10 * 60_000) / 3)
     : undefined;
   try {
+    if (custody === "planning") {
+      runtimeResult = await runPlanningWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController, diagnostics);
+      return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
+    }
     const importedCampaignWorkItem = isImportedCccCampaignWorkItem(dispatch.workItem);
-    const campaignRequired = opts.campaignRequired === true || importedCampaignWorkItem;
+    const campaignRequired = custody === "campaign" || importedCampaignWorkItem;
     if (userCancellationRequested) {
       runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
       return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
@@ -294,6 +321,165 @@ export async function processDueWorkflowWorkItem(
     }
   }
   return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
+}
+
+/**
+ * FNXC:CccPlanningHost 2026-10-14-22:17:
+ * Card H1 (D1, D3, D45). A planning item runs the whole K1 planning workflow under this one lease. The lease is
+ * renewed like a campaign lease; losing it (or any abort) settles the run strictly as cancelAll, flush, release,
+ * completeCancellation: registered descendants are cancelled, the runtime's own bookkeeping is awaited, the item goes
+ * back to `runnable` for the existing acquire path, and L1 completes a pending cancellation if nothing still holds it.
+ * A stage that parks the run (operator wait, blocked, unknown effect) holds the item without changing its attempt, so
+ * L1's resume and answer paths can requeue it; a cancelling run releases the item to `held` before L1 completes the
+ * cancellation, so a deferred completion never re-runs stages. Campaign custody, sealed authorization and campaign
+ * summaries never apply here.
+ */
+async function runPlanningWorkflowWorkItem(
+  store: WorkflowWorkProcessorStore,
+  runtime: WorkflowTaskRuntime,
+  settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
+  opts: WorkflowWorkProcessorOptions,
+  claimed: WorkflowWorkItem,
+  abortController: AbortController,
+  diagnostics: string[],
+): Promise<WorkflowTaskRuntimeResult> {
+  let workItem = claimed;
+  const failed = (reason: string): WorkflowTaskRuntimeResult => ({
+    disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason,
+  });
+  const casPatch = () => ({
+    now: opts.now,
+    expectedState: "running" as const,
+    expectedLeaseOwner: opts.leaseOwner,
+    expectedAttempt: workItem.attempt,
+    attempt: workItem.attempt,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+  });
+  const transition = async (state: WorkflowWorkItemState, patch: { lastError?: string | null; blockedReason?: string | null }) => {
+    await store.transitionWorkflowWorkItem!(workItem.id, state, { ...casPatch(), ...patch });
+  };
+  const releaseQuietly = async (state: WorkflowWorkItemState, patch: { lastError?: string | null; blockedReason?: string | null }) => {
+    try {
+      await transition(state, patch);
+    } catch (error) {
+      // The lease is gone (another engine reclaimed it) or the item moved: there is nothing of ours left to release.
+      diagnostics.push(`ccc planning release to ${state} skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  const completer = cccPlanningCancellationCompleter(store);
+  const completeCancellation = async () => {
+    if (!completer) {
+      diagnostics.push(`ccc planning cancellation completion is unwired for run ${workItem.runId}`);
+      return;
+    }
+    await completer(workItem.runId);
+  };
+  const failWorkItem = async (reason: string): Promise<WorkflowTaskRuntimeResult> => {
+    await transition("failed", { lastError: reason });
+    return failed(reason);
+  };
+
+  const lookup = cccPlanningRunLookup(store);
+  if (!lookup) return failWorkItem("workflow planning custody lookup is unwired");
+  const planningRun = await lookup(workItem.taskId);
+  if (!planningRun || planningRun.runId !== workItem.runId || planningRun.planningTaskId !== workItem.taskId) {
+    return failWorkItem("workflow required planning custody is missing");
+  }
+  if (typeof store.renewWorkflowWorkItemLease !== "function") {
+    return failWorkItem("workflow planning processor requires renewWorkflowWorkItemLease");
+  }
+  if (typeof store.getTask !== "function") return failWorkItem("workflow planning processor requires getTask");
+  if (workItem.attempt === 0) {
+    workItem = await store.transitionWorkflowWorkItem!(workItem.id, "running", {
+      now: opts.now,
+      expectedState: "running",
+      expectedLeaseOwner: opts.leaseOwner,
+      expectedAttempt: 0,
+      attempt: 1,
+      leaseOwner: opts.leaseOwner,
+    });
+  }
+  const descendants = createCccPlanningDescendantRegistry();
+  const signal = abortController.signal;
+  const settleAbort = async (flush: () => Promise<void>, why?: Error): Promise<WorkflowTaskRuntimeResult> => {
+    const reason = why ?? (signal.reason instanceof Error ? signal.reason : new Error("workflow-aborted"));
+    await settleCccPlanningRun({
+      descendants,
+      flush,
+      release: () => releaseQuietly("runnable", { lastError: reason.message }),
+      completeCancellation,
+      reason,
+    });
+    return failed(reason.message);
+  };
+  const renewal = startWorkflowLeaseRenewal(store, workItem, opts, abortController);
+  try {
+    const task = await store.getTask(workItem.taskId) as TaskDetail | undefined;
+    if (signal.aborted) return await settleAbort(async () => undefined);
+    if (!task) return await failWorkItem("workflow planning task is missing");
+    const running = runtime.run(task, settings, {
+      signal,
+      custody: "planning",
+      cccPlanningDescendants: descendants,
+      deferCompletionSummary: true,
+      workItemFence: {
+        workItemId: workItem.id,
+        leaseOwner: opts.leaseOwner,
+        attempt: workItem.attempt,
+        runId: workItem.runId,
+        eventTimestamp: opts.now ?? new Date().toISOString(),
+        ...(workItem.irHash ? { irHash: workItem.irHash } : {}),
+      },
+    });
+    const settled = running.then(() => undefined, () => undefined);
+    const aborted = new Promise<"aborted">((resolve) => {
+      if (signal.aborted) resolve("aborted");
+      else signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+    });
+    const first = await Promise.race([
+      running.then((result) => ({ result }), (error: unknown) => ({ error })),
+      aborted,
+    ]);
+    if (first === "aborted") return await settleAbort(() => settled);
+    if ("error" in first) {
+      return await failWorkItem(`workflow-work-item-runtime-error:${first.error instanceof Error ? first.error.message : String(first.error)}`);
+    }
+    const result = first.result;
+    if (signal.aborted) return await settleAbort(async () => undefined);
+    const hold = result.context[CCC_PLANNING_HOLD_CONTEXT_KEY] as CccPlanningHoldContext | undefined;
+    if (hold?.disposition === "lease-lost") {
+      await settleAbort(async () => undefined, new Error("ccc-planning-fence-stale"));
+      return result;
+    }
+    if (hold?.disposition === "cancel") {
+      await settleCccPlanningRun({
+        descendants,
+        flush: async () => undefined,
+        release: () => transition("held", { blockedReason: "ccc-planning:cancelling", lastError: null }),
+        completeCancellation,
+        reason: new Error("ccc-planning-cancelling"),
+      });
+      return result;
+    }
+    if (hold?.disposition === "held") {
+      await descendants.cancelAll(new Error(`ccc-planning-held:${hold.runState}`));
+      const blockedReason = ["ccc-planning", hold.runState, hold.code, hold.decisionId]
+        .filter((part): part is string => typeof part === "string" && part.length > 0)
+        .join(":");
+      await transition("held", { blockedReason, lastError: null });
+      return result;
+    }
+    await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
+    if (result.disposition === "completed") {
+      await transition("succeeded", { lastError: null });
+    } else {
+      await transition("failed", { lastError: result.reason ?? "workflow-planning-failed" });
+    }
+    return result;
+  } finally {
+    if (renewal) clearInterval(renewal);
+  }
 }
 
 function claimedProcessorResult(
