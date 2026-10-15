@@ -12,6 +12,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import {
+  answerCccPlanningDecision,
   admitCccPlanningDispatch,
   buildCccPlanningWorkflowIr,
   CCC_PLANNING_IR_STAGES,
@@ -200,7 +201,7 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
 
   async function workItem(run: Run): Promise<Row> {
     const rows = (await db.execute(sql`
-      SELECT state, attempt, lease_owner FROM project.workflow_work_items WHERE project_id = ${PROJECT} AND id = ${run.workItemId}
+      SELECT state, attempt, lease_owner, blocked_reason FROM project.workflow_work_items WHERE project_id = ${PROJECT} AND id = ${run.workItemId}
     `)) as unknown as Row[];
     expect(rows).toHaveLength(1);
     return rows[0]!;
@@ -417,6 +418,38 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
     return requestCccPlanningControl(harness.layer, { runId: run.runId, request: "cancel", actor: "operator" });
   }
 
+  async function publishRaceQuestion(run: Run): Promise<string> {
+    const record = await createCccPlanningArtifactPort(harness.layer).publishCccPlanningArtifact({
+      planningTaskId: run.taskId, runId: run.runId,
+      slot: { runRevision: 1, stageId: "intent", slot: "racequestion", version: 1 },
+      kind: "decision_request", contentSchema: "ccc-planning.decision-request.v1",
+      content: { type: "json", value: { schema: "ccc-planning.decision-request.v1", question: "Which target?" } },
+      inputs: [], producer: { kind: "controller", roleId: "controller", instanceId: "controller:race" },
+      policy: { promptVersion: "none", promptDigest: "none", toolPolicyVersion: "none", toolPolicyDigest: "none" },
+      status: "complete", now: NOW,
+      fence: { kind: "work_item_lease", workItemId: run.workItemId, runId: run.runId,
+        leaseOwner: run.fence.leaseOwner, attempt: 1 },
+    });
+    return cccPlanningDecisionId({ revision: 1, questionDigest: record.envelope.outputDigest });
+  }
+
+  async function continueRaceAndCancel(run: Run): Promise<void> {
+    let entered = false;
+    const stages = plainStages({ preflight: async () => {
+      entered = true;
+      await operatorCancel(run);
+      return { kind: "committed", artifactKeys: [] };
+    } });
+    const result = await processDueWorkflowWorkItem(harness.store, planningRuntime(stages), undefined, {
+      leaseOwner: LIVE_ENGINE, leaseDurationMs: 60_000, custody: "planning",
+      exactCandidate: { id: run.workItemId, runId: run.runId, attempt: 2 },
+    });
+    expect(result.claimed).toBe(true);
+    expect(entered).toBe(true);
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  }
+
   function workflowIdOf(run: Pick<Run, "runId">): string {
     return `${run.runId.replace(":", "-")}--workflow`;
   }
@@ -529,6 +562,88 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
     expect(cancel).toMatchObject({ appliedDirectly: true });
     expect(await anchor(run)).toMatchObject({ state: "cancelled" });
     expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  // FNXC:CccPlanningHost 2026-10-15-05:15: E17 Y1/Y2 exercise the control before the held write; Y3 proves L1's existing after-held path.
+  it("H1z Y1: a resume between a blocked park and its held write requeues and can later cancel", async () => {
+    const run = await seedRun({ lease: "expired" });
+    const real = createCccPlanningLedgerPort(harness.layer);
+    const racing = Object.freeze({ ...real, transitionCccPlanningRunState: async (
+      input: Parameters<CccPlanningLedgerPort["transitionCccPlanningRunState"]>[0],
+    ) => {
+      const moved = await real.transitionCccPlanningRunState(input);
+      if (input.to === "blocked_prerequisite") {
+        await requestCccPlanningControl(harness.layer, { runId: run.runId, request: "resume", actor: "operator" });
+      }
+      return moved;
+    } });
+    await processRun(run, planningRuntime(plainStages({
+      preflight: async () => ({ kind: "blocked", state: "blocked_prerequisite", code: "CCC_PLANNING_SANDBOX_UNAVAILABLE" }),
+    }), racing));
+    expect(await anchor(run)).toMatchObject({ state: "running" });
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 2, lease_owner: null, blocked_reason: null });
+    await continueRaceAndCancel(run);
+  });
+
+  it("H1z Y2: an answer between awaiting-intent park and its held write requeues and can later cancel", async () => {
+    const run = await seedRun({ lease: "live" });
+    const decisionId = await publishRaceQuestion(run);
+    await expireLease(run);
+    const real = createCccPlanningLedgerPort(harness.layer);
+    const racing = Object.freeze({ ...real, transitionCccPlanningRunState: async (
+      input: Parameters<CccPlanningLedgerPort["transitionCccPlanningRunState"]>[0],
+    ) => {
+      const moved = await real.transitionCccPlanningRunState(input);
+      if (input.to === "awaiting_intent") {
+        await answerCccPlanningDecision(harness.layer, { runId: run.runId, decisionId, answer: "Use the admitted target", actor: "operator" });
+      }
+      return moved;
+    } });
+    await processRun(run, planningRuntime(plainStages({ intent: async () => ({ kind: "awaiting-intent", decisionId }) }), racing));
+    expect(await anchor(run)).toMatchObject({ state: "running" });
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 2, lease_owner: null, blocked_reason: null });
+    await continueRaceAndCancel(run);
+  });
+
+  it("H1z Y3 control: an answer after the held write uses the existing ledger requeue and can later cancel", async () => {
+    const run = await seedRun({ lease: "live" });
+    const decisionId = await publishRaceQuestion(run);
+    await expireLease(run);
+    await processRun(run, planningRuntime(plainStages({ intent: async () => ({ kind: "awaiting-intent", decisionId }) })));
+    expect(await workItem(run)).toMatchObject({ state: "held", attempt: 1 });
+    await answerCccPlanningDecision(harness.layer, { runId: run.runId, decisionId, answer: "Use the admitted target", actor: "operator" });
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 2, lease_owner: null, blocked_reason: null });
+    await continueRaceAndCancel(run);
+  });
+
+  it("H1z Y4: a held read-back failure releases the item and a later resume can continue and cancel", async () => {
+    const run = await seedRun({ lease: "expired" });
+    const real = createCccPlanningLedgerPort(harness.layer);
+    let held = false;
+    let failedReads = 0;
+    const flaky = proxiedStore((key) => {
+      if (key === "inspectCccPlanningRun") return async (runId: string) => {
+        if (held && failedReads++ === 0) throw new Error("held read-back unavailable");
+        return real.inspectCccPlanningRun(runId);
+      };
+      if (key === "transitionCccPlanningRunState") return real.transitionCccPlanningRunState;
+      if (key === "transitionWorkflowWorkItem") return async (
+        ...args: Parameters<PgTestHarness["store"]["transitionWorkflowWorkItem"]>
+      ) => {
+        const moved = await harness.store.transitionWorkflowWorkItem(...args);
+        if (args[1] === "held") held = true;
+        return moved;
+      };
+      return undefined;
+    });
+    const result = await processRun(run, planningRuntime(plainStages({
+      preflight: async () => ({ kind: "blocked", state: "blocked_prerequisite", code: "CCC_PLANNING_SANDBOX_UNAVAILABLE" }),
+    })), flaky);
+    expect(failedReads).toBe(1);
+    expect(result.diagnostics?.join(" ")).toContain("held read-back unavailable");
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 2, lease_owner: null, blocked_reason: null });
+    await requestCccPlanningControl(harness.layer, { runId: run.runId, request: "resume", actor: "operator" });
+    await continueRaceAndCancel(run);
   });
 
   /*
