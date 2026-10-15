@@ -125,6 +125,7 @@ import {
   CCC_TERMINAL_ROUTE_RECEIPT_API,
   streamCccTerminalRouteReceipt,
 } from "./ccc-route-receipt-adapter.js";
+import { assertCccPolicySessionFinalTools, resolveCccPolicySessionTools } from "./ccc-confinement/session-tool-policy.js";
 
 /**
  * A receipt is durable after its flush, but two concurrently-created agent
@@ -4290,7 +4291,23 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     ? undefined
     : new Set(options.toolsAllowlist.map((name) => name.trim().toLowerCase()).filter(Boolean));
   const isAllowedByToolAllowlist = (toolName: string): boolean => normalizedToolsAllowlist === undefined || normalizedToolsAllowlist.has(toolName.trim().toLowerCase());
-  const builtins = [
+  /*
+  FNXC:CccSessionToolPolicy 2026-10-14-21:20:
+  Card C2 (D11, CONTRACT-v3 section 2.13). A binding with a tool policy closes the session tool set: options.tools and the allowlists stop selecting tools, Pi's built-ins are never created, and the session gets only the policy's tools, the confined ones built over cccConfinement (grep is Fusion's) and the rest from customTools. Any MCP server, and any builtin allowlist, tools allowlist or custom tool outside the policy, is refused here with CCC_SESSION_TOOL_POLICY_REFUSED, before an MCP connection or a session exists. Host extensions, skills and RTK are skipped below, and the final list is checked again after the wrapper chain.
+  */
+  const cccToolPolicy = cccProviderAttemptBinding?.toolPolicy;
+  const cccPolicyTools = cccToolPolicy
+    ? resolveCccPolicySessionTools({
+        policy: cccToolPolicy,
+        confinement: options.cccConfinement!,
+        cwd: options.cwd,
+        customTools: options.customTools ?? [],
+        mcpServerNames: requestedMcpServers.map((server) => server.name),
+        builtinToolsAllowlist: options.builtinToolsAllowlist,
+        toolsAllowlist: options.toolsAllowlist,
+      })
+    : undefined;
+  const builtins = cccPolicyTools ? [] : [
     createReadTool(options.cwd),
     createBashTool(options.cwd, bashToolOptions),
     createEditTool(options.cwd),
@@ -4302,7 +4319,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const modeFilteredTools = isReadonly
     ? builtins.filter((tool) => isReadonlyAllowed(tool.name))
     : builtins;
-  const tools = modeFilteredTools.filter((tool) => isAllowedByToolAllowlist(tool.name));
+  const tools = cccPolicyTools ?? modeFilteredTools.filter((tool) => isAllowedByToolAllowlist(tool.name));
   // Suppress lint about unused presets — kept in scope for incremental migration.
   void createCodingTools;
   void createReadOnlyTools;
@@ -4421,14 +4438,16 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   FNXC:MergeQueue 2026-07-15-11:08:
   Also skip host extensions for sessionPurpose "merger". Merge agents only need coding builtins (git/bash); host fn_* tools open a second store and can wedge the merge on hung fn_task_show. Engine-owned customTools (if ever supplied) still pass through.
   */
-  const skipHostExtensions = isReadonly || options.sessionPurpose === "merger";
+  const skipHostExtensions = isReadonly || options.sessionPurpose === "merger" || cccToolPolicy !== undefined;
   const effectiveExtensionPaths = skipHostExtensions ? [] : hostExtensionPaths;
   if (skipHostExtensions && hostExtensionPaths.length > 0) {
     /*
     FNXC:MergeQueue 2026-07-15-11:20:
     Log the actual skip reason (readonly vs sessionPurpose) so future skip reasons do not mislabel as "merger".
     */
-    const skipReason = isReadonly
+    const skipReason = cccToolPolicy !== undefined
+      ? "tool-policy"
+      : isReadonly
       ? "readonly"
       : `sessionPurpose=${options.sessionPurpose ?? "unknown"}`;
     piLog.log(`${skipReason} session — host extensions (${hostExtensionPaths.length}) skipped`);
@@ -4444,10 +4463,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         ? [options.systemPromptLayers.dynamic]
         : [],
     ...(effectiveExtensionPaths.length > 0 ? { additionalExtensionPaths: [...effectiveExtensionPaths] } : {}),
-    ...(normalizedAdditionalSkillPaths.length > 0
+    ...(normalizedAdditionalSkillPaths.length > 0 && cccToolPolicy === undefined
       ? { additionalSkillPaths: normalizedAdditionalSkillPaths }
       : {}),
-    ...(skillsOverrideFn ? { skillsOverride: skillsOverrideFn } : {}),
+    ...(skillsOverrideFn && cccToolPolicy === undefined ? { skillsOverride: skillsOverrideFn } : {}),
+    // FNXC:CccSessionToolPolicy 2026-10-14-21:20: card C2, a tool-policy session loads no extensions and no skills (D11).
+    ...(cccToolPolicy !== undefined ? { noExtensions: true, noSkills: true } : {}),
   });
   await resourceLoader.reload();
 
@@ -4593,7 +4614,8 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     );
 
     const mcpReadonlyTools = new Set(mcpToolset?.tools ?? []);
-    const candidateCustomTools = [
+    // FNXC:CccSessionToolPolicy 2026-10-14-21:20: card C2, a tool-policy session's custom tools are already in `tools` (D11).
+    const candidateCustomTools = cccPolicyTools ? [] : [
       ...(options.customTools ?? []),
       ...(mcpToolset?.tools ?? []),
     ];
@@ -4617,7 +4639,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       ...(tools as ToolDefinition[]),
       ...allowlistFilteredCustomTools.allowed,
     ];
-    const toolsWithRtkRewrite = wrapToolsWithRtkRewrite(toolChainStart);
+    const toolsWithRtkRewrite = cccToolPolicy ? toolChainStart : wrapToolsWithRtkRewrite(toolChainStart);
     /*
      * FNXC:AgentGating 2026-07-12-17:22:
      * MAIN-008 requires one approval authority per tool call. Executor sessions
@@ -4672,6 +4694,11 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       const [doneTool] = customToolList.splice(heartbeatDoneIdx, 1);
       customToolList.push(doneTool);
     }
+    /*
+    FNXC:CccSessionToolPolicy 2026-10-14-21:20:
+    Card C2 (D11). The tool-policy session's final list, after every wrapper, must still be exactly its policy: names, parameters (the toolset digest) and the confinement mark on every confined name, so a wrapper that dropped fn_complete_phase or swapped a tool refuses the session before it exists.
+    */
+    if (cccToolPolicy) assertCccPolicySessionFinalTools(cccToolPolicy, customToolList);
     // Last-chance abort hook. Fires *here* — after every awaited setup step
     // in createFnAgent (provider registration, worktree validation, resource
     // loader reload) and immediately before the actual LLM session spawn.
@@ -4708,7 +4735,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       ...(modelOverride ? { model: modelOverride } : {}),
     };
 
-    if (options.builtinToolsAllowlist && options.builtinToolsAllowlist.length > 0) {
+    if (cccToolPolicy) {
+      createSessionOptions.tools = customToolList.map((tool) => tool.name).sort();
+    }
+    if (!cccToolPolicy && options.builtinToolsAllowlist && options.builtinToolsAllowlist.length > 0) {
       const safeBuiltinAllowlist = (isReadonly
         ? options.builtinToolsAllowlist.filter((name) => READONLY_ALLOWLIST.includes(name as (typeof READONLY_ALLOWLIST)[number]))
         : options.builtinToolsAllowlist).filter(isAllowedByToolAllowlist);
@@ -4719,7 +4749,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         ]),
       ].sort();
     }
-    if (normalizedToolsAllowlist !== undefined) {
+    if (!cccToolPolicy && normalizedToolsAllowlist !== undefined) {
       createSessionOptions.tools = [
         ...new Set([
           ...customToolList.map((tool) => tool.name),
