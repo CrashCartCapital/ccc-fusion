@@ -2311,3 +2311,6 @@ export * from "./task-store/ccc-planning-ops.js";
 // FNXC:CccPlanning 2026-10-14-22:25 (INT-3a, D34 parent barrel): card AD1's one-transaction run admission, for the
 // engine and CLI callers (G0, CL1 deps, CL2); core modules keep importing it relatively (errata E10 B-1).
 export * from "./task-store/ccc-planning-admission-ops.js";
+// FNXC:CccPlanning 2026-10-15-00:12 (INT-3c, D34 parent barrel): card IM1's import intent and write-once link, and
+// CccPlanningImportClosure, for the engine import bridge (IB2) and the live-execution release (AU2); core imports it relatively.
+export * from "./task-store/ccc-planning-import-ops.js";
