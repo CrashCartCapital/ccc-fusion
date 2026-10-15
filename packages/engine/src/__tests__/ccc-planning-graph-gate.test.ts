@@ -1,16 +1,22 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type {
-  CccPlanningAcceptanceCasesV1,
-  CccPlanningRequirementMapV1,
-  CccPlanningTaskPlanV1,
-  CccPlanningVerifierBundleV1,
-  CccPrdAuthoringProposalV2,
-  CccPrdDiagnostic,
+import {
+  CCC_PLANNING_PREFLIGHT_LINEAGES,
+  CCC_PLANNING_ROLE_POLICY_FULL_V2,
+  type CccPlanningAcceptanceCasesV1,
+  type CccPlanningRequirementMapV1,
+  type CccPlanningTaskPlanV1,
+  type CccPlanningVerifierBundleV1,
+  type CccPrdAuthoringProposalV2,
+  type CccPrdDiagnostic,
 } from "@fusion/core";
 import { diagnoseCccPrdProductGraphAdmission } from "../ccc-prd/compiler.js";
 import { CCC_PLANNING_G4_SOURCE_PATHS, runCccPlanningG4, type CccPlanningG4Input } from "../ccc-planning/gates.js";
-import { cccPlanningGraphAdmissionInput, diagnoseCccPlanningTaskPlanGraph } from "../ccc-planning/graph-gate.js";
+import {
+  CCC_PLANNING_FIXED_LINEAGE_IDS,
+  cccPlanningGraphAdmissionInput,
+  diagnoseCccPlanningTaskPlanGraph,
+} from "../ccc-planning/graph-gate.js";
 
 /*
 FNXC:CccPlanningGraphGate 2026-10-14-18:40:
@@ -228,6 +234,42 @@ function mutableTasks(input: MutableInput): Array<Record<string, unknown>> {
   return input.proposal.tasks as unknown as Array<Record<string, unknown>>;
 }
 
+/** The diamond with one more path owned and writable by T1, in the plan, the proposal and an annex custody quote alike. */
+function withExtraT1Path(extraPath: string): MutableInput {
+  const line = `Task T1 also owns ${extraPath} here.`;
+  const input = g4Input(DIAMOND, [line]);
+  const planned = input.taskPlan.tasks[0] as unknown as { ownedPaths: string[]; allowedWriteRoots: string[] };
+  planned.ownedPaths = ["src/tokenizer.mjs", extraPath];
+  planned.allowedWriteRoots = ["src/tokenizer.mjs", extraPath];
+  const proposed = mutableTasks(input)[0]!;
+  proposed.ownedPaths = [...planned.ownedPaths];
+  proposed.allowedWriteRoots = [...planned.allowedWriteRoots];
+  (proposed.sourceRefs as unknown[]).push({ path: P.technicalAnnex, exactQuote: line });
+  return input;
+}
+
+/** The diamond with task `from` renamed everywhere the plan and the proposal name it. */
+function renamedTask(from: string, to: string): MutableInput {
+  const input = g4Input();
+  const swap = (id: string) => (id === from ? to : id);
+  const plan = input.taskPlan as unknown as {
+    tasks: Array<{ id: string; dependencyTaskIds: string[] }>; edges: Array<{ fromTaskId: string; toTaskId: string }>;
+  };
+  for (const task of plan.tasks) {
+    task.id = swap(task.id);
+    task.dependencyTaskIds = task.dependencyTaskIds.map(swap);
+  }
+  for (const edge of plan.edges) {
+    edge.fromTaskId = swap(edge.fromTaskId);
+    edge.toTaskId = swap(edge.toTaskId);
+  }
+  for (const task of mutableTasks(input)) {
+    task.id = swap(task.id as string);
+    task.dependencyTaskIds = (task.dependencyTaskIds as string[]).map(swap);
+  }
+  return input;
+}
+
 describe("runCccPlanningG4", () => {
   it("positive control: the section 4.1 diamond with its sources yields zero diagnostics", () => {
     expect(run(g4Input())).toEqual([]);
@@ -284,8 +326,12 @@ describe("runCccPlanningG4", () => {
     const plan = input.taskPlan as unknown as { protectedActions: unknown[]; tasks: Array<{ protectedActionIds: string[] }> };
     plan.protectedActions.push({ id: "A-MERGE", kind: "merge", target: "main" });
     plan.tasks[1]!.protectedActionIds.push("A-MERGE");
+    // The proposal carries the same action (errata E9 GG item 2), so the agreement check is silent and only the landing rule can refuse.
+    (mutableTasks(input)[1]!.protectedActionIds as string[]).push("A-MERGE");
     const diagnostics = run(input);
-    expect(codes(diagnostics)).toEqual(["CCC_PLANNING_GRAPH_INADMISSIBLE"]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(diagnostics[0]!.message).toContain("single terminal task");
     expect(diagnostics[0]!.message).toContain("A-MERGE");
     // Control: the same action on the terminal task is admitted.
     const control = g4Input();
@@ -294,6 +340,51 @@ describe("runCccPlanningG4", () => {
     terminal.tasks[3]!.protectedActionIds.push("A-MERGE");
     (mutableTasks(control)[3]!.protectedActionIds as string[]).push("A-MERGE");
     expect(run(control)).toEqual([]);
+  });
+
+  it("two merge actions on the terminal task fail G4 with the importer's one-merge rule", () => {
+    const input = g4Input();
+    const plan = input.taskPlan as unknown as { protectedActions: unknown[]; tasks: Array<{ protectedActionIds: string[] }> };
+    plan.protectedActions.push({ id: "A-MERGE", kind: "merge", target: "main" }, { id: "A-MERGE-2", kind: "merge", target: "release" });
+    plan.tasks[3]!.protectedActionIds.push("A-MERGE", "A-MERGE-2");
+    (mutableTasks(input)[3]!.protectedActionIds as string[]).push("A-MERGE", "A-MERGE-2");
+    const diagnostics = run(input);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+    expect(diagnostics[0]!.message).toContain("2 merge actions (A-MERGE, A-MERGE-2)");
+  });
+
+  /*
+  FNXC:CccPlanningGraphGate 2026-10-14-21:05:
+  Errata E9 GG item 1 at the G4 level. The plan, its proposal and the annex custody quote all carry the same non-canonical spelling, which K1's validator, the agreement check and the custody provenance check all admit; the custody check would still refuse it at import (semantic-proof-custody.ts:1271), so G4 must refuse it before any review spend.
+  */
+  it("a non-canonical task path fails G4 before review: the custody check would refuse it as a model write root", () => {
+    for (const spelling of ["./src/helper.mjs", "src/helper/", "src//helper.mjs", "src/./helper.mjs"]) {
+      const diagnostics = run(withExtraT1Path(spelling));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+      expect(diagnostics[0]!.message).toContain("rule write-root-canonical:");
+      expect(diagnostics[0]!.message).toContain("task T1");
+      expect(diagnostics[0]!.message).toContain(`path ${spelling}:`);
+    }
+    // Control: the canonical spelling of the same extra path is admitted.
+    expect(run(withExtraT1Path("src/helper.mjs"))).toEqual([]);
+  });
+
+  /*
+  FNXC:CccPlanningGraphGate 2026-10-14-21:05:
+  Errata E9 GG item 3 (E8 N-3). A campaign task's G7 review runs on lineage `review:<semantic task id>`, and dispatch counters are keyed by lineage id alone (E7-L 8(b)), so a task named like a planning critic would share that critic's attempt counters. G4 refuses the plan; a near name is admitted.
+  */
+  it("a semantic task id whose G7 lineage review:<id> is a planning fixed lineage fails G4", () => {
+    for (const id of ["product-adversary", "technical-critic"]) {
+      const diagnostics = run(renamedTask("T1", id));
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]!.code).toBe("CCC_PLANNING_GRAPH_INADMISSIBLE");
+      expect(diagnostics[0]!.message).toContain(`task ${id}`);
+      expect(diagnostics[0]!.message).toContain(`review:${id}`);
+    }
+    // Control: a task id that forms no fixed lineage is admitted.
+    expect(run(renamedTask("T1", "product-adversary-2"))).toEqual([]);
   });
 
   it("admitted write roots without the target's .fusion fail G4", () => {
@@ -324,5 +415,25 @@ describe("runCccPlanningG4", () => {
     const diagnostics = run(input);
     expect(codes(diagnostics)).toEqual(["CCC_PLANNING_GRAPH_INADMISSIBLE"]);
     expect(diagnostics.every(({ message }) => message.startsWith("task plan:"))).toBe(true);
+  });
+});
+
+describe("CCC_PLANNING_FIXED_LINEAGE_IDS", () => {
+  it("is derived from K1: each fixed or once-if-leaves role's stage:role, each preflight lineage and judge:final", () => {
+    const expected = [
+      ...CCC_PLANNING_ROLE_POLICY_FULL_V2.roles
+        .filter(({ counting }) => counting === "fixed" || counting === "once-if-leaves")
+        .map(({ stageId, roleId }) => `${stageId}:${roleId}`),
+      ...CCC_PLANNING_PREFLIGHT_LINEAGES.map(({ lineageId }) => lineageId),
+      "judge:final",
+    ];
+    expect(CCC_PLANNING_FIXED_LINEAGE_IDS).toEqual([...new Set(expected)].sort());
+    expect(CCC_PLANNING_FIXED_LINEAGE_IDS).toEqual(expect.arrayContaining(
+      ["design:designer-b", "research:leaf-reviewer", "preflight:critic", "judge:final"]));
+    for (const perTaskOrProbe of ["research:extraction-leaf", "campaign:implementation-writer", "g7:task-reviewer", "preflight:preflight-writer"]) {
+      expect(CCC_PLANNING_FIXED_LINEAGE_IDS).not.toContain(perTaskOrProbe);
+    }
+    // The ids a G7 lineage review:<semantic task id> can collide with today (errata E9 GG item 3).
+    expect(CCC_PLANNING_FIXED_LINEAGE_IDS.filter((id) => id.startsWith("review:"))).toEqual(["review:product-adversary", "review:technical-critic"]);
   });
 });

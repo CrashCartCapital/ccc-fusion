@@ -1,9 +1,11 @@
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type {
-  CccPlanningTaskPlanV1,
-  CccPrdAuthoringProposalV2,
-  CccPrdDiagnostic,
-  CccPrdImportIntent,
+import {
+  CCC_PLANNING_PREFLIGHT_LINEAGES,
+  CCC_PLANNING_ROLE_POLICY_FULL_V2,
+  type CccPlanningTaskPlanV1,
+  type CccPrdAuthoringProposalV2,
+  type CccPrdDiagnostic,
+  type CccPrdImportIntent,
 } from "@fusion/core";
 import { diagnoseCccPrdProductGraphAdmission, type CccPrdProductGraphAdmissionInput } from "../ccc-prd/compiler.js";
 
@@ -12,6 +14,8 @@ FNXC:CccPlanningGraphGate 2026-10-14-18:53:
 Card GG, G4 graph admission (D19, ADR B Q3, T3.2). The planner's task plan carries no workflow, terminal or import intent of its own, so G4 builds the one input the compiler's exported `diagnoseCccPrdProductGraphAdmission` (B2) reads, the way IB1's proposal will declare it: one workflow holding every task, entries are the tasks with no dependency, terminals the tasks nothing depends on, the plan's edges unchanged, and exactly one import intent each for the campaign, source, run audit, workflow and work item plus one per task and per edge. The diagnostics are therefore the compiler's own words about the same graph (a cycle, an N shape, two terminals, shared ownership), not a second implementation that could drift from it.
 FNXC:CccPlanningGraphGate 2026-10-14-18:53:
 The compiler leaves two importer rules unchecked, so G4 adds them, both as CCC_PLANNING_GRAPH_INADMISSIBLE. The importer lands a merge only through the single terminal task (`mergeLandingFor`, importer.ts:1056): a merge action named by any other task would never run, and two merges on the terminal are refused at import. And the importer refuses a bundle whose admitted write roots do not contain the target's `.fusion/tasks` and `.fusion/artifacts`, or whose bounds exceed 10,000 requests, 86,400,000 ms or concurrency 256 (`assertCccPrdImportBundle`, import-admission.ts:89-111); G4 applies the same containment and ceilings to the proposal so a plan it admits is not refused after review.
+FNXC:CccPlanningGraphGate 2026-10-14-21:10:
+Errata E9 GG item 3 (E8 N-3). A campaign task's G7 review runs on lineage `review:${semanticTaskId}` (section 2.1), and dispatch counters are keyed by lineage id alone (E7-L 8(b)), so a task whose id makes that lineage equal to a planning fixed lineage would share that lineage's attempt counters. G4 refuses such a plan with CCC_PLANNING_GRAPH_INADMISSIBLE naming the task and the colliding lineage. The fixed set is derived from K1's exports, never listed by hand: `${stageId}:${roleId}` for every `fixed` or `once-if-leaves` role of K1's role policy (K1 exports one, full-v2), every `CCC_PLANNING_PREFLIGHT_LINEAGES` id, and the G8 lineage `judge:final`, which section 2.1 fixes and no K1 role spells. Today the colliding ids are `review:product-adversary` and `review:technical-critic`.
 */
 
 export const CCC_PLANNING_WORKFLOW_ID = "ccc-planning-workflow";
@@ -29,6 +33,19 @@ const INTENT_TARGET = {
 } as const;
 
 const IMPORT_BOUND_CEILINGS = Object.freeze({ maxRequests: 10_000, maxDurationMs: 86_400_000, maxConcurrency: 256 });
+
+/** Section 2.1 node lineage ids that no K1 role spells: G7 is `review:${semanticTaskId}` and G8 is `judge:final`. */
+const G7_LINEAGE_PREFIX = "review:";
+const G8_LINEAGE_ID = "judge:final";
+
+/** Every planning fixed lineage id, sorted: derived from K1's role policy and preflight lineages, plus the G8 lineage. */
+export const CCC_PLANNING_FIXED_LINEAGE_IDS: readonly string[] = Object.freeze([...new Set([
+  ...[CCC_PLANNING_ROLE_POLICY_FULL_V2].flatMap(({ roles }) => roles
+    .filter(({ counting }) => counting === "fixed" || counting === "once-if-leaves")
+    .map(({ stageId, roleId }) => `${stageId}:${roleId}`)),
+  ...CCC_PLANNING_PREFLIGHT_LINEAGES.map(({ lineageId }) => lineageId),
+  G8_LINEAGE_ID,
+])].sort());
 
 function intent(id: string, entityType: keyof typeof INTENT_TARGET, entityId: string): CccPrdImportIntent {
   return { id, entityType, entityId, operation: "create", target: INTENT_TARGET[entityType] };
@@ -104,11 +121,23 @@ function mergeLandingDiagnostics(taskPlan: CccPlanningTaskPlanV1): CccPrdDiagnos
   return diagnostics;
 }
 
-/** G4's graph part: the compiler's product-graph admission plus the importer's merge-landing rule. Pure. */
+function lineageCollisionDiagnostics(taskPlan: CccPlanningTaskPlanV1): CccPrdDiagnostic[] {
+  const fixed = new Set(CCC_PLANNING_FIXED_LINEAGE_IDS);
+  return taskPlan.tasks
+    .filter(({ id }) => fixed.has(`${G7_LINEAGE_PREFIX}${id}`))
+    .map(({ id }) => ({
+      code: "CCC_PLANNING_GRAPH_INADMISSIBLE",
+      message: `task ${id}: its G7 review lineage ${G7_LINEAGE_PREFIX}${id} is the planning fixed lineage ${G7_LINEAGE_PREFIX}${id};`
+        + " dispatch counters are keyed by lineage id alone, so the task's review would share that lineage's attempts",
+    }));
+}
+
+/** G4's graph part: the compiler's product-graph admission, the importer's merge-landing rule and the G7 lineage namespace. Pure. */
 export function diagnoseCccPlanningTaskPlanGraph(taskPlan: CccPlanningTaskPlanV1): CccPrdDiagnostic[] {
   return [
     ...diagnoseCccPrdProductGraphAdmission(cccPlanningGraphAdmissionInput(taskPlan)),
     ...mergeLandingDiagnostics(taskPlan),
+    ...lineageCollisionDiagnostics(taskPlan),
   ];
 }
 

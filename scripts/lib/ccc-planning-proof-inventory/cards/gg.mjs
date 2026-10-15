@@ -5,6 +5,8 @@ Proof inventory for request-to-code v3 card GG (deterministic planning gates: G3
 All four check files are engine tests the card owns, run under the `engine-default` project, whose aliases point @fusion/core at source, so no build runs and nothing reaches PostgreSQL (the gates are pure). TARGETED is file-closed over the four files in one command. OFFLINE is name-closed over the same files: the names below are exactly their tests, built the way `assertionName` in `scripts/run-ccc-pg-proof.mjs` builds them (ancestor titles and the title joined by " > "), so a skipped, renamed, missing or extra test fails the command instead of passing quietly.
 
 Measured on the M5 Max under a load average near 10 to 12 (parallel agents running heavy suites): the four files take about 2.5 to 3.1 s of vitest duration for 46 tests, including transform and import (the tests themselves take under 0.1 s). The 120 s command timeout is a hang bound over that measurement; no test timeout is raised anywhere.
+FNXC:CccPlanningProof 2026-10-14-21:13:
+Repair 1 (errata E9 GG items 1 to 3) adds seven names: the write-root-canonical rule (non-canonical spelling, surrounding whitespace, a duplicate write root, and the same refusal through G4), the two-merges-on-the-terminal case, the G7 lineage collision through G4, and the derivation of the planning fixed lineage set from K1. Re-measured on the M5 Max at a load average near 13: 53 tests in 1.96 s of vitest duration (about 2 s wall; the tests themselves take 50 ms), so the 120 s command timeout keeps its wide margin as a hang bound.
 */
 
 const SOURCE_FIDELITY_FILE = "src/__tests__/ccc-planning-source-fidelity.test.ts";
@@ -55,10 +57,14 @@ export const OFFLINE = Object.freeze([
       `runCccPlanningG4 > a task path missing from its exact source evidence fails G4 with the custody provenance code`,
       `runCccPlanningG4 > a proposal whose task custody differs from the task plan fails G4`,
       `runCccPlanningG4 > a merge action on a non-terminal task fails G4 with the importer's landing rule`,
+      `runCccPlanningG4 > two merge actions on the terminal task fail G4 with the importer's one-merge rule`,
+      `runCccPlanningG4 > a non-canonical task path fails G4 before review: the custody check would refuse it as a model write root`,
+      `runCccPlanningG4 > a semantic task id whose G7 lineage review:<id> is a planning fixed lineage fails G4`,
       `runCccPlanningG4 > admitted write roots without the target's .fusion fail G4`,
       `runCccPlanningG4 > G4 runs source fidelity: a changed request byte gives the anchor mismatch`,
       `runCccPlanningG4 > G4 runs the proof-command policy on the proposal's proofs`,
       `runCccPlanningG4 > a task plan that fails its schema stops G4 at the schema diagnostics`,
+      `CCC_PLANNING_FIXED_LINEAGE_IDS > is derived from K1: each fixed or once-if-leaves role's stage:role, each preflight lineage and judge:final`,
       // ccc-planning-objections.test.ts
       `cccPlanningObjectionsFromVerdict > turns a reject verdict with a counterexample finding and an artifact finding into two objections with those refs`,
       `cccPlanningObjectionsFromVerdict > refuses a stage that may not publish objections`,
@@ -84,6 +90,9 @@ export const OFFLINE = Object.freeze([
       `checkCccPlanningProofCommands > refuses a candidate path outside the task's own write roots`,
       `checkCccPlanningProofCommands > compares paths on the comparison key: ./TASKFILE.yml is refused as a writer-owned Taskfile.yml`,
       `checkCccPlanningProofCommands > compares paths on the comparison key: another letter case of a harness overlaps it`,
+      `checkCccPlanningProofCommands > refuses a task path that is not a canonical target-relative path, which the custody check refuses as a model write root`,
+      `checkCccPlanningProofCommands > refuses a task path with leading or trailing whitespace, as the importer's execution policy does`,
+      `checkCccPlanningProofCommands > refuses a write root listed twice in one task, as the importer's execution policy does`,
     ]),
   }),
 ]);

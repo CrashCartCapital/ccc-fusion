@@ -17,6 +17,8 @@ FNXC:CccPlanningProofCommands 2026-10-14-18:52:
 Paths are compared on K1's `cccPlanningPathComparisonKey` (E2-13, E2-40a) wherever two spellings could name one file on the I2 host's case- and normalization-insensitive volume, so `./TASKFILE.yml` is the writer-owned `Taskfile.yml` and `TEST/Tokenizer.test.mjs` overlaps the harness `test/tokenizer.test.mjs`. Where the custody check compares exact strings to admit something (the task runner must be `Taskfile.yml`, a closure file must exist at its exact path in the bundle, a candidate must lie inside a write root), the policy keeps the exact comparison too, because an equivalent spelling the custody check would not match must not pass here. Each violation is a CCC_PLANNING_GRAPH_INADMISSIBLE diagnostic whose detail names the rule, the proof (or the task) and the path.
 FNXC:CccPlanningProofCommands 2026-10-14-18:52:
 The frozen signature is `(taskPlan, verifierBundle)`, which derives each proof the way the importer will see it from the bundle: command `task <taskfileTask>`, closure `Taskfile.yml`, the target's harness and the proof's other files as fixtures, and the target's candidate arguments. G4 passes a third argument, the proposal's own proof definitions, so the commands, closures and candidates that will actually be compiled are the ones checked against the bundle. The Python adapter profile is not modelled: a planning bundle has no verifier profile, so a `python3` target is refused (fail-closed). The E6-0 `bash -c` rule for package scripts is an I3 prerequisite and is not enforced here.
+FNXC:CccPlanningProofCommands 2026-10-14-21:10:
+Errata E9 GG item 1, rule `write-root-canonical`. Overlap is compared on the comparison key, but a path is admitted only in its exact canonical spelling, because the custody check runs `canonicalRelativePath` on every task's owned paths and write roots before comparing exact strings (semantic-proof-custody.ts:1271, inside assertClosureDisjoint; importer.ts passes every route's ownedPaths and allowedWriteRoots as model write roots), and the importer's execution policy refuses the same spellings plus surrounding whitespace and a path listed twice in one field (canonical.ts:353-391, exactTargetRelativePaths). K1's task-plan validator normalizes before its own checks, so without this rule G4 admitted `./src/x.mjs` or `src/x/`, spent the review calls, and import refused the plan. Each offending path of a task gets one diagnostic naming the task, the fields that hold it, the path and the rule it breaks.
 */
 
 export type CccPlanningProofDefinition = Readonly<{
@@ -44,6 +46,7 @@ export const CCC_PLANNING_PROOF_COMMAND_RULES = Object.freeze([
   "candidate-not-closure",
   "candidate-in-own-write-roots",
   "writer-owns-only-src-bin",
+  "write-root-canonical",
 ] as const);
 export type CccPlanningProofCommandRule = (typeof CCC_PLANNING_PROOF_COMMAND_RULES)[number];
 
@@ -175,6 +178,27 @@ export function cccPlanningProofDefinitionsFromBundle(bundle: CccPlanningVerifie
 
 type TaskPaths = Readonly<{ id: string; proofIds: readonly string[]; owned: readonly string[]; roots: readonly string[]; all: readonly string[] }>;
 
+const CUSTODY_ROOT_RULE = "the semantic-proof custody check refuses it as a model write root (semantic-proof-custody.ts:1271, canonicalRelativePath)";
+const IMPORTER_ROUTE_RULE = "the importer's execution policy refuses it (canonical.ts exactTargetRelativePaths)";
+
+/** custody canonicalRelativePath plus the importer's exactTargetRelativePaths, per distinct path of one task: path -> fields holding it and its problems. */
+function taskPathSpellingProblems(task: TaskPaths): Map<string, Readonly<{ fields: string[]; problems: string[] }>> {
+  const result = new Map<string, { fields: string[]; problems: string[] }>();
+  for (const [field, paths] of [["ownedPaths", task.owned], ["allowedWriteRoots", task.roots]] as const) {
+    for (const path of new Set(paths)) {
+      const problems: string[] = [];
+      if (canonicalPathProblem(path)) problems.push(`is not a canonical target-relative path; ${CUSTODY_ROOT_RULE} and ${IMPORTER_ROUTE_RULE}`);
+      if (typeof path === "string" && path.trim() !== path) problems.push(`has leading or trailing whitespace; ${IMPORTER_ROUTE_RULE}`);
+      if (paths.filter((other) => other === path).length > 1) problems.push(`is listed more than once in ${field}; ${IMPORTER_ROUTE_RULE}`);
+      const entry = result.get(path) ?? { fields: [], problems: [] };
+      entry.fields.push(field);
+      for (const problem of problems) if (!entry.problems.includes(problem)) entry.problems.push(problem);
+      result.set(path, entry);
+    }
+  }
+  return result;
+}
+
 function isWriterPath(path: string): boolean {
   const key = cccPlanningPathComparisonKey(path);
   return WRITER_ROOTS.some((root) => key === root || key.startsWith(`${root}/`));
@@ -209,6 +233,13 @@ export function checkCccPlanningProofCommands(
   const bundleFileByKey = new Map(verifierBundle.files.map(({ path }) => [cccPlanningPathComparisonKey(path), path]));
   const bundleProofs = new Map(verifierBundle.proofs.map((proof) => [proof.id, proof]));
   const taskfileKey = cccPlanningPathComparisonKey(TASKFILE);
+
+  // Every owned path and write root is spelled canonically, once, as the custody check and the importer require.
+  for (const task of tasks) {
+    for (const [path, { fields, problems }] of taskPathSpellingProblems(task)) {
+      if (problems.length > 0) add("write-root-canonical", `task ${task.id} ${fields.join(" and ")}`, path, problems.join("; "));
+    }
+  }
 
   // Writers own only src/** and bin/**.
   for (const task of tasks) {

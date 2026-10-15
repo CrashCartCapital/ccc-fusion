@@ -227,4 +227,61 @@ describe("checkCccPlanningProofCommands", () => {
     expect(overlap[0]!.message).toContain("proof tokenizer");
     expect(overlap[0]!.message).toContain("path test/tokenizer.test.mjs");
   });
+
+  /*
+  FNXC:CccPlanningScheduleAndCommands 2026-10-14-21:05:
+  Errata E9 GG item 1 (rule write-root-canonical). K1's task-plan validator normalizes a path before its own checks, so it admits `./src/helper.mjs` or `src/helper/`, but the custody check runs `canonicalRelativePath` on every task's owned paths and write roots (semantic-proof-custody.ts:1271) and the importer's execution policy refuses the same spellings, plus surrounding whitespace and a duplicate (canonical.ts exactTargetRelativePaths). Each case below is admitted by the validator, so only this rule keeps G4 from passing a plan the importer refuses after review spend.
+  */
+  it("refuses a task path that is not a canonical target-relative path, which the custody check refuses as a model write root", () => {
+    for (const spelling of ["./src/helper.mjs", "src/helper/", "src//helper.mjs", "src/./helper.mjs"]) {
+      const odd = plan(DIAMOND, (tasks) => {
+        tasks[0]!.ownedPaths = ["src/tokenizer.mjs", spelling];
+        tasks[0]!.allowedWriteRoots = ["src/tokenizer.mjs", spelling];
+      });
+      expect(validateCccPlanningTaskPlanV1(odd)).toEqual([]);
+      const diagnostics = checkCccPlanningProofCommands(odd, bundle());
+      expect(diagnostics).toHaveLength(1);
+      const refused = byRule(diagnostics, "write-root-canonical");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.message).toContain("task T1");
+      expect(refused[0]!.message).toContain(`path ${spelling}:`);
+      expect(refused[0]!.message).toContain("semantic-proof-custody.ts:1271");
+    }
+    // Control: the canonical spelling of the same extra path is admitted.
+    const canonical = plan(DIAMOND, (tasks) => {
+      tasks[0]!.ownedPaths = ["src/tokenizer.mjs", "src/helper.mjs"];
+      tasks[0]!.allowedWriteRoots = ["src/tokenizer.mjs", "src/helper.mjs"];
+    });
+    expect(validateCccPlanningTaskPlanV1(canonical)).toEqual([]);
+    expect(checkCccPlanningProofCommands(canonical, bundle())).toEqual([]);
+  });
+
+  it("refuses a task path with leading or trailing whitespace, as the importer's execution policy does", () => {
+    for (const spelling of ["src/helper.mjs ", " src/helper.mjs"]) {
+      const padded = plan(DIAMOND, (tasks) => {
+        tasks[0]!.ownedPaths = ["src/tokenizer.mjs", spelling];
+        tasks[0]!.allowedWriteRoots = ["src/tokenizer.mjs", spelling];
+      });
+      expect(validateCccPlanningTaskPlanV1(padded)).toEqual([]);
+      const refused = byRule(checkCccPlanningProofCommands(padded, bundle()), "write-root-canonical");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]!.message).toContain("task T1");
+      expect(refused[0]!.message).toContain(`path ${spelling}:`);
+      expect(refused[0]!.message).toContain("whitespace");
+    }
+  });
+
+  it("refuses a write root listed twice in one task, as the importer's execution policy does", () => {
+    const twice = plan(DIAMOND, (tasks) => {
+      tasks[1]!.allowedWriteRoots = ["src/word-frequency.mjs", "src/word-frequency.mjs"];
+    });
+    expect(validateCccPlanningTaskPlanV1(twice)).toEqual([]);
+    const diagnostics = checkCccPlanningProofCommands(twice, bundle());
+    expect(diagnostics).toHaveLength(1);
+    const refused = byRule(diagnostics, "write-root-canonical");
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.message).toContain("task T2");
+    expect(refused[0]!.message).toContain("path src/word-frequency.mjs:");
+    expect(refused[0]!.message).toContain("more than once in allowedWriteRoots");
+  });
 });
