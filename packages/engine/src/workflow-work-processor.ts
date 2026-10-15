@@ -20,12 +20,20 @@ import {
   type WorkflowTaskRuntimeResult,
   type WorkflowWorkCustodyKind,
 } from "./workflow-task-runtime.js";
-import { createCccPlanningDescendantRegistry, settleCccPlanningRun } from "./ccc-planning/controller.js";
-import { cccPlanningCancellationCompleter, cccPlanningRunLookup } from "./ccc-planning/ports.js";
+import {
+  concludeCccPlanningRunFailure,
+  createCccPlanningDescendantRegistry,
+  settleCccPlanningRun,
+  type CccPlanningFailureConclusion,
+} from "./ccc-planning/controller.js";
+import { cccPlanningCancellationCompleter, cccPlanningHostLedger, cccPlanningRunLookup } from "./ccc-planning/ports.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
 import { CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON } from "./ccc-campaign-product-control.js";
 import { CCC_RETRY_CLASSIFICATION_CONTEXT_KEY } from "./workflow-graph-executor.js";
+
+/** W3 repair 1: the code a startable planning run fails with when the host concludes a failure that is not a hold. */
+const CCC_PLANNING_INTERNAL_ERROR_CODE = "CCC_PLANNING_INTERNAL_ERROR";
 
 export interface WorkflowWorkProcessorOptions {
   leaseOwner: string;
@@ -333,6 +341,15 @@ export async function processDueWorkflowWorkItem(
  * L1's resume and answer paths can requeue it; a cancelling run releases the item to `held` before L1 completes the
  * cancellation, so a deferred completion never re-runs stages. Campaign custody, sealed authorization and campaign
  * summaries never apply here.
+ *
+ * FNXC:CccPlanningHost 2026-10-14-23:24:
+ * W3 repair 1 (review findings 2, 4 and 5). The claim never ends with a failed or held item behind a run that could
+ * still run. A failure that is not a hold (a runtime rejection, a host or ledger error, a stage handler that threw) is
+ * concluded under the still-live fence first: a startable run moves to `failed` / CCC_PLANNING_INTERNAL_ERROR (its
+ * pending pause or cancel wins instead), and only then does the item fail; a resting run holds the item. When L1
+ * cannot be reached the item goes back to `runnable`, as on lease loss, so the next stage start runs its checks and
+ * pending controls again. Every hold also asks L1 to complete a cancellation (D45): an operator cancel that lands after
+ * the park and before the release is deferred live-lease by L1, and nothing else would finish it before a restart.
  */
 async function runPlanningWorkflowWorkItem(
   store: WorkflowWorkProcessorStore,
@@ -375,6 +392,14 @@ async function runPlanningWorkflowWorkItem(
     }
     await completer(workItem.runId);
   };
+  const completeCancellationQuietly = async () => {
+    try {
+      await completeCancellation();
+    } catch (error) {
+      // Engine-start recovery completes it later (D45); the item is already released.
+      diagnostics.push(`ccc planning cancellation completion deferred: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   const failWorkItem = async (reason: string): Promise<WorkflowTaskRuntimeResult> => {
     await transition("failed", { lastError: reason });
     return failed(reason);
@@ -413,11 +438,74 @@ async function runPlanningWorkflowWorkItem(
     });
     return failed(reason.message);
   };
+  /** A held or cancelling run: hold the item, then let L1 complete a cancellation if one is due (D45). */
+  const holdWorkItem = async (hold: CccPlanningHoldContext, release: typeof transition): Promise<void> => {
+    const blockedReason = hold.disposition === "cancel"
+      ? "ccc-planning:cancelling"
+      : ["ccc-planning", hold.runState, hold.code, hold.decisionId]
+        .filter((part): part is string => typeof part === "string" && part.length > 0)
+        .join(":");
+    await settleCccPlanningRun({
+      descendants,
+      flush: async () => undefined,
+      release: () => release("held", { blockedReason, lastError: null }),
+      completeCancellation: hold.disposition === "cancel" ? completeCancellation : completeCancellationQuietly,
+      reason: new Error(hold.disposition === "cancel" ? "ccc-planning-cancelling" : `ccc-planning-held:${hold.runState}`),
+    });
+  };
+  /** Conclude a failure that is not a hold before the work item moves (W3 repair 1). */
+  const concludeFailure = async (base: WorkflowTaskRuntimeResult, reason: string): Promise<WorkflowTaskRuntimeResult> => {
+    let conclusion: CccPlanningFailureConclusion;
+    try {
+      const ledger = cccPlanningHostLedger(store);
+      if (!ledger) throw new Error("ccc planning ledger is unwired");
+      conclusion = await concludeCccPlanningRunFailure({
+        ledger,
+        fence: {
+          kind: "planning",
+          workItemId: workItem.id,
+          runId: workItem.runId,
+          attempt: workItem.attempt,
+          leaseOwner: opts.leaseOwner,
+          originTaskId: workItem.taskId,
+        },
+        code: CCC_PLANNING_INTERNAL_ERROR_CODE,
+      });
+    } catch (error) {
+      const why = new Error(`${reason}; run not concluded: ${error instanceof Error ? error.message : String(error)}`);
+      await settleCccPlanningRun({
+        descendants,
+        flush: async () => undefined,
+        release: () => releaseQuietly("runnable", { lastError: why.message }),
+        completeCancellation: completeCancellationQuietly,
+        reason: why,
+      });
+      return { ...base, disposition: "failed", outcome: "failure", reason: why.message };
+    }
+    if (conclusion.kind === "ended") {
+      await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
+      await transition("failed", { lastError: reason });
+      return { ...base, disposition: "failed", outcome: "failure", reason };
+    }
+    const { hold } = conclusion;
+    const concluded = {
+      ...base,
+      outcome: "failure" as const,
+      context: { ...base.context, [CCC_PLANNING_HOLD_CONTEXT_KEY]: hold },
+      reason: `${reason}; ccc-planning-${hold.disposition}:${hold.runState}${hold.code ? `:${hold.code}` : ""}`,
+    };
+    if (hold.disposition === "lease-lost") {
+      await settleAbort(async () => undefined, new Error("ccc-planning-fence-stale"));
+      return { ...concluded, disposition: "failed" };
+    }
+    await holdWorkItem(hold, releaseQuietly);
+    return { ...concluded, disposition: hold.disposition === "cancel" ? "cancelled" : "manual-required" };
+  };
   const renewal = startWorkflowLeaseRenewal(store, workItem, opts, abortController);
   try {
     const task = await store.getTask(workItem.taskId) as TaskDetail | undefined;
     if (signal.aborted) return await settleAbort(async () => undefined);
-    if (!task) return await failWorkItem("workflow planning task is missing");
+    if (!task) return await concludeFailure(failed("workflow planning task is missing"), "workflow planning task is missing");
     const running = runtime.run(task, settings, {
       signal,
       custody: "planning",
@@ -443,7 +531,8 @@ async function runPlanningWorkflowWorkItem(
     ]);
     if (first === "aborted") return await settleAbort(() => settled);
     if ("error" in first) {
-      return await failWorkItem(`workflow-work-item-runtime-error:${first.error instanceof Error ? first.error.message : String(first.error)}`);
+      const reason = `workflow-work-item-runtime-error:${first.error instanceof Error ? first.error.message : String(first.error)}`;
+      return await concludeFailure(failed(reason), reason);
     }
     const result = first.result;
     if (signal.aborted) return await settleAbort(async () => undefined);
@@ -452,31 +541,16 @@ async function runPlanningWorkflowWorkItem(
       await settleAbort(async () => undefined, new Error("ccc-planning-fence-stale"));
       return result;
     }
-    if (hold?.disposition === "cancel") {
-      await settleCccPlanningRun({
-        descendants,
-        flush: async () => undefined,
-        release: () => transition("held", { blockedReason: "ccc-planning:cancelling", lastError: null }),
-        completeCancellation,
-        reason: new Error("ccc-planning-cancelling"),
-      });
+    if (hold?.disposition === "cancel" || hold?.disposition === "held") {
+      await holdWorkItem(hold, transition);
       return result;
     }
-    if (hold?.disposition === "held") {
-      await descendants.cancelAll(new Error(`ccc-planning-held:${hold.runState}`));
-      const blockedReason = ["ccc-planning", hold.runState, hold.code, hold.decisionId]
-        .filter((part): part is string => typeof part === "string" && part.length > 0)
-        .join(":");
-      await transition("held", { blockedReason, lastError: null });
-      return result;
-    }
-    await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
     if (result.disposition === "completed") {
+      await descendants.cancelAll(new Error("ccc-planning-workflow-ended"));
       await transition("succeeded", { lastError: null });
-    } else {
-      await transition("failed", { lastError: result.reason ?? "workflow-planning-failed" });
+      return result;
     }
-    return result;
+    return await concludeFailure(result, result.reason ?? "workflow-planning-failed");
   } finally {
     if (renewal) clearInterval(renewal);
   }

@@ -127,6 +127,9 @@ export type CccPlanningHostWiring = Readonly<{
   linkedOutcomePorts?: CccPlanningLinkedOutcomePorts;
 }>;
 
+/** W3 repair 1: lease-expired planning items offered per drain pass, applied after the planning filter. */
+const CCC_PLANNING_EXPIRED_DRAIN_LIMIT = 20;
+
 /** A request-to-code planning work item: the run's single task item, keyed by its `ccc-plan:` run id (D1). */
 function isCccPlanningWorkItem(item: WorkflowWorkItem): boolean {
   return item.kind === "task"
@@ -2352,10 +2355,16 @@ export class InProcessRuntime
       FNXC:CccPlanningHost 2026-10-14-22:17:
       D3: a planning item whose lease expired stays `running`; the existing acquire path reclaims it, so once the
       planning host is wired the drain also offers lease-expired planning items (campaign items are unchanged).
+
+      FNXC:CccPlanningHost 2026-10-14-23:24:
+      W3 repair 1 (review finding 3, the FN-8470/8471 limit:20 class): nothing in the engine clears lease-expired
+      `running` campaign or ordinary task items, so a first page of the oldest 20 can hold none of the planning items
+      and the D3 reclaim would never happen. The whole lease-expired list is read, filtered to planning items, and only
+      the planning subset is capped.
       */
       if (this.cccPlanningHost) {
-        const expiredPlanning = await this.taskStore.listDueWorkflowWorkItems({ kinds: ["task"], states: ["running"], limit: 20 });
-        items.push(...expiredPlanning.filter(isCccPlanningWorkItem));
+        const expiredRunning = await this.taskStore.listDueWorkflowWorkItems({ kinds: ["task"], states: ["running"] });
+        items.push(...expiredRunning.filter(isCccPlanningWorkItem).slice(0, CCC_PLANNING_EXPIRED_DRAIN_LIMIT));
       }
       for (const item of items) {
         let task: Task | undefined;

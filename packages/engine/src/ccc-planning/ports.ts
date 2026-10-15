@@ -188,6 +188,39 @@ export function cccPlanningRunLookup(store: unknown):
   return null;
 }
 
+/** The two L1 functions the host's own run moves need: read where the run stands, and move it under the fence. */
+export type CccPlanningHostLedger = Pick<CccPlanningLedgerPort, "inspectCccPlanningRun" | "transitionCccPlanningRunState">;
+
+/**
+ * FNXC:CccPlanningHost 2026-10-14-23:24:
+ * W3 repair 1: the processor concludes a planning failure itself (it moves the run before it fails or holds the work
+ * item), so it needs L1's read and move with the same binding rule as the run lookup: a store that names both
+ * functions is asked directly (test fakes, wrappers), otherwise the store's own AsyncDataLayer is bound. Null means
+ * the ledger is unwired, which the processor treats like an unreachable ledger.
+ */
+export function cccPlanningHostLedger(store: unknown): CccPlanningHostLedger | null {
+  if (!store || typeof store !== "object") return null;
+  const candidate = store as Partial<CccPlanningHostLedger> & { getAsyncLayer?: () => AsyncDataLayer | null | undefined };
+  const inspect = candidate.inspectCccPlanningRun;
+  const transition = candidate.transitionCccPlanningRunState;
+  if (typeof inspect === "function" && typeof transition === "function") {
+    return Object.freeze({
+      inspectCccPlanningRun: (runId, ports) => inspect.call(store, runId, ports),
+      transitionCccPlanningRunState: (i) => transition.call(store, i),
+    });
+  }
+  if (typeof candidate.getAsyncLayer === "function") {
+    const layer = candidate.getAsyncLayer.call(store);
+    if (layer) {
+      return Object.freeze({
+        inspectCccPlanningRun: (runId, ports) => inspectCccPlanningRun(layer, runId, ports),
+        transitionCccPlanningRunState: (i) => transitionCccPlanningRunState(layer, i),
+      });
+    }
+  }
+  return null;
+}
+
 /** The same binding rule for L1's cancellation completion (D45); null when the store carries neither. */
 export function cccPlanningCancellationCompleter(store: unknown):
   ((runId: string) => Promise<Readonly<{ completed: boolean }>>) | null {

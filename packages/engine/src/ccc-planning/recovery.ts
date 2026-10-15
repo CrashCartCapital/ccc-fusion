@@ -47,33 +47,62 @@ async function hasLivePlanningLease(layer: AsyncDataLayer, run: RecoverableRun):
   return live.length > 0;
 }
 
+/** One run's engine-start recovery; a refusal or ledger error is the caller's to isolate. */
+async function recoverRun(layer: AsyncDataLayer, run: RecoverableRun,
+  i: Readonly<{ now?: string; ports?: CccPlanningLinkedOutcomePorts }>): Promise<CccPlanningRecoveryOutcome> {
+  if (run.import_id !== null) {
+    if (!i.ports?.reconcileLinkedOutcome) return "none";
+    await i.ports.reconcileLinkedOutcome(layer, run.run_id);
+    return "campaign-reconciled";
+  }
+  if (run.state === "cancelling") {
+    const completion = await completeCccPlanningCancellation(layer, {
+      runId: run.run_id, ...(i.now !== undefined ? { now: i.now } : {}),
+    });
+    return completion.completed ? "cancellation-completed" : "none";
+  }
+  if (run.state === "running") {
+    const status = await inspectCccPlanningRun(layer, run.run_id);
+    if (status.state === "running" && status.unreconciled.length > 0 && !(await hasLivePlanningLease(layer, run))) {
+      await transitionCccPlanningRunState(layer, {
+        runId: run.run_id, from: "running", to: "unknown_effect", stateCode: "CCC_PLANNING_UNRECONCILED_DISPATCH", fence: null,
+      });
+      return "unknown-effect";
+    }
+  }
+  return "none";
+}
+
+/*
+FNXC:CccPlanningHost 2026-10-14-23:24:
+W3 repair 1 (review finding 1, D45): each run is recovered on its own. A run whose recovery is refused (for example
+running -> unknown_effect refused CONTROL_PENDING while an operator pause waits for the next stage start) or whose ledger
+call fails is reported "none" and the loop goes on, so one run that refuses the same way on every restart can never
+keep later runs (sorted by run id) from completing their cancellation. After the loop one AggregateError names every
+failed run, so the engine still logs it; it carries the per-run results as `results`.
+*/
 export async function recoverCccPlanningRuns(i: Readonly<{ store: TaskStore; now?: string; ports?: CccPlanningLinkedOutcomePorts }>):
   Promise<ReadonlyArray<Readonly<{ runId: string; outcome: CccPlanningRecoveryOutcome }>>> {
   const layer = i.store.getAsyncLayer();
   if (!layer) return [];
   const results: Array<Readonly<{ runId: string; outcome: CccPlanningRecoveryOutcome }>> = [];
+  const failures: Array<Readonly<{ runId: string; error: unknown }>> = [];
   for (const run of await listRecoverableRuns(layer)) {
     let outcome: CccPlanningRecoveryOutcome = "none";
-    if (run.import_id !== null) {
-      if (i.ports?.reconcileLinkedOutcome) {
-        await i.ports.reconcileLinkedOutcome(layer, run.run_id);
-        outcome = "campaign-reconciled";
-      }
-    } else if (run.state === "cancelling") {
-      const completion = await completeCccPlanningCancellation(layer, {
-        runId: run.run_id, ...(i.now !== undefined ? { now: i.now } : {}),
-      });
-      if (completion.completed) outcome = "cancellation-completed";
-    } else if (run.state === "running") {
-      const status = await inspectCccPlanningRun(layer, run.run_id);
-      if (status.state === "running" && status.unreconciled.length > 0 && !(await hasLivePlanningLease(layer, run))) {
-        await transitionCccPlanningRunState(layer, {
-          runId: run.run_id, from: "running", to: "unknown_effect", stateCode: "CCC_PLANNING_UNRECONCILED_DISPATCH", fence: null,
-        });
-        outcome = "unknown-effect";
-      }
+    try {
+      outcome = await recoverRun(layer, run, i);
+    } catch (error) {
+      failures.push({ runId: run.run_id, error });
     }
     results.push(Object.freeze({ runId: run.run_id, outcome }));
+  }
+  if (failures.length > 0) {
+    const named = failures.map((failure) => `${failure.runId} (${failure.error instanceof Error ? failure.error.message : String(failure.error)})`);
+    throw Object.assign(
+      new AggregateError(failures.map((failure) => failure.error),
+        `ccc planning engine-start recovery failed for ${failures.length} run(s): ${named.join(", ")}`),
+      { results: Object.freeze([...results]) },
+    );
   }
   return results;
 }

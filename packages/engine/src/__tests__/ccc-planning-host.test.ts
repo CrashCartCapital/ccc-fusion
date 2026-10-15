@@ -37,7 +37,24 @@ import { createCccPlanningStageHandler } from "../ccc-planning/controller.js";
 import {
   computeCccRuntimeDistManifestSha256,
   registerCccRunningRuntimeAtEngineStart,
+  resolveCccRuntimeDistRoot,
 } from "../ccc-planning/runtime-digest.js";
+import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
+
+/*
+FNXC:CccPlanningHost 2026-10-14-23:24 (W3 repair 1):
+The runtime-digest module is wrapped in pass-through spies so the engine-start case can see that start() resolves its
+own dist root and registers it. A source run resolves no dist and registers nothing, so the call itself is the only
+observable; every other case still runs the real functions.
+*/
+vi.mock("../ccc-planning/runtime-digest.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../ccc-planning/runtime-digest.js")>();
+  return {
+    ...actual,
+    resolveCccRuntimeDistRoot: vi.fn(actual.resolveCccRuntimeDistRoot),
+    registerCccRunningRuntimeAtEngineStart: vi.fn(actual.registerCccRunningRuntimeAtEngineStart),
+  };
+});
 import type {
   CccPlanningArtifactPort,
   CccPlanningLedgerPort,
@@ -207,6 +224,10 @@ function createWorld(options: {
     })),
     getCccCampaignContextForTask: vi.fn(async () => null),
     getCccPlanningRunForTask: (taskId: string) => ledger.getCccPlanningRunForTask(taskId),
+    // FNXC:CccPlanningHost 2026-10-14-23:24: the processor's own L1 reads and moves (W3 repair 1) go to the same ledger.
+    inspectCccPlanningRun: (runId: string) => ledger.inspectCccPlanningRun(runId),
+    transitionCccPlanningRunState: (i: Parameters<typeof ledger.transitionCccPlanningRunState>[0]) =>
+      ledger.transitionCccPlanningRunState(i),
     completeCccPlanningCancellation: async (runId: string) => {
       order.push("completeCancellation");
       return ledger.completeCccPlanningCancellation({ runId });
@@ -523,6 +544,122 @@ describe("ccc planning host with a registered runtime", () => {
     expect(result.runtime?.disposition).toBe("failed");
     expect(result.runtime?.reason ?? "").toContain("ledger unavailable after intent");
     expect(world.workItem.state).toBe("failed");
+    // W3 repair 1: the item fails only after the run itself was moved to failed under the still-live fence.
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" }]);
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-14-23:24 (W3 repair 1):
+  The claim never ends with a failed or held work item behind a run that could still run (admitted, running, spec_ready,
+  importing): nothing would ever move such a run again, and an operator cancel would wait forever for a stage boundary.
+  A failure that is not a hold moves the run to failed first; a pending control wins over the failure; a pair the host
+  may not take from a startable state fails the run instead of holding it.
+  */
+  it("H1 RED 12b: a runtime rejection moves the run to failed before the work item fails", async () => {
+    const world = createWorld({ state: "running" });
+    const rejecting = {
+      run: async () => { throw new Error("runtime crashed before any stage"); },
+      runWorkItem: async () => { throw new Error("runWorkItem is not part of the planning path"); },
+    } as unknown as WorkflowTaskRuntime;
+
+    const result = await processPlanning(world, rejecting);
+
+    expect(result.runtime?.reason ?? "").toContain("runtime crashed before any stage");
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" }]);
+    expect(world.workItem).toMatchObject({ state: "failed", leaseOwner: null });
+  });
+
+  it("H1 RED 12c: a host failure while a pause is pending applies the pause and holds the item, never failed", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world, {
+      intent: async () => {
+        world.run.controlRequest = "pause";
+        world.ledger.inspectCccPlanningRun.mockImplementationOnce(async () => {
+          throw new Error("ledger unavailable after intent");
+        });
+        world.run.committed.add("intent");
+        return { kind: "committed", artifactKeys: [] };
+      },
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls.map((call) => call.stageId)).toEqual(["preflight", "intent"]);
+    expect(world.run).toMatchObject({ state: "paused", controlRequest: null });
+    expect(world.stateEvents).toEqual([{ from: "running", to: "paused", stateCode: null }]);
+    expect(world.workItem).toMatchObject({ state: "held", leaseOwner: null });
+    expect(world.workItem.blockedReason).toContain("paused");
+    expect(result.runtime?.context[CCC_PLANNING_HOLD_CONTEXT_KEY]).toMatchObject({ disposition: "held", runState: "paused" });
+  });
+
+  it("H1 RED 12d: a host failure while a cancel is pending settles the cancel and L1 completes it", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages } = recordingStages(world, {
+      intent: async () => {
+        world.run.controlRequest = "cancel";
+        world.ledger.inspectCccPlanningRun.mockImplementationOnce(async () => {
+          throw new Error("ledger unavailable after intent");
+        });
+        world.run.committed.add("intent");
+        return { kind: "committed", artifactKeys: [] };
+      },
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(world.stateEvents).toEqual([
+      { from: "running", to: "cancelling", stateCode: null },
+      { from: "cancelling", to: "cancelled", stateCode: "CCC_PLANNING_CANCELLED" },
+    ]);
+    expect(world.workItem).toMatchObject({ state: "cancelled", leaseOwner: null });
+    expect(result.runtime?.disposition).toBe("cancelled");
+  });
+
+  it("H1 RED 12e: when L1 cannot be reached to fail the run, the item is released to runnable, never failed or held", async () => {
+    const world = createWorld({ state: "running" });
+    const { stages, calls } = recordingStages(world, {
+      intent: async () => {
+        // The post-stage read and the processor's own read both fail: L1 is unreachable for this claim.
+        world.ledger.inspectCccPlanningRun
+          .mockImplementationOnce(async () => { throw new Error("ledger unreachable (1)"); })
+          .mockImplementationOnce(async () => { throw new Error("ledger unreachable (2)"); });
+        world.run.committed.add("intent");
+        return { kind: "committed", artifactKeys: [] };
+      },
+    });
+    const runtime = planningRuntime(world, stages);
+
+    const result = await processPlanning(world, runtime);
+
+    expect(result.runtime?.disposition).toBe("failed");
+    expect(world.run.state).toBe("running");
+    expect(world.stateEvents).toEqual([]);
+    expect(world.workItem).toMatchObject({ state: "runnable", attempt: 1, leaseOwner: null });
+
+    // An operator cancel recorded meanwhile is applied at the next stage start of the next claim.
+    world.run.controlRequest = "cancel";
+    const again = await processPlanning(world, runtime);
+    expect(again.claimed).toBe(true);
+    expect(calls.map((call) => call.stageId)).toEqual(["preflight", "intent"]);
+    expect(world.run.state).toBe("cancelled");
+    expect(world.workItem.state).toBe("cancelled");
+  });
+
+  it("H1 RED 18b: a park whose pair the host may not take from a startable state fails the run instead of holding it", async () => {
+    const world = createWorld({ state: "importing" });
+    const { stages, calls } = recordingStages(world, {
+      preflight: async () => ({ kind: "unknown-effect", attemptKeys: ["attempt-1"] }),
+    });
+
+    const result = await processPlanning(world, planningRuntime(world, stages));
+
+    expect(calls.map((call) => call.stageId)).toEqual(["preflight"]);
+    expect(cccPlanningTransitionAllowed("importing", "unknown_effect")).toBe(false);
+    expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(world.workItem.state).toBe("failed");
+    expect(result.runtime?.disposition).toBe("failed");
   });
 
   describe("session watchdog (D40)", () => {
@@ -602,6 +739,75 @@ describe("ccc planning host with a registered runtime", () => {
       expect(world.workItem.state).toBe("failed");
       expect(world.run.state).toBe("failed");
       expect(world.run.stateCode).toBe("CCC_PLANNING_INTERNAL_ERROR");
+    });
+
+    /*
+    FNXC:CccPlanningHost 2026-10-14-23:24 (W3 repair 1, D40):
+    The watchdog covers the open of a session attempt as well as its run: an open that ignores its signal is ended at
+    30 minutes, and a session that the factory hands back after the deadline is disposed, never used.
+    */
+    function slowOpenSessions(openMs: number) {
+      const entry = { abortedAfterMs: null as number | null, opens: 0, disposed: 0, runs: 0 };
+      const factory: CccPlanningSessionFactory = {
+        open: async (input) => {
+          const openedAt = Date.now();
+          entry.opens += 1;
+          input.signal.addEventListener("abort", () => { entry.abortedAfterMs = Date.now() - openedAt; }, { once: true });
+          // Ignores its signal on purpose: only the host's watchdog can end the open early.
+          await new Promise<void>((resolve) => setTimeout(resolve, openMs));
+          return {
+            binding: {} as CccPlanningSession["binding"],
+            run: async () => {
+              entry.runs += 1;
+              return { submitted: [], verdict: null };
+            },
+            dispose: async () => { entry.disposed += 1; },
+          };
+        },
+      };
+      return { factory, entry };
+    }
+
+    it("H1 RED 8c: a session open that hangs past 30 minutes is killed at 30 minutes and its late session disposed", async () => {
+      vi.useFakeTimers();
+      const world = createWorld({ state: "running" });
+      const { factory, entry } = slowOpenSessions(45 * 60_000);
+      const { stages, calls } = recordingStages(world, { preflight: sessionStage(world, 1) });
+      let settled = false;
+
+      const processing = processPlanning(world, planningRuntime(world, stages, factory));
+      void processing.then(() => { settled = true; }, () => { settled = true; });
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+
+      expect(entry.abortedAfterMs).toBe(30 * 60_000);
+      expect(settled).toBe(true);
+      const result = await processing;
+      expect(calls.map((call) => call.stageId)).toEqual(["preflight"]);
+      expect(result.runtime?.disposition).toBe("failed");
+      expect(world.run).toMatchObject({ state: "failed", stateCode: "CCC_PLANNING_INTERNAL_ERROR" });
+      expect(world.workItem.state).toBe("failed");
+      expect(entry.runs).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+      expect(entry.disposed).toBe(1);
+      expect(entry.runs).toBe(0);
+    });
+
+    it("H1 RED 8d: control, a 20-minute session open is not killed and the stage runs", async () => {
+      vi.useFakeTimers();
+      const world = createWorld({ state: "running" });
+      const { factory, entry } = slowOpenSessions(20 * 60_000);
+      const { stages, calls } = recordingStages(world, { preflight: sessionStage(world, 1) });
+
+      const processing = processPlanning(world, planningRuntime(world, stages, factory));
+      await vi.advanceTimersByTimeAsync(21 * 60_000);
+      const result = await processing;
+
+      expect(entry.abortedAfterMs).toBeNull();
+      expect(entry).toMatchObject({ opens: 1, runs: 1, disposed: 1 });
+      expect(calls.map((call) => call.stageId)).toEqual([...CCC_PLANNING_IR_STAGES]);
+      expect(result.runtime).toMatchObject({ disposition: "completed" });
+      expect(world.workItem.state).toBe("succeeded");
     });
   });
 
@@ -693,6 +899,102 @@ describe("ccc planning host with a registered runtime", () => {
       expect(await computeCccRuntimeDistManifestSha256(root)).toBe(expected);
       await writeFile(join(root, "sub", "b.js"), "export const b = 3;\n");
       expect(await computeCccRuntimeDistManifestSha256(root)).not.toBe(expected);
+    });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-14-23:24 (W3 repair 1, D3, D44, verify-v2 item 35):
+  The production wiring in InProcessRuntime, not only the paths it calls. The drain must offer every lease-expired
+  planning item to the existing acquire path even when older lease-expired items of other kinds fill the first page
+  (the FN-8470/8471 limit:20 class), and start() must register its own runtime digest and run planning recovery with
+  the linked-outcome ports it was wired with.
+  */
+  describe("in-process runtime wiring", () => {
+    type RuntimeInternals = {
+      status: string;
+      taskStore: unknown;
+      executor: Record<string, unknown>;
+      cccPlanningWorkflowRuntime?: WorkflowTaskRuntime;
+      drainWorkflowContinuations: () => Promise<void>;
+    };
+    /** The public surface the tests drive plus the private members they seed (an intersection with the class is never). */
+    type WiredRuntime = Pick<InProcessRuntime, "setCccPlanningHost" | "settleWorkflowContinuations" | "on" | "start"> & RuntimeInternals;
+    function bareRuntime(config: Record<string, unknown> = {}, centralCore: unknown = {}): WiredRuntime {
+      return new InProcessRuntime({
+        projectId: "h1-wiring", workingDirectory: "/private/tmp/h1-wiring-unused", isolationMode: "in-process",
+        maxConcurrent: 1, maxWorktrees: 1, ...config,
+      } as never, centralCore as never) as unknown as WiredRuntime;
+    }
+
+    it("H1 RED 13: the drain dispatches a lease-expired planning item behind 25 older lease-expired running items under planning custody", async () => {
+      const deadOwner = "h1-dead-engine";
+      const world = createWorld({ state: "running" });
+      Object.assign(world.workItem, { state: "running", attempt: 1, leaseOwner: deadOwner, leaseExpiresAt: NOW });
+      world.loseLease();
+      const { stages, calls } = recordingStages(world);
+      const zombies = Array.from({ length: 25 }, (_, index) => ({
+        id: `zombie-${index}`, runId: `ccc-prd:zombie-${index}`, taskId: `T-ZOMBIE-${index}`, nodeId: "n", kind: "task",
+        state: "running", attempt: 1, leaseOwner: deadOwner, leaseExpiresAt: "2020-01-01T00:00:00.000Z",
+        stableWorkflowRunId: `ccc-prd:zombie-${index}`, createdAt: "2020-01-01T00:00:00.000Z",
+      }));
+      // The due query's order (created_at FIFO): every zombie is older than the planning item.
+      const listDueWorkflowWorkItems = vi.fn(async (filter: { states?: string[]; limit?: number } = {}) => {
+        const expiredPlanning = world.workItem.state === "running" && world.workItem.leaseOwner === deadOwner ? [{ ...world.workItem }] : [];
+        const due = [...zombies, ...expiredPlanning].filter((item) => !filter.states || filter.states.includes(item.state));
+        return filter.limit === undefined ? due : due.slice(0, filter.limit);
+      });
+      const runtime = bareRuntime();
+      runtime.setCccPlanningHost({ stages, sessions: unusedSessions() });
+      runtime.status = "active";
+      runtime.taskStore = { ...world.store, listDueWorkflowWorkItems, getSettings: async () => ({}), getAsyncLayer: () => null };
+      const releaseExecution = vi.fn();
+      const executor = { execute: vi.fn(), tryBeginAuthoritativeWorkflowExecution: vi.fn(() => releaseExecution) };
+      runtime.executor = executor;
+      runtime.cccPlanningWorkflowRuntime = planningRuntime(world, stages);
+
+      await runtime.drainWorkflowContinuations();
+      await runtime.settleWorkflowContinuations();
+
+      expect(calls.map((call) => call.stageId)).toEqual([...CCC_PLANNING_IR_STAGES]);
+      expect(world.store.acquireWorkflowWorkItemLease).toHaveBeenCalledTimes(1);
+      expect(world.store.acquireWorkflowWorkItemLease.mock.calls[0]?.[1]).toBe("in-process-runtime:h1-wiring");
+      expect(world.workItem).toMatchObject({ state: "succeeded", attempt: 1, leaseOwner: null });
+      expect(executor.tryBeginAuthoritativeWorkflowExecution).toHaveBeenCalledWith(TASK_ID);
+      expect(releaseExecution).toHaveBeenCalledTimes(1);
+      expect(executor.execute).not.toHaveBeenCalled();
+    });
+
+    it("H1 RED 14: start() registers its own runtime digest and runs planning recovery with the wired linked-outcome ports", async () => {
+      const linkedRun = { run_id: RUN_ID, state: "building", import_id: "h1-import", planning_task_id: TASK_ID };
+      const layer = {
+        projectId: "h1-wiring",
+        db: {
+          // Campaign startup recovery runs first and finds no prior-boot campaign item.
+          select: () => ({ from: () => ({ where: async () => [] }) }),
+          // Planning recovery lists one linked run.
+          execute: vi.fn(async () => [linkedRun]),
+        },
+      };
+      const reconcileLinkedOutcome = vi.fn(async () => undefined);
+      // start() is stopped right after the planning step: the next thing it touches is the central core.
+      const stopHere = new Error("h1-stop-after-planning-start");
+      const centralCore = { get backendMode(): boolean { throw stopHere; } };
+      const runtime = bareRuntime({ externalTaskStore: { getAsyncLayer: () => layer }, engineInstanceId: "h1-engine-instance" }, centralCore);
+      runtime.on("error", () => undefined);
+      runtime.setCccPlanningHost({
+        stages: recordingStages(createWorld()).stages, sessions: unusedSessions(), linkedOutcomePorts: { reconcileLinkedOutcome },
+      });
+      vi.mocked(resolveCccRuntimeDistRoot).mockClear();
+      vi.mocked(registerCccRunningRuntimeAtEngineStart).mockClear();
+
+      await expect(runtime.start()).rejects.toBe(stopHere);
+
+      expect(vi.mocked(resolveCccRuntimeDistRoot)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(resolveCccRuntimeDistRoot).mock.calls[0]?.[0]).toMatch(/\/runtimes\/in-process-runtime\.(ts|js)$/u);
+      const distRoot = vi.mocked(resolveCccRuntimeDistRoot).mock.results[0]?.value;
+      expect(vi.mocked(registerCccRunningRuntimeAtEngineStart)).toHaveBeenCalledWith({ distRoot });
+      expect(reconcileLinkedOutcome).toHaveBeenCalledTimes(1);
+      expect(reconcileLinkedOutcome).toHaveBeenCalledWith(layer, RUN_ID);
     });
   });
 });

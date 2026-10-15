@@ -57,6 +57,8 @@ CCC_PLANNING_HOLD_CONTEXT_KEY, which the processor maps to the work item state `
 */
 export type WorkflowWorkCustodyKind = "campaign" | "planning";
 export const CCC_PLANNING_HOLD_CONTEXT_KEY = "ccc:planning:hold" as const;
+/** W3 repair 1: the executed-IR digest of a stored IR that cannot be resolved; never a sha256, so never K1's. */
+const CCC_PLANNING_UNRESOLVED_IR_HASH = "unresolved";
 
 /** The value a planning stage leaves under CCC_PLANNING_HOLD_CONTEXT_KEY when the run must stop at this stage. */
 export type CccPlanningHoldContext = Readonly<{
@@ -572,6 +574,11 @@ export class WorkflowTaskRuntime {
    * attempt (`maxRetriesPerNode: 1`, E2-14: the graph treats the IR's `maxRetries: 0` as unset). When the stored IR is
    * not the K1 IR for the run's mode, no stored node runs at all: the stage handler is given K1's first stage gate, so
    * its own checks record RUNTIME_NOT_PERMITTED or WORKFLOW_IR_DRIFT exactly as they would at a stage start.
+   *
+   * FNXC:CccPlanningHost 2026-10-14-23:24:
+   * W3 repair 1 (review finding 4, risk 29): a stored IR that cannot be resolved at all (it no longer parses, or its
+   * workflow definition is gone) is drift too. It takes the same path with an executed digest that can never equal
+   * K1's, so the run ends `failed` / WORKFLOW_IR_DRIFT under the fence instead of the item failing behind a running run.
    */
   private async runPlanning(
     task: TaskDetail,
@@ -611,14 +618,12 @@ export class WorkflowTaskRuntime {
       return this.campaignCustodyFailure(task.id, "ccc-planning-work-item-fence-refused");
     }
     this.emit("start", task.id, "resolve-workflow");
-    let target: WorkflowRuntimeTarget;
+    let target: WorkflowRuntimeTarget | null = null;
+    let resolutionError: string | undefined;
     try {
       target = await this.resolveRuntimeTarget(task.id);
     } catch (err) {
-      return this.campaignCustodyFailure(
-        task.id,
-        `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      resolutionError = `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`;
     }
     const signal = runOptions.signal ?? new AbortController().signal;
     const host: CccPlanningStageHost = Object.freeze({
@@ -632,7 +637,7 @@ export class WorkflowTaskRuntime {
       }),
       descendants,
       workItemIrHash: fence.irHash ?? null,
-      executedIrHash: cccPlanningWorkflowIrHash(target.ir),
+      executedIrHash: target ? cccPlanningWorkflowIrHash(target.ir) : CCC_PLANNING_UNRESOLVED_IR_HASH,
       signal,
     });
     const withHost = (context: Parameters<WorkflowNodeHandler>[1]) =>
@@ -640,7 +645,7 @@ export class WorkflowTaskRuntime {
     const k1 = buildCccPlanningWorkflowIr(custody.mode);
     let result: Awaited<ReturnType<WorkflowGraphExecutor["run"]>>;
     try {
-      if (host.executedIrHash !== cccPlanningWorkflowIrHash(k1)) {
+      if (!target || host.executedIrHash !== cccPlanningWorkflowIrHash(k1)) {
         const firstStage = k1.nodes.find((node) => node.kind === "gate")!;
         const stage = await runStage(firstStage, withHost({ task, settings: buildWorkflowRuntimeSettings(settings), context: {}, signal }));
         result = {
@@ -687,13 +692,14 @@ export class WorkflowTaskRuntime {
         : hold?.disposition === "cancel"
           ? "cancelled"
           : "failed";
-    const reason = disposition === "completed"
+    const outcomeReason = disposition === "completed"
       ? undefined
       : aborted
         ? "workflow-aborted"
         : hold
           ? `ccc-planning-${hold.disposition}:${hold.runState}${hold.code ? `:${hold.code}` : ""}`
           : graphFailureReason(result);
+    const reason = resolutionError && outcomeReason ? `${resolutionError}; ${outcomeReason}` : outcomeReason;
     this.emit("terminal", task.id, reason ? `${disposition}:${reason}` : disposition);
     return {
       disposition,

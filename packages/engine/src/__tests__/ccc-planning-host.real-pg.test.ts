@@ -21,6 +21,7 @@ import {
   cccPlanningWorkflowIrHash,
   drizzleSql as sql,
   registerCccRunningRuntimeDistManifest,
+  requestCccPlanningControl,
   type CccPlanningCallRequest,
   type CccPlanningIrStageId,
   type CccPlanningRouteBinding,
@@ -35,7 +36,13 @@ import { cccPlanningRuns } from "../../../core/src/postgres/schema/ccc-planning.
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
 import { createCccPlanningStageHandler } from "../ccc-planning/controller.js";
-import { createCccPlanningArtifactPort, createCccPlanningLedgerPort, type CccPlanningStageContext, type CccPlanningStageFn } from "../ccc-planning/ports.js";
+import {
+  createCccPlanningArtifactPort,
+  createCccPlanningLedgerPort,
+  type CccPlanningLedgerPort,
+  type CccPlanningStageContext,
+  type CccPlanningStageFn,
+} from "../ccc-planning/ports.js";
 import { recoverCccPlanningRuns } from "../ccc-planning/recovery.js";
 
 const PROJECT = "__legacy_unscoped__";
@@ -81,10 +88,10 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
   }
 
   /** A Build run with its task, K1 workflow, selection and planning work item, as admission (AD1) leaves them. */
-  async function seedRun(options: { path?: readonly string[]; lease: "live" | "expired"; owner?: string }): Promise<Run> {
+  async function seedRun(options: { path?: readonly string[]; lease: "live" | "expired"; owner?: string; label?: string }): Promise<Run> {
     ordinal += 1;
     const taskId = `R2C-H1-${ordinal}`;
-    const runId = `ccc-plan:${sha(`r2c-h1-run-${ordinal}`).slice(0, 24)}`;
+    const runId = `ccc-plan:${sha(options.label ?? `r2c-h1-run-${ordinal}`).slice(0, 24)}`;
     const workItemId = `${runId.replace(":", "-")}--planning`;
     const workflowId = `${runId.replace(":", "-")}--workflow`;
     const ir = buildCccPlanningWorkflowIr("build");
@@ -180,7 +187,7 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
 
   async function anchor(run: Pick<Run, "runId">): Promise<Row> {
     const rows = (await db.execute(sql`
-      SELECT state, state_code FROM project.ccc_planning_runs WHERE project_id = ${PROJECT} AND run_id = ${run.runId}
+      SELECT state, state_code, control_request FROM project.ccc_planning_runs WHERE project_id = ${PROJECT} AND run_id = ${run.runId}
     `)) as unknown as Row[];
     expect(rows).toHaveLength(1);
     return rows[0]!;
@@ -213,22 +220,23 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
     return { stages, calls, entered };
   }
 
-  function planningRuntime(stages: Record<CccPlanningIrStageId, CccPlanningStageFn>): WorkflowTaskRuntime {
+  function planningRuntime(stages: Record<CccPlanningIrStageId, CccPlanningStageFn>,
+    ledger: CccPlanningLedgerPort = createCccPlanningLedgerPort(harness.layer)): WorkflowTaskRuntime {
     return new WorkflowTaskRuntime({
       store: harness.store,
       primitives: {} as never,
       runCustomNode: async () => ({ outcome: "success" }),
       runCccPlanningStage: createCccPlanningStageHandler({
         stages,
-        ledger: createCccPlanningLedgerPort(harness.layer),
+        ledger,
         artifacts: createCccPlanningArtifactPort(harness.layer),
         sessions: { open: async () => { throw new Error("no session is expected"); } },
       }),
     });
   }
 
-  function processRun(run: Run, runtime: WorkflowTaskRuntime) {
-    return processDueWorkflowWorkItem(harness.store, runtime, undefined, {
+  function processRun(run: Run, runtime: WorkflowTaskRuntime, store: PgTestHarness["store"] = harness.store) {
+    return processDueWorkflowWorkItem(store, runtime, undefined, {
       leaseOwner: LIVE_ENGINE, leaseDurationMs: 60_000, custody: "planning",
       exactCandidate: { id: run.workItemId, runId: run.runId, attempt: 1 },
     });
@@ -355,5 +363,175 @@ pgDescribe("ccc planning host (card H1, PostgreSQL)", () => {
     const withoutPorts = await recoverCccPlanningRuns({ store: harness.store });
     expect(outcomeOf(withoutPorts, linked)).toBe("none");
     expect(await anchor(linked)).toMatchObject({ state: "building" });
+  });
+
+  /*
+  FNXC:CccPlanningHost 2026-10-14-23:24 (W3 repair 1):
+  The claim never ends with a failed or held planning work item behind a run that could still run, so a run is never
+  stranded where nothing moves it again and an operator cancel waits forever. Each failure below is injected the way the
+  review reproduced it on PostgreSQL; each asserts the run state, not only the item.
+  */
+  function plainStages(overrides: Partial<Record<CccPlanningIrStageId, CccPlanningStageFn>> = {}) {
+    return Object.fromEntries(CCC_PLANNING_IR_STAGES.map((stageId) => [
+      stageId, overrides[stageId] ?? (async () => ({ kind: "committed", artifactKeys: [] })),
+    ])) as Record<CccPlanningIrStageId, CccPlanningStageFn>;
+  }
+
+  /** The bound L1 port whose run reads fail on the chosen calls, like a dropped connection. */
+  function flakyLedger(failOn: (read: number) => boolean): CccPlanningLedgerPort {
+    const real = createCccPlanningLedgerPort(harness.layer);
+    let reads = 0;
+    return Object.freeze({
+      ...real,
+      inspectCccPlanningRun: (...args: Parameters<CccPlanningLedgerPort["inspectCccPlanningRun"]>) => {
+        reads += 1;
+        return failOn(reads)
+          ? Promise.reject(new Error("ECONNRESET (simulated transient ledger read failure)"))
+          : real.inspectCccPlanningRun(...args);
+      },
+    });
+  }
+
+  function operatorCancel(run: Pick<Run, "runId">) {
+    return requestCccPlanningControl(harness.layer, { runId: run.runId, request: "cancel", actor: "operator" });
+  }
+
+  function workflowIdOf(run: Pick<Run, "runId">): string {
+    return `${run.runId.replace(":", "-")}--workflow`;
+  }
+
+  it("H1 RED 16: one transient ledger read failure moves the run to failed before the item fails", async () => {
+    const run = await seedRun({ lease: "expired" });
+    // Reads 1-2 are preflight's boundary and post-stage reads, 3-4 intent's: the intent post-stage read fails.
+    const result = await processRun(run, planningRuntime(plainStages(), flakyLedger((read) => read === 4)));
+
+    expect(result.runtime?.reason ?? "").toContain("ECONNRESET");
+    expect(await anchor(run)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_INTERNAL_ERROR", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "failed", lease_owner: null });
+    // The run has ended, so there is nothing an operator cancel could be left waiting on.
+    await expect(operatorCancel(run)).rejects.toMatchObject({ code: "CCC_PLANNING_RUN_TERMINAL" });
+  });
+
+  it("H1 RED 16b: when L1 cannot be reached to fail the run, the item is released and a later operator cancel completes", async () => {
+    const run = await seedRun({ lease: "expired" });
+    // The processor's own L1 reads and moves fail too, so it cannot conclude the failure on this claim.
+    const unreachable = new Proxy(harness.store, {
+      get(target, key) {
+        if (key === "inspectCccPlanningRun" || key === "transitionCccPlanningRunState") {
+          return async () => { throw new Error("ECONNRESET (ledger unreachable)"); };
+        }
+        const value = Reflect.get(target, key, target) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+
+    const first = await processRun(run, planningRuntime(plainStages(), flakyLedger((read) => read === 4)), unreachable);
+
+    expect(first.claimed).toBe(true);
+    expect(await anchor(run)).toMatchObject({ state: "running", control_request: null });
+    expect(await workItem(run)).toMatchObject({ state: "runnable", attempt: 1, lease_owner: null });
+
+    const cancel = await operatorCancel(run);
+    expect(cancel.appliedDirectly).toBe(false);
+    const { stages, calls } = recordingStages();
+    const second = await processRun(run, planningRuntime(stages));
+
+    expect(second.claimed).toBe(true);
+    expect(calls).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  it("H1 RED 17: a stored workflow IR that no longer parses fails the run with WORKFLOW_IR_DRIFT", async () => {
+    const run = await seedRun({ lease: "expired" });
+    await db.execute(sql`
+      UPDATE project.workflows SET ir = to_jsonb(${"{\"version\":\"v2\",\"nodes\":"}::text)
+       WHERE project_id = ${PROJECT} AND id = ${workflowIdOf(run)}
+    `);
+    const { stages, entered } = recordingStages();
+
+    const result = await processRun(run, planningRuntime(stages));
+
+    expect(result.runtime?.reason ?? "").toContain("workflow-resolution-error");
+    expect(entered).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_WORKFLOW_IR_DRIFT" });
+    expect(await workItem(run)).toMatchObject({ state: "failed", lease_owner: null });
+    await expect(operatorCancel(run)).rejects.toMatchObject({ code: "CCC_PLANNING_RUN_TERMINAL" });
+  });
+
+  it("H1 RED 17b: a deleted workflow definition fails the run with WORKFLOW_IR_DRIFT", async () => {
+    const run = await seedRun({ lease: "expired" });
+    await db.execute(sql`DELETE FROM project.workflows WHERE project_id = ${PROJECT} AND id = ${workflowIdOf(run)}`);
+    const { stages, entered } = recordingStages();
+
+    const result = await processRun(run, planningRuntime(stages));
+
+    expect(result.runtime?.reason ?? "").toContain("workflow-missing");
+    expect(entered).toEqual([]);
+    expect(await anchor(run)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_WORKFLOW_IR_DRIFT" });
+    expect(await workItem(run)).toMatchObject({ state: "failed", lease_owner: null });
+    await expect(operatorCancel(run)).rejects.toMatchObject({ code: "CCC_PLANNING_RUN_TERMINAL" });
+  });
+
+  it("H1 RED 18: a refused awaiting-intent park fails the run instead of holding the item behind a running run", async () => {
+    const run = await seedRun({ lease: "expired" });
+    // No decision_request artifact exists, so L1 refuses running -> awaiting_intent (STATE_TRANSITION_REFUSED).
+    const stages = plainStages({ intent: async () => ({ kind: "awaiting-intent", decisionId: "d".repeat(64) }) });
+
+    const result = await processRun(run, planningRuntime(stages));
+
+    expect(result.runtime?.disposition).toBe("failed");
+    expect(await anchor(run)).toMatchObject({ state: "failed", state_code: "CCC_PLANNING_INTERNAL_ERROR" });
+    expect(await workItem(run)).toMatchObject({ state: "failed", lease_owner: null });
+    await expect(operatorCancel(run)).rejects.toMatchObject({ code: "CCC_PLANNING_RUN_TERMINAL" });
+  });
+
+  it("H1 RED 19: an operator cancel landing between the park and the item release ends cancelled without a restart", async () => {
+    const run = await seedRun({ lease: "expired" });
+    const real = createCccPlanningLedgerPort(harness.layer);
+    let cancel: Awaited<ReturnType<typeof operatorCancel>> | undefined;
+    const racing: CccPlanningLedgerPort = Object.freeze({
+      ...real,
+      transitionCccPlanningRunState: async (i: Parameters<CccPlanningLedgerPort["transitionCccPlanningRunState"]>[0]) => {
+        const moved = await real.transitionCccPlanningRunState(i);
+        // `fn plan cancel`, after the park committed and before the processor holds the item: L1 defers live-lease.
+        if (i.to === "blocked_prerequisite") cancel = await operatorCancel(run);
+        return moved;
+      },
+    });
+    const stages = plainStages({
+      preflight: async () => ({ kind: "blocked", state: "blocked_prerequisite", code: "CCC_PLANNING_SANDBOX_UNAVAILABLE" }),
+    });
+
+    await processRun(run, planningRuntime(stages, racing));
+
+    expect(cancel).toMatchObject({ appliedDirectly: true });
+    expect(await anchor(run)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(run)).toMatchObject({ state: "cancelled", lease_owner: null });
+  });
+
+  // Last in the file: run A stays running with a pending pause, which every later recovery would report as failed.
+  it("H1 RED 15: one run refused at engine start does not stop recovery of the runs after it", async () => {
+    // A sorts first: running, a dispatched_unknown call, an operator pause recorded as pending, lease expired.
+    const refused = await seedRun({ lease: "live", label: "r2c-h1-isolation-refused-4" });
+    await dispatchUnsettledCall(refused);
+    await requestCccPlanningControl(harness.layer, { runId: refused.runId, request: "pause", actor: "operator" });
+    await expireLease(refused);
+    // B sorts later: cancelling with an expired lease, which recovery must complete (D45).
+    const cancelling = await seedRun({ path: ["running", "cancelling"], lease: "expired", label: "r2c-h1-isolation-cancelling-4" });
+    expect(refused.runId < cancelling.runId).toBe(true);
+
+    const recovery = await recoverCccPlanningRuns({ store: harness.store }).then(
+      (results) => ({ results, error: undefined as unknown }),
+      (error: unknown) => ({ results: undefined, error }),
+    );
+
+    expect(recovery.error).toBeInstanceOf(AggregateError);
+    expect((recovery.error as AggregateError).message).toContain(refused.runId);
+    expect((recovery.error as AggregateError).errors).toHaveLength(1);
+    expect((recovery.error as AggregateError).errors[0]).toMatchObject({ code: "CCC_PLANNING_CONTROL_PENDING" });
+    expect(await anchor(cancelling)).toMatchObject({ state: "cancelled" });
+    expect(await workItem(cancelling)).toMatchObject({ state: "cancelled", lease_owner: null });
+    expect(await anchor(refused)).toMatchObject({ state: "running", control_request: "pause" });
   });
 });

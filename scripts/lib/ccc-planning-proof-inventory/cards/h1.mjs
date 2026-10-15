@@ -16,6 +16,12 @@ file-closed only.
 Measured on the M5 Max at load average about 8.7 (1 min, parallel agents): unit command 6 s wall (2 files, 54 tests),
 PostgreSQL command 4 s wall (6 tests), each including transform and import. The 180 s command timeouts are hang bounds
 over those measurements; no test timeout is raised anywhere.
+
+FNXC:CccPlanningProof 2026-10-14-23:24:
+W3 repair 1 adds the unit names 12b-12e, 18b, 8c, 8d and the in-process runtime wiring names 13 and 14, and the
+PostgreSQL names 16, 16b, 17, 17b, 18, 19 and 15 (15 runs last in its file because the file shares one database).
+Re-measured at load average about 7.6 (1 min, parallel agents): unit command 5 s wall (2 files, 63 tests), PostgreSQL
+command 7 s wall (13 tests). The 180 s hang bounds stay.
 */
 
 const UNIT_FILE = "src/__tests__/ccc-planning-host.test.ts";
@@ -27,6 +33,7 @@ const REGISTERED = "ccc planning host with a registered runtime";
 const WATCHDOG = `${REGISTERED} > session watchdog (D40)`;
 const ROUTE = `${REGISTERED} > provider route refusal (verify-v2 item 42, E8-W3)`;
 const DIGEST = `${REGISTERED} > runtime dist manifest digest (D44, ADR D algorithm)`;
+const WIRING = `${REGISTERED} > in-process runtime wiring`;
 const PG = "ccc planning host (card H1, PostgreSQL)";
 
 const ENGINE = Object.freeze({
@@ -78,11 +85,20 @@ export const OFFLINE = Object.freeze([
       `${REGISTERED} > H1 RED 7: a stored IR altered by one node config fails the run with WORKFLOW_IR_DRIFT`,
       `${REGISTERED} > H1 RED 7b: a work item irHash that is not the K1 digest fails the run with WORKFLOW_IR_DRIFT`,
       `${REGISTERED} > H1 RED 12: a planning node gets exactly one attempt (maxRetriesPerNode 1), never an executor retry`,
+      `${REGISTERED} > H1 RED 12b: a runtime rejection moves the run to failed before the work item fails`,
+      `${REGISTERED} > H1 RED 12c: a host failure while a pause is pending applies the pause and holds the item, never failed`,
+      `${REGISTERED} > H1 RED 12d: a host failure while a cancel is pending settles the cancel and L1 completes it`,
+      `${REGISTERED} > H1 RED 12e: when L1 cannot be reached to fail the run, the item is released to runnable, never failed or held`,
+      `${REGISTERED} > H1 RED 18b: a park whose pair the host may not take from a startable state fails the run instead of holding it`,
       `${WATCHDOG} > H1 RED 8a: a stage that runs four 20-minute sessions is not killed`,
       `${WATCHDOG} > H1 RED 8b: a single 31-minute session attempt is killed at 30 minutes`,
+      `${WATCHDOG} > H1 RED 8c: a session open that hangs past 30 minutes is killed at 30 minutes and its late session disposed`,
+      `${WATCHDOG} > H1 RED 8d: control, a 20-minute session open is not killed and the stage runs`,
       `${ROUTE} > H1 RED 11: a session that throws CccProviderRouteReceiptError after settlement yields blocked with one state event`,
       `${ROUTE} > H1 RED 11b: a stage that swallows the route refusal still yields blocked with one state event`,
       `${DIGEST} > H1 runtime digest: sha256 of canonical sorted [relPath, sha256] over dist/**/*.js`,
+      `${WIRING} > H1 RED 13: the drain dispatches a lease-expired planning item behind 25 older lease-expired running items under planning custody`,
+      `${WIRING} > H1 RED 14: start() registers its own runtime digest and runs planning recovery with the wired linked-outcome ports`,
     ]),
   }),
   Object.freeze({
@@ -98,6 +114,13 @@ export const OFFLINE = Object.freeze([
       `${PG} > H1 RED 9: at engine start a cancelling run whose lease expired ends cancelled`,
       `${PG} > H1 recovery: a running run with a dispatched_unknown call and no live holder moves to unknown_effect`,
       `${PG} > H1 RED 10: recovery calls reconcileLinkedOutcome once per linked run, never for an unlinked one; without ports it reports none`,
+      `${PG} > H1 RED 16: one transient ledger read failure moves the run to failed before the item fails`,
+      `${PG} > H1 RED 16b: when L1 cannot be reached to fail the run, the item is released and a later operator cancel completes`,
+      `${PG} > H1 RED 17: a stored workflow IR that no longer parses fails the run with WORKFLOW_IR_DRIFT`,
+      `${PG} > H1 RED 17b: a deleted workflow definition fails the run with WORKFLOW_IR_DRIFT`,
+      `${PG} > H1 RED 18: a refused awaiting-intent park fails the run instead of holding the item behind a running run`,
+      `${PG} > H1 RED 19: an operator cancel landing between the park and the item release ends cancelled without a restart`,
+      `${PG} > H1 RED 15: one run refused at engine start does not stop recovery of the runs after it`,
     ]),
   }),
 ]);

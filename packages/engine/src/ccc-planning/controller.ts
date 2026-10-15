@@ -9,6 +9,7 @@ import {
   type CccPlanningIrStageId,
   type CccPlanningRunCustody,
   type CccPlanningRunState,
+  type CccPlanningWorkItemFence,
 } from "@fusion/core";
 import type { WorkflowNodeHandler, WorkflowNodeResult } from "../workflow-graph-executor.js";
 import { CCC_PLANNING_HOLD_CONTEXT_KEY, type CccPlanningHoldContext } from "../workflow-task-runtime.js";
@@ -17,6 +18,7 @@ import {
   CCC_PLANNING_STAGE_HOST_KEY,
   type CccPlanningArtifactPort,
   type CccPlanningDescendantRegistry,
+  type CccPlanningHostLedger,
   type CccPlanningLedgerPort,
   type CccPlanningSession,
   type CccPlanningSessionFactory,
@@ -122,12 +124,146 @@ function failureResult(value: string): WorkflowNodeResult {
   return { outcome: "failure", value };
 }
 
+/**
+ * Where one host move left the run: resting with the work item held (or cancelling, or the lease lost), moved to
+ * `failed` by this host, or already terminal.
+ */
+type HostVerdict =
+  | Readonly<{ kind: "hold"; hold: CccPlanningHoldContext }>
+  | Readonly<{ kind: "failed"; code: string }>
+  | Readonly<{ kind: "terminal"; state: CccPlanningRunState }>;
+
+type HostMove = { moved: true; custody: CccPlanningRunCustody } | { moved: false; verdict: HostVerdict };
+
+/**
+ * `normal`: a refusal re-reads the run and may apply a pending control. `control`: the move applies a control, so a
+ * refusal never applies controls again. `last`: the run was already sent to `failed` once, so a run still startable
+ * after a refusal is an error the processor resolves by releasing the item, never a hold.
+ */
+type MoveMode = "normal" | "control" | "last";
+
+function verdictResult(verdict: HostVerdict): WorkflowNodeResult {
+  if (verdict.kind === "hold") return holdResult(verdict.hold);
+  if (verdict.kind === "failed") return failureResult(`ccc-planning-failed:${verdict.code}`);
+  return failureResult(`ccc-planning-run-terminal:${verdict.state}`);
+}
+
+/*
+FNXC:CccPlanningHost 2026-10-14-23:24:
+W3 repair 1 (review findings 2 and 4). The host never leaves a run in a startable state (admitted, running, spec_ready,
+importing) behind a held or failed work item: nothing moves such a run again, L1 only records a cancel for the host to
+apply, and resume is refused. So a park the host may not take from a startable state, or a refused move that leaves
+the run startable, fails the run with CCC_PLANNING_INTERNAL_ERROR (allowed from every startable state). A pending
+control still wins: L1 refuses `-> failed` with CONTROL_PENDING while a pause or cancel is pending, and the refusal
+applies that control (pause -> paused, cancel -> cancelling, then the D45 settlement). Every path is bounded: a run
+still startable after a second refused move throws, and the processor then releases the item to `runnable` so the next
+stage start runs its checks again.
+*/
+function createHostMoves(ledger: CccPlanningHostLedger, fence: CccPlanningWorkItemFence) {
+  const held = (runState: CccPlanningRunState, code: string | null, decisionId?: string): HostVerdict => ({
+    kind: "hold",
+    hold: Object.freeze({ disposition: "held", runState, code, ...(decisionId ? { decisionId } : {}) }),
+  });
+  const cancelling: HostVerdict = { kind: "hold", hold: Object.freeze({ disposition: "cancel", runState: "cancelling", code: null }) };
+
+  const move = async (from: CccPlanningRunState, to: CccPlanningRunState, stateCode: string | null, mode: MoveMode,
+    failCode: string = CODE_INTERNAL_ERROR): Promise<HostMove> => {
+    try {
+      const custody = await ledger.transitionCccPlanningRunState({ runId: fence.runId, from, to, stateCode, fence });
+      return { moved: true, custody };
+    } catch (error) {
+      const code = refusalCode(error);
+      if (code === "CCC_PLANNING_FENCE_STALE") {
+        return { moved: false, verdict: { kind: "hold", hold: Object.freeze({ disposition: "lease-lost", runState: from, code }) } };
+      }
+      if (code === "CCC_PLANNING_CONTROL_PENDING" || code === "CCC_PLANNING_STATE_TRANSITION_REFUSED") {
+        return { moved: false, verdict: await restAt({ allowControl: mode !== "control", last: mode !== "normal", failCode }) };
+      }
+      throw error;
+    }
+  };
+
+  /** Move the run to `failed` with a code; a resting run is held instead, a refusal goes back to where the run stands. */
+  const fail = async (from: CccPlanningRunState, code: string, last = false): Promise<HostVerdict> => {
+    const safeCode = STATE_CODE_PATTERN.test(code) ? code : CODE_INTERNAL_ERROR;
+    if (from === "failed") return { kind: "failed", code: safeCode };
+    if (!cccPlanningTransitionAllowed(from, "failed")) return restAt({ last, failCode: safeCode });
+    const outcome = await move(from, "failed", safeCode, last ? "last" : "normal", safeCode);
+    return outcome.moved ? { kind: "failed", code: safeCode } : outcome.verdict;
+  };
+
+  /** Apply a pending pause or cancel at this safe point. */
+  const applyControl = async (from: CccPlanningRunState, request: "pause" | "cancel" | "resume"): Promise<HostVerdict | null> => {
+    if (request === "pause" && cccPlanningTransitionAllowed(from, "paused")) {
+      const outcome = await move(from, "paused", null, "control");
+      return outcome.moved ? held("paused", null) : outcome.verdict;
+    }
+    if (request === "cancel" && cccPlanningTransitionAllowed(from, "cancelling")) {
+      const outcome = await move(from, "cancelling", null, "control");
+      return outcome.moved ? cancelling : outcome.verdict;
+    }
+    return null;
+  };
+
+  /** Where the run stands now, when the stage cannot start, a host move was refused, or a failure is concluded. */
+  const restAt = async (i: Readonly<{ allowControl?: boolean; last?: boolean; failCode?: string }> = {}): Promise<HostVerdict> => {
+    const status = await ledger.inspectCccPlanningRun(fence.runId);
+    if ((i.allowControl ?? true) && status.pendingControl) {
+      const applied = await applyControl(status.state, status.pendingControl.request);
+      if (applied) return applied;
+    }
+    if (status.state === "cancelling") return cancelling;
+    if (TERMINAL_STATES.has(status.state)) return { kind: "terminal", state: status.state };
+    if (STARTABLE_STATES.has(status.state)) {
+      if (i.last) {
+        throw new Error(`ccc planning host could not move run ${fence.runId} out of startable state ${status.state}`);
+      }
+      return fail(status.state, i.failCode ?? CODE_INTERNAL_ERROR, true);
+    }
+    return held(status.state, status.stateCode, status.awaitingDecision?.decisionId);
+  };
+
+  /** Park the run in a resting state; a pair the host may not take fails a startable run and holds a resting one. */
+  const park = async (from: CccPlanningRunState, to: CccPlanningRunState, code: string | null,
+    decisionId?: string): Promise<HostVerdict> => {
+    if (from === to) return held(from, code, decisionId);
+    if (!cccPlanningTransitionAllowed(from, to)) {
+      return STARTABLE_STATES.has(from) ? fail(from, CODE_INTERNAL_ERROR) : held(from, code, decisionId);
+    }
+    const outcome = await move(from, to, code, "normal");
+    return outcome.moved ? held(to, code, decisionId) : outcome.verdict;
+  };
+
+  return Object.freeze({ move, fail, applyControl, restAt, park });
+}
+
+/** What the processor does with its planning work item after concluding a failure (see concludeCccPlanningRunFailure). */
+export type CccPlanningFailureConclusion =
+  | Readonly<{ kind: "ended"; runState: CccPlanningRunState; code: string | null }>
+  | Readonly<{ kind: "hold"; hold: CccPlanningHoldContext }>;
+
+/**
+ * FNXC:CccPlanningHost 2026-10-14-23:24:
+ * W3 repair 1: a planning workflow that failed without a hold (a host error, a stage handler that threw, a runtime
+ * rejection) is concluded here, under the processor's still-live fence, before the work item moves. A startable run
+ * goes to `failed` with `code` (or applies its pending control); a run that already rests or ended is reported as it
+ * is. `ended` lets the processor fail the item; `hold` maps to held, the D45 settlement, or a lost lease. A ledger
+ * error propagates: the processor then releases the item to `runnable` instead of failing it.
+ */
+export async function concludeCccPlanningRunFailure(i: Readonly<{ ledger: CccPlanningHostLedger;
+  fence: CccPlanningWorkItemFence; code: string }>): Promise<CccPlanningFailureConclusion> {
+  const verdict = await createHostMoves(i.ledger, i.fence).restAt({ failCode: i.code });
+  if (verdict.kind === "hold") return verdict;
+  if (verdict.kind === "failed") return { kind: "ended", runState: "failed", code: verdict.code };
+  return { kind: "ended", runState: verdict.state, code: null };
+}
+
 type SessionWatch = { routeRefused: boolean };
 
 /**
  * D40: each open/run/dispose attempt gets its own controller, linked to the stage signal, and its own timer. When the
- * timer fires the attempt is aborted with CccPlanningSessionWatchdogError and its pending run() rejects, even if the
- * session ignores its signal. The stage keeps going: a stage of many short sessions is never killed for its length.
+ * timer fires the attempt is aborted with CccPlanningSessionWatchdogError, and a pending open() or run() rejects, even
+ * if the session ignores its signal. The stage keeps going: a stage of many short sessions is never killed for its length.
  */
 function watchedSessions(factory: CccPlanningSessionFactory, stageSignal: AbortSignal, watch: SessionWatch,
   limitMs: number): CccPlanningSessionFactory {
@@ -143,21 +279,35 @@ function watchedSessions(factory: CccPlanningSessionFactory, stageSignal: AbortS
       });
       const watchdog = new CccPlanningSessionWatchdogError(limitMs);
       let rejectRun: ((error: Error) => void) | undefined;
+      let rejectOpen: ((error: Error) => void) | undefined;
+      const openDeadline = new Promise<never>((_resolve, reject) => { rejectOpen = reject; });
       const timer = setTimeout(() => {
         attempt.abort(watchdog);
+        rejectOpen?.(watchdog);
         rejectRun?.(watchdog);
       }, limitMs);
       const release = () => {
         clearTimeout(timer);
         for (const remove of forwards) remove();
       };
+      /*
+      FNXC:CccPlanningHost 2026-10-14-23:24:
+      W3 repair 1 (review finding 6, D40): the open is raced against the same watchdog as run(). An open that ignores
+      its signal is ended at the limit, and a session the factory hands back after the deadline is disposed in the
+      background (its dispose is never awaited by the stage), so a late session is never used and never leaks.
+      */
+      const opening = factory.open({ ...input, signal: attempt.signal });
       let session: CccPlanningSession;
       try {
-        session = await factory.open({ ...input, signal: attempt.signal });
+        session = await Promise.race([opening, openDeadline]);
       } catch (error) {
         release();
         if (isRouteRefusal(error)) watch.routeRefused = true;
-        throw attempt.signal.reason === watchdog ? watchdog : error;
+        if (attempt.signal.reason === watchdog) {
+          void opening.then((late) => late.dispose(), () => undefined).catch(() => undefined);
+          throw watchdog;
+        }
+        throw error;
       }
       if (attempt.signal.reason === watchdog) {
         release();
@@ -203,75 +353,11 @@ export function createCccPlanningStageHandler(i: Readonly<{ stages: Readonly<Rec
     if (!host) return failureResult("ccc-planning-stage-host-missing");
     const { fence, signal } = host;
     if (signal.aborted) return failureResult("aborted");
-
-    /**
-     * One host transition. A pending control (CONTROL_PENDING) or a run that moved meanwhile sends the host back to
-     * where the run now stands; a stale fence means the lease is no longer this engine's. A refused control move does
-     * not apply controls again, so the fallback is bounded.
-     */
-    const move = async (from: CccPlanningRunState, to: CccPlanningRunState, stateCode: string | null, inControl = false):
-      Promise<{ moved: true; custody: CccPlanningRunCustody } | { moved: false; result: WorkflowNodeResult }> => {
-      try {
-        const custody = await ledger.transitionCccPlanningRunState({ runId: fence.runId, from, to, stateCode, fence });
-        return { moved: true, custody };
-      } catch (error) {
-        const code = refusalCode(error);
-        if (code === "CCC_PLANNING_FENCE_STALE") {
-          return { moved: false, result: holdResult({ disposition: "lease-lost", runState: from, code }) };
-        }
-        if (code === "CCC_PLANNING_CONTROL_PENDING" || code === "CCC_PLANNING_STATE_TRANSITION_REFUSED") {
-          return { moved: false, result: await restAt(!inControl) };
-        }
-        throw error;
-      }
-    };
-    /** Park the run in a resting state and hold the work item; a disallowed pair holds at the current state. */
-    const park = async (from: CccPlanningRunState, to: CccPlanningRunState, code: string | null,
-      decisionId?: string): Promise<WorkflowNodeResult> => {
-      if (from === to || !cccPlanningTransitionAllowed(from, to)) {
-        return holdResult({ disposition: "held", runState: from, code, ...(decisionId ? { decisionId } : {}) });
-      }
-      const outcome = await move(from, to, code);
-      if (!outcome.moved) return outcome.result;
-      return holdResult({ disposition: "held", runState: to, code, ...(decisionId ? { decisionId } : {}) });
-    };
-    /** Move the run to `failed` with a code and fail the node (the work item then fails). */
-    const fail = async (from: CccPlanningRunState, code: string): Promise<WorkflowNodeResult> => {
-      const safeCode = STATE_CODE_PATTERN.test(code) ? code : CODE_INTERNAL_ERROR;
-      if (from !== "failed" && !cccPlanningTransitionAllowed(from, "failed")) return restAt(true);
-      if (from !== "failed") {
-        const outcome = await move(from, "failed", safeCode);
-        if (!outcome.moved) return outcome.result;
-      }
-      return failureResult(`ccc-planning-failed:${safeCode}`);
-    };
-    /** Apply a pending pause or cancel at this safe point. */
-    const applyControl = async (from: CccPlanningRunState, request: "pause" | "cancel" | "resume"):
-      Promise<WorkflowNodeResult | null> => {
-      if (request === "pause" && cccPlanningTransitionAllowed(from, "paused")) {
-        const outcome = await move(from, "paused", null, true);
-        return outcome.moved ? holdResult({ disposition: "held", runState: "paused", code: null }) : outcome.result;
-      }
-      if (request === "cancel" && cccPlanningTransitionAllowed(from, "cancelling")) {
-        const outcome = await move(from, "cancelling", null, true);
-        return outcome.moved ? holdResult({ disposition: "cancel", runState: "cancelling", code: null }) : outcome.result;
-      }
-      return null;
-    };
-    /** Where the run stands now, when the stage cannot start or a host transition was refused. */
-    const restAt = async (allowControl = true): Promise<WorkflowNodeResult> => {
-      const status = await ledger.inspectCccPlanningRun(fence.runId);
-      if (allowControl && status.pendingControl) {
-        const applied = await applyControl(status.state, status.pendingControl.request);
-        if (applied) return applied;
-      }
-      if (status.state === "cancelling") return holdResult({ disposition: "cancel", runState: "cancelling", code: null });
-      if (TERMINAL_STATES.has(status.state)) return failureResult(`ccc-planning-run-terminal:${status.state}`);
-      return holdResult({
-        disposition: "held", runState: status.state, code: status.stateCode,
-        ...(status.awaitingDecision?.decisionId ? { decisionId: status.awaitingDecision.decisionId } : {}),
-      });
-    };
+    const moves = createHostMoves(ledger, fence);
+    const park = async (from: CccPlanningRunState, to: CccPlanningRunState, code: string | null, decisionId?: string) =>
+      verdictResult(await moves.park(from, to, code, decisionId));
+    const fail = async (from: CccPlanningRunState, code: string) => verdictResult(await moves.fail(from, code));
+    const restAt = async () => verdictResult(await moves.restAt());
 
     let custody = await ledger.getCccPlanningRunForTask(fence.originTaskId);
     if (!custody || custody.runId !== fence.runId) return failureResult("ccc-planning-custody-missing");
@@ -295,12 +381,12 @@ export function createCccPlanningStageHandler(i: Readonly<{ stages: Readonly<Rec
     if (status.unreconciled.length > 0) return park(state, "unknown_effect", CODE_UNRECONCILED_DISPATCH);
     // (4) The stage boundary is the safe point for a pending pause or cancel.
     if (status.pendingControl) {
-      const applied = await applyControl(state, status.pendingControl.request);
-      if (applied) return applied;
+      const applied = await moves.applyControl(state, status.pendingControl.request);
+      if (applied) return verdictResult(applied);
     }
     if (state === "admitted") {
-      const outcome = await move("admitted", "running", null);
-      if (!outcome.moved) return outcome.result;
+      const outcome = await moves.move("admitted", "running", null, "normal");
+      if (!outcome.moved) return verdictResult(outcome.verdict);
       custody = outcome.custody;
     }
 
