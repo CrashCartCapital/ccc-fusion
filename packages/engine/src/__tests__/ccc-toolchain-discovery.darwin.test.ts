@@ -14,8 +14,10 @@ seals with its own digest, and the fixture `git` is a byte copy of the host's
 real git, because sealing asks git for its exec path. A script shim shaped like
 the host's SafeExec git shim sits earlier on the path, so a discovery that
 accepts scripts seals a file that cannot run inside the sandbox. The real host
-scan is the positive control; it stays Darwin-only and its full-catalogue
-result is reported as evidence, not asserted (E4-15).
+scan is the positive control; it stays Darwin-only, and since repair 1 it
+asserts the default discovery (every required tool sealed, nothing outside
+the required and optional sets, every file under /opt/homebrew) rather than
+reporting a full-catalogue result as evidence (E6-B item 4, E7-B item 6).
 
 The single `skipIf(process.platform !== "darwin")` is the only skip form a
 Darwin-tagged planning suite may carry (ADR D, skip policy).
@@ -31,6 +33,28 @@ when the caller passes that directory; that test and the host scan read this
 host's Homebrew. Directory-first lookup is pinned by an unprefixed `cat` in a
 directory after the one holding `gcat` (loops-swapped mutant D12), and the
 missing bash and node roles and the execute-permission check have tests.
+
+FNXC:CccToolchainDiscovery 2026-10-14-18:33:
+Repair 2 (errata E7-B items 5 and 6; test-only, discovery's source is
+unchanged). Recorded limits of the default discovery, none of them a defect:
+- Inside the sandbox `id -un` fails the way the dropped `whoami` did ("id:
+  cannot find name for user ID 501", exit 1; re-probed on the M5 Max on
+  2026-10-14), so only numeric `id` and `id -u` are supported, although `id`
+  is in the required coreutils.
+- `/opt/homebrew` is owned and writable by the operator account (on this host
+  the SafeExec git shim lives in `/opt/homebrew/bin`), so "Homebrew only"
+  keeps user-writable home directories off the path but does not mean
+  protected. Sealing records each file's digest, so a binary changed after
+  sealing fails closed.
+- A keg-only `node@NN` that is not linked into `/opt/homebrew/bin` is not found
+  by default: of node's directories the default path lists only
+  `/opt/homebrew/opt/node/bin`. A caller passes the keg's `bin` explicitly.
+- An optional tool that is found but that `sealCccToolchain` then rejects
+  refuses the whole discovery instead of being left out (fails closed).
+- Inside one directory the unprefixed name wins over the `g` name, so a
+  Homebrew formula that installs an unprefixed coreutils or awk name in
+  `/opt/homebrew/bin` (BWK `awk`, md5sha1sum's `md5sum`) would be sealed in
+  place of the GNU build found by its `g` name in that same directory.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync, readFileSync, realpathSync } from "node:fs";

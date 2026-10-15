@@ -36,6 +36,38 @@ the margin also covers a burst of X1's lsof sweep stalls (round 1's adversary
 saw one failing run take 86 s; X1c owns that fix, E6-X item 5). This is a hang
 bound for a deterministic suite, not a test-timeout widening; no test timeout
 is changed.
+
+FNXC:CccPlanningProofInventory 2026-10-14-18:37:
+Repair 2 (errata E7-B; test-only, no source file changed). The closed check
+now holds twenty-three tests: twelve in discovery, eleven in the shim layer.
+The four new shim-layer tests pin behaviours a named mutant broke while the
+check still passed, and each mutant now fails it with an assertion: N1 (a
+nested bash forgets the inherited shim directories; a package script running
+`bash -c 'hello'` and a `bash -c` inside a shim-enabled bash both report
+"command not found", 127), N11 (`#!/usr/bin/env bash` runs as the clone's
+`sh`), N2 (a shim without a shebang runs as `bash`, not `sh`) and, optional
+item 4, N7 (a wrappers directory redirected through a symlink is accepted).
+The discovery test header's stale "reported as evidence, not asserted" line
+is corrected (item 6).
+
+Recorded limits (item 5), none of them a defect:
+- inside the sandbox `id -un` fails like the dropped `whoami` ("id: cannot
+  find name for user ID 501", exit 1), so only numeric `id` and `id -u` are
+  supported;
+- `/opt/homebrew` is writable by the operator account, so "Homebrew only" does
+  not mean protected; sealing records digests, so a later change fails closed;
+- a keg-only `node@NN` not linked into `/opt/homebrew/bin` is not found by
+  default (a caller passes its `bin` explicitly);
+- an optional tool that `sealCccToolchain` rejects refuses the whole discovery
+  (fails closed) instead of being left out;
+- inside one directory an unprefixed Homebrew name wins over the `g` name.
+
+Measured with the prescribed command on the M5 Max on 2026-10-14, at ambient
+load only (no CPU burners in this round): 23 of 23 passed in 27.8 s (load
+8.6 rising to 10.9), 20.2 s (8.5 to 8.6) and 20.6 s (8.6 to 11.4); the 19
+tests before this repair took 17.6 s at load 10.1, so the four new tests add
+about 3 s of sandboxed execs. The bound stays 120 s, well above 1.5 x the
+worst run here (41.7 s). The load-25 run was not repeated for the new tests.
 */
 
 const DISCOVERY = "CCC toolchain discovery (Darwin)";
@@ -60,10 +92,14 @@ const NAMES = Object.freeze([
   `${COMPAT} > every wrapper carries a toolchain shebang and the npm wrapper runs npm inside the sandbox, while the raw shell has no npm`,
   `${COMPAT} > the BASH_ENV dispatcher runs node_modules/.bin shims through the toolchain sh and node and exports npm_config_script_shell, while the raw shell cannot run them`,
   `${COMPAT} > runs a #!/usr/bin/env -S node shim through the toolchain node with the flags its shebang names, while the raw shell cannot run it`,
+  `${COMPAT} > runs a #!/usr/bin/env bash shim through the toolchain bash with POSIX mode off, while the raw shell cannot run it`,
+  `${COMPAT} > runs a shim without a shebang through the toolchain sh, as execve's ENOEXEC fallback would, while the raw shell cannot run it`,
   `${COMPAT} > npm run starts its script shell from the toolchain bash, which loads the dispatcher and runs a .bin shim, while npm's default sh cannot run the shim`,
+  `${COMPAT} > keeps the shim directories in a nested bash, from a package script that runs bash -c and from a bash -c inside a shim-enabled bash, while the raw shell cannot run the shim from either`,
   `${COMPAT} > refuses a shim whose shebang names an interpreter outside the toolchain with a clear message and status 126, while a sh shim in the same directory runs`,
   `${COMPAT} > keeps the dispatcher read-only inside the sandbox and refuses an exec once it changed outside, while the scratch home stays writable and the restored file runs`,
   `${COMPAT} > refuses an exec once an extra file is planted in the shim layer's directory or in its wrappers directory, while the exec runs again once the file is removed`,
+  `${COMPAT} > refuses an exec once the wrappers directory is replaced by a symlink to a directory outside the shim layer that holds the same bytes, while the exec runs again once the real directory is back`,
 ]);
 
 function toolchainShellCompatCommand(id) {
