@@ -790,12 +790,23 @@ SBPL escaping, ancestor-metadata pattern, dylib closure discovery and loopback
 rule form instead of a second implementation. These are re-exports of the
 existing internal helpers; the semantic-proof profile and runner keep their
 exact behaviour.
+
+FNXC:CccConfinedShell 2026-10-14-17:30:
+Errata E6-X item 7 (card X1c): the rules of the dylib closure discovery
+(`resolveLinkedPath` and the helpers `darwinLinkedRuntimeFiles` calls) are
+re-exported too, so the confined shell can bind them into its profile
+template digest; the discovered libraries become its read roots. Helper
+exports only, no behaviour change.
 */
 export {
   DARWIN_SANDBOX_EXECUTABLE as CCC_DARWIN_SANDBOX_EXECUTABLE,
   DARWIN_SHELL_SELECTION_PATH as CCC_DARWIN_SHELL_SELECTION_PATH,
   canonicalExistingPath as cccCanonicalExistingPath,
   darwinLinkedRuntimeFiles as cccDarwinLinkedRuntimeFiles,
+  executableInstallRoot as cccExecutableInstallRoot,
+  isHomebrewRuntimePath as cccIsHomebrewRuntimePath,
+  resolveLinkedPath as cccResolveLinkedPath,
+  sealedToolchainRoot as cccSealedToolchainRoot,
   isSameOrWithin as cccIsSameOrWithin,
   pathAncestors as cccPathAncestors,
   sbplLiteral as cccSbplLiteral,

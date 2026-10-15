@@ -150,6 +150,45 @@ narrowed to `{ lsofPath? }`, and `CccSealedToolchain` gains `libraries`, which
 - Item 9 (E4-7): the exit status of an lsof scan never decides; a scan is
   trusted only when its output parses and lists the controller's own pid. This
   was already the E2-22 behaviour; X1c pins it with tests.
+
+FNXC:CccConfinedShell 2026-10-14-17:30:
+Errata E6-X, card X1c repair 1. No exported signature changes.
+- Item 1: the reaper-stopped orphan kill is best effort. A throw from it (a
+  /bin/ps spawn can throw synchronously, for example ENOMEM) is recorded in the
+  message and never replaces the CLOSURE_UNCONFIRMED error, and `execOnce` sets
+  the instance's unconfirmed latch itself on both closure-error paths before
+  anything else can throw.
+- Item 2: `dispose()` also reports unconfirmed when its final sweep finds any
+  process running from the clone: every exec has ended by then, so a survivor
+  proves an earlier confirmation wrong.
+- Item 3 (v3.2 F3): a reaper-reported pid no scan saw is killed only when `ps`
+  shows the same uid, a stopped state and a start time no earlier than the
+  second the exec started. macOS gives no executable path without lsof that
+  `exec -a` cannot spoof (`ps -o comm` is argv[0], `ps -o ucomm` a 16-character
+  file name), so that fourth condition is not used.
+- Item 5: every sweep scan runs `lsof -b`. Without it lsof stats every mount
+  point first, including this host's smbfs Time Machine mount over Tailscale
+  (`/Volumes/.timemachine/...`), and that stat most likely blocks while the
+  server is unreachable: the X1b adversary saw scans stall at the 11 s capture limit in
+  bursts (3 of 13 tests in one closed check; one standalone scan of 11.24 s;
+  0 of 90 later samples), and X1c round 1 saw hand scans of 10.3 s and 11.1 s
+  and two whole-file runs fail. Measured here (120 interleaved rounds, load
+  8.1 to 13.3): no stall with or without `-b` in that window; without `-b`
+  all 120 scans warned that lsof could not stat the smbfs mount, while `-b`
+  makes lsof report "avoiding stat(...): -b was specified" for each mount
+  point; median 0.194 s with `-b` against 0.225 s without, worst 0.34 s
+  against 0.47 s. Apple's lsof 4.91 rejects `-e` (illegal option), so a mount
+  cannot be exempted alone. One bounded retry of a timed-out scan was not
+  applied: the stalls came in bursts, so a retry would mostly double the wait
+  before the same failure. `-b` keeps the E4-7 trust rule: the scan still
+  parses, lists the controller and matches clone inodes (txt device and inode
+  are identical with and without `-b`, measured on a cloned bash).
+- Item 6: names and path segments use K1's `cccPlanningPathComparisonKey`
+  (the K1b form that merges U+1E9E with "ss"); the private fold is gone.
+- Item 7: the template material binds the dylib-closure discovery: the source
+  of `darwinLinkedRuntimeFiles`, `resolveLinkedPath` and its helpers, and of
+  this file's steps from the sealed executables to a read root, so any change
+  to a rule that could widen a read root changes the template digest.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -158,13 +197,17 @@ import { connect as netConnect, createServer, type Server } from "node:net";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import { superviseSpawn, type SupervisedChild } from "@fusion/core";
+import { cccPlanningPathComparisonKey, superviseSpawn, type SupervisedChild } from "@fusion/core";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import {
   acquireCccSemanticProofLoopbackPort,
   cccCanonicalExistingPath,
   cccDarwinLinkedRuntimeFiles,
+  cccExecutableInstallRoot,
+  cccIsHomebrewRuntimePath,
   cccIsSameOrWithin,
+  cccResolveLinkedPath,
+  cccSealedToolchainRoot,
   cccPathAncestors,
   cccSbplLiteral,
   cccSbplLoopbackPortRules,
@@ -978,23 +1021,16 @@ function deniedNamePattern(name: string): string {
 }
 
 /**
- * K1's path comparison fold (errata E2-40), applied to one name: on this
- * host's APFS volume it merges every pair the filesystem merges (A/a, NFC/NFD,
- * ß/ss, ς/σ, ﬁ/fi, ſ/s, Kelvin K/k); its one over-match, I/ı, fails closed.
- */
-function cccConfinedFoldName(value: string): string {
-  return value.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC");
-}
-
-/**
  * E2-23: the caller's denied names united with `CCC_CONFINED_DEFAULT_DENIED_NAMES`,
  * folded, de-duplicated and sorted. Each name is one path component of
  * `[A-Za-z0-9._*-]`, where `*` matches any run of characters within a segment.
- * A caller can add names, never remove a default.
+ * A caller can add names, never remove a default. E6-X item 6: names and path
+ * segments are folded with K1's `cccPlanningPathComparisonKey` (the K1b form,
+ * which also merges U+1E9E with "ss"), the one path key of every planning card.
  */
 export function cccConfinedEffectiveDeniedNames(callerNames: readonly string[]): readonly string[] {
   for (const name of callerNames) assertDeniedName(name);
-  const folded = new Set([...CCC_CONFINED_DEFAULT_DENIED_NAMES, ...callerNames].map(cccConfinedFoldName));
+  const folded = new Set([...CCC_CONFINED_DEFAULT_DENIED_NAMES, ...callerNames].map(cccPlanningPathComparisonKey));
   return Object.freeze([...folded].sort(compareCodeUnits));
 }
 
@@ -1056,7 +1092,7 @@ export function cccConfinedWriteRefusal(i: Readonly<{
     return canonicalRoot === null ? [] : [canonicalRoot];
   });
   if (landing === null || !roots.some((root) => cccIsSameOrWithin(landing, root))) return "outside-write-roots";
-  const segments = [...pathSegments(resolve(i.path)), ...pathSegments(landing)].map(cccConfinedFoldName);
+  const segments = [...pathSegments(resolve(i.path)), ...pathSegments(landing)].map(cccPlanningPathComparisonKey);
   if (segments.includes(".git")) return "git-segment";
   const patterns = deniedNames.map(deniedNameRegex);
   if (segments.some((segment) => patterns.some((pattern) => pattern.test(segment)))) return "denied-name";
@@ -1329,10 +1365,25 @@ export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL: readonly string[] = Obj
     taskEnv: {},
   }))} shell-added ${SHELL_ADDED_ENV_KEYS.join(",")}`,
   `loopback ${cccSbplLoopbackPortRules(TEMPLATE_SENTINEL_PORT).join("\n")}`,
-  `controller-sweep ${LSOF_EXECUTABLE} txt by clone inode; stop, rescan, kill, two empty scans; at most ${CONTROLLER_SWEEP_MAX_SCANS} scans; killed lists only pids a scan saw`,
+  `controller-sweep ${LSOF_EXECUTABLE} ${JSON.stringify(lsofSweepArgs("<uid>"))} txt by clone inode; stop, rescan, kill, two empty scans; at most ${CONTROLLER_SWEEP_MAX_SCANS} scans; killed lists only pids a scan saw`,
   `system-runtime-read-roots ${JSON.stringify(SYSTEM_RUNTIME_READ_ROOTS)}`,
   `device-read-files ${JSON.stringify(DEVICE_READ_FILES)}`,
   `writer-profile-sentinel ${TEMPLATE_SENTINEL_PROFILE}`,
+  // E6-X item 7: the libraries the discovery finds become read roots, so its rules (otool's load commands, the
+  // @rpath, @loader_path and @executable_path resolution, the Homebrew recursion) and the shell's own steps from the
+  // sealed executables to a read root are material: a rule change that widens a read root changes the digest.
+  `dylib-closure-rules ${[
+    cccDarwinLinkedRuntimeFiles,
+    cccResolveLinkedPath,
+    cccSealedToolchainRoot,
+    cccExecutableInstallRoot,
+    cccIsHomebrewRuntimePath,
+    toolchainExecutables,
+    linkedRuntimeFilesForExecutables,
+    linkedRuntimeFilesFor,
+    writerProfile,
+    assembleWriterProfile,
+  ].map((rule) => String(rule)).join("\n")}`,
 ]);
 export const CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256 = createHash("sha256")
   .update(CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL.join("\u0000"))
@@ -1488,6 +1539,21 @@ const LSOF_FIELD_VALUE: Readonly<Record<string, RegExp>> = {
 };
 
 /**
+ * E6-X item 5: `-b` makes lsof skip the stat(2), lstat(2) and readlink(2) of
+ * every mount point it otherwise makes before listing anything; it takes their
+ * device numbers from the mount table instead. Without it, each scan stats the
+ * smbfs Time Machine mount on this host, and when that server is unreachable
+ * the stat most likely blocks past the scan's 11 s lifetime (the X1b
+ * adversary's stall). The txt files' device and inode come from the process
+ * table either way, so a scan still parses, lists the controller and matches
+ * clone inodes (measured, and pinned by a test). Apple's lsof 4.91 has no `-e`
+ * to exempt one mount.
+ */
+function lsofSweepArgs(uid: string): string[] {
+  return ["-b", "-n", "-P", "-w", "-a", "-u", uid, "-d", "txt", "-F", "pDi"];
+}
+
+/**
  * Outside the sandbox: every same-uid pid whose lsof txt mapping is one of the
  * clone's inodes, from the absolute lsof spawned through the supervised async
  * capture. Any line that is not one of the requested fields, a failed or
@@ -1496,11 +1562,7 @@ const LSOF_FIELD_VALUE: Readonly<Record<string, RegExp>> = {
  */
 async function scanCloneProcesses(clone: ToolchainClone, lsofPath: string): Promise<number[]> {
   const uid = typeof process.getuid === "function" ? process.getuid() : -1;
-  const scan = await captureSupervised(
-    lsofPath,
-    ["-n", "-P", "-w", "-a", "-u", String(uid), "-d", "txt", "-F", "pDi"],
-    { label: "ccc-confined-shell-sweep" },
-  );
+  const scan = await captureSupervised(lsofPath, lsofSweepArgs(String(uid)), { label: "ccc-confined-shell-sweep" });
   if (scan.timedOut || scan.overLimit || scan.spawnError !== null || scan.signal !== null) {
     throw new Error(`lsof scan failed (${scan.spawnError ?? (scan.timedOut ? "timed out" : scan.overLimit ? "output over limit" : `signal ${String(scan.signal)}`)})`);
   }
@@ -1622,18 +1684,33 @@ function killStoppedSeen(stopped: ReadonlySet<number>, killed: Set<number>): voi
   }
 }
 
+const PS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
+/** `ps -o pid=,uid=,stat=,lstart=` under TZ=UTC0 and LANG=C: `  123   501 T    Wed Oct 14 17:15:02 2026`. */
+const PS_ORPHAN_LINE = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)\s+[A-Z][a-z]{2}\s+([A-Z][a-z]{2})\s+([0-9]{1,2})\s+([0-9]{2}):([0-9]{2}):([0-9]{2})\s+([0-9]{4})\s*$/u;
+
 /**
- * E4 X1c item 8: when the controller cannot confirm closure, nothing the
- * in-sandbox reaper stopped may stay stopped forever. Every pid the reaper
- * reported stopping is SIGKILLed after the foreign-pid filter (E2-26c): a pid a
- * controller scan saw running from the clone is an instance process; any other
- * is killed only when `ps` lists it with the controller's uid in a stopped
- * state (`T`). The foreign zombie the reaper can signal (P7, state `Z`), a pid
- * that has since gone, and a pid recycled by a running process are never
- * signalled. Without a usable `ps` no unseen pid is signalled. Returns the pids
- * it signalled.
+ * E4 X1c item 8 and E6-X item 3: when the controller cannot confirm closure,
+ * nothing the in-sandbox reaper stopped may stay stopped forever. A
+ * reaper-reported pid is SIGKILLed only after the foreign-pid filter (E2-26c,
+ * v3.2 F3). A pid a controller scan saw running from the clone is an instance
+ * process: lsof read its executable's inode, which `exec -a` cannot spoof (and
+ * every such pid is already killed by the sweep that gave up). Any other pid
+ * is killed only when `ps` lists it with all of: the controller's uid, a
+ * stopped state (`T`), and a start time (`lstart`, read in UTC) no earlier than
+ * the second this exec started. The fourth condition of item 3, an executable
+ * path inside the clone read in a way `exec -a` cannot spoof, is not available
+ * without lsof on macOS: `ps -o comm` is argv[0] (`exec -a` sets it) and
+ * `ps -o ucomm` is only the first 16 characters of the file name, so it is not
+ * used. The foreign zombie the reaper can signal (P7, state `Z`), a pid that has
+ * since gone, a pid recycled by a running process, and an older stopped
+ * process are never signalled; nor is any unseen pid when `ps` is unusable.
+ * Returns the pids it signalled.
  */
-async function killReaperStoppedPids(reported: readonly number[], sweep: ControllerSweep): Promise<number[]> {
+async function killReaperStoppedPids(
+  reported: readonly number[],
+  sweep: ControllerSweep,
+  execStartedAtMs: number,
+): Promise<number[]> {
   const alreadyKilled = new Set(sweep.killed);
   const seen = new Set(sweep.seen);
   const candidates = cccUniqueSortedNumbers(reported.filter((pid) => (
@@ -1642,16 +1719,29 @@ async function killReaperStoppedPids(reported: readonly number[], sweep: Control
   const confirmed = candidates.filter((pid) => seen.has(pid));
   const unseen = candidates.filter((pid) => !seen.has(pid));
   if (unseen.length > 0) {
-    const ps = await captureSupervised(PS_EXECUTABLE, ["-o", "pid=,uid=,stat=", "-p", unseen.join(",")], { label: "ccc-confined-shell-orphans" });
+    const ps = await captureSupervised(
+      PS_EXECUTABLE,
+      ["-o", "pid=,uid=,stat=,lstart=", "-p", unseen.join(",")],
+      { label: "ccc-confined-shell-orphans", env: { ...CAPTURE_ENV, TZ: "UTC0" } },
+    );
     // ps exits 1 when a listed pid is gone; its lines for the others still count.
     if (!ps.timedOut && !ps.overLimit && ps.spawnError === null && ps.signal === null) {
       const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+      // lstart has one-second resolution, so the bound is the start of the second the exec started in.
+      const startSecond = Math.floor(execStartedAtMs / 1_000);
       const wanted = new Set(unseen);
       for (const line of ps.stdout.split("\n")) {
-        const match = /^\s*([0-9]+)\s+([0-9]+)\s+(\S+)\s*$/u.exec(line);
+        const match = PS_ORPHAN_LINE.exec(line);
         if (!match) continue;
         const pid = Number(match[1]);
-        if (wanted.has(pid) && Number(match[2]) === uid && match[3]!.startsWith("T")) confirmed.push(pid);
+        const month = PS_MONTHS.indexOf(match[4] as (typeof PS_MONTHS)[number]);
+        const startedSecond = Date.UTC(Number(match[9]), month, Number(match[5]), Number(match[6]), Number(match[7]), Number(match[8])) / 1_000;
+        if (
+          wanted.has(pid) && Number(match[2]) === uid && match[3]!.startsWith("T")
+          && month >= 0 && Number.isSafeInteger(startedSecond) && startedSecond >= startSecond
+        ) {
+          confirmed.push(pid);
+        }
       }
     }
   }
@@ -1822,6 +1912,8 @@ function confinedOperations(
     let forceKill: NodeJS.Timeout | undefined;
     let outcome: Awaited<ReturnType<typeof runCccDarwinSandboxedProcess>> | null = null;
     let runnerError: unknown = null;
+    // E6-X item 3: no process of this exec started before this instant.
+    const execStartedAtMs = Date.now();
     try {
       outcome = await runCccDarwinSandboxedProcess({
         profile: profileText,
@@ -1885,15 +1977,27 @@ function confinedOperations(
     const frame = outcome === null ? null : reported;
     const record = mergedClosureRecord(frame, sweep);
     if (!sweep.converged) {
-      // E4 X1c item 8: no process the reaper stopped is left stopped behind an unconfirmed closure.
-      const orphansKilled = await killReaperStoppedPids(reported?.record.stopped ?? [], sweep);
+      // E6-X item 1: the latch is set here, before anything else can throw, so dispose reports unconfirmed
+      // whatever this exec ends with.
+      closureUnconfirmed = true;
+      // E4 X1c item 8: no process the reaper stopped is left stopped behind an unconfirmed closure. E6-X item 1:
+      // that kill is best effort and can never replace the closure error (a spawn of /bin/ps can throw
+      // synchronously, for example ENOMEM, and the same pressure is a likely reason the sweep failed).
+      let orphanNote: string;
+      try {
+        const orphansKilled = await killReaperStoppedPids(reported?.record.stopped ?? [], sweep, execStartedAtMs);
+        orphanNote = `SIGKILLed ${orphansKilled.length} process(es) the reaper had stopped`;
+      } catch (error) {
+        orphanNote = `killing the processes the reaper had stopped failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
       throw new CccConfinementClosureError(
         record,
-        `the controller sweep did not converge (${sweep.failure ?? "unknown"}; ${sweep.remaining.length} process(es) still running from the per-instance toolchain; SIGKILLed ${orphansKilled.length} process(es) the reaper had stopped); ${QUARANTINE_NOTE}`,
+        `the controller sweep did not converge (${sweep.failure ?? "unknown"}; ${sweep.remaining.length} process(es) still running from the per-instance toolchain; ${orphanNote}); ${QUARANTINE_NOTE}`,
       );
     }
     if (runnerError !== null || outcome === null) throw runnerError ?? new Error("confined-shell runner produced no outcome");
     if (frame !== null && !frame.sandboxed) {
+      closureUnconfirmed = true;
       throw new CccConfinementClosureError(record, `the reaper could signal the controller, so the sandbox did not apply; ${QUARANTINE_NOTE}`);
     }
     if (frame?.outputCapped || outcome.result.outputOverLimit) {
@@ -1917,27 +2021,25 @@ function confinedOperations(
       if (disposed) {
         return Promise.reject(new CccConfinementRefusedError("instance-disposed", "these confined-shell operations were disposed and their toolchain clone removed"));
       }
-      return serialized(async () => {
-        try {
-          return await execOnce(command, cwd, execOptions);
-        } catch (error) {
-          if (error instanceof CccConfinementClosureError) closureUnconfirmed = true;
-          throw error;
-        }
-      });
+      // E6-X item 1: execOnce sets the unconfirmed latch itself; nothing here infers it from an error class.
+      return serialized(() => execOnce(command, cwd, execOptions));
     },
     // E2-24 and E4-9: after the execs already queued, sweep once more, then
     // remove exactly this instance's clone directory. The result is
-    // "unconfirmed" when that sweep does not converge or any earlier exec ended
-    // CLOSURE_UNCONFIRMED. Idempotent: every call returns the first result.
+    // "unconfirmed" when that sweep does not converge, when it found any
+    // process running from the clone (E6-X item 2: every exec had ended, so a
+    // survivor proves an earlier confirmation wrong), or when any earlier exec
+    // ended CLOSURE_UNCONFIRMED. Idempotent: every call returns the first result.
     dispose: () => {
       disposed = true;
       disposal ??= serialized(async (): Promise<CccConfinedDisposeResult> => {
         const made = clone ? await clone.catch(() => undefined) : undefined;
         // No clone means no exec ever started a process from this instance.
-        const finalSweepConverged = made ? (await sweepCloneProcesses(made, lsofPath)).converged : true;
+        const finalSweep = made ? await sweepCloneProcesses(made, lsofPath) : null;
+        const finalSweepClean = finalSweep === null
+          || (finalSweep.converged && finalSweep.seen.length === 0 && finalSweep.killed.length === 0);
         await rm(instanceDir, { recursive: true, force: true });
-        return Object.freeze({ closure: finalSweepConverged && !closureUnconfirmed ? "confirmed" : "unconfirmed" });
+        return Object.freeze({ closure: finalSweepClean && !closureUnconfirmed ? "confirmed" : "unconfirmed" });
       });
       return disposal;
     },

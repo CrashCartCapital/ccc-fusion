@@ -9,19 +9,18 @@ fails if either list drifts, for example if `.envrc` is dropped from X1's
 defaults. It needs no sandbox, so it runs on every platform: the effective
 names are pure, and the shared write predicate only resolves real paths in a
 temporary directory.
+
+FNXC:CccConfinedShell 2026-10-14-17:30:
+Errata E6-X item 6: the shell keys names with K1's `cccPlanningPathComparisonKey`
+(the K1b form), so this check uses that same key instead of a private copy.
 */
 import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CCC_PLANNING_DENIED_NAMES } from "@fusion/core";
+import { CCC_PLANNING_DENIED_NAMES, cccPlanningPathComparisonKey } from "@fusion/core";
 import { cccConfinedEffectiveDeniedNames, cccConfinedWriteRefusal } from "../ccc-confinement/confined-shell.js";
-
-/** K1's comparison fold for one name (E2-40), the same fold the shell applies to its effective names. */
-function fold(name: string): string {
-  return name.normalize("NFC").toUpperCase().toLowerCase().normalize("NFC");
-}
 
 /** A concrete path segment for a denied name: `*` stands for any run of characters, so `.env.*` becomes `.env.local`. */
 function sampleSegment(name: string): string {
@@ -47,7 +46,7 @@ describe("CCC confined-shell denied names cover K1's planning denied names (E2-8
     expect(CCC_PLANNING_DENIED_NAMES.length).toBeGreaterThan(0);
     expect(CCC_PLANNING_DENIED_NAMES).toContain(".envrc");
     const effective = new Set(cccConfinedEffectiveDeniedNames([]));
-    expect(CCC_PLANNING_DENIED_NAMES.filter((name) => !effective.has(fold(name)))).toEqual([]);
+    expect(CCC_PLANNING_DENIED_NAMES.filter((name) => !effective.has(cccPlanningPathComparisonKey(name)))).toEqual([]);
   });
 
   it("refuses a write through any K1 denied name as the basename or a directory segment with no caller names, while a near-miss name is admitted", () => {

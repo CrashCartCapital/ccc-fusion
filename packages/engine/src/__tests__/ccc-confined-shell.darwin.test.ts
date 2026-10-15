@@ -56,6 +56,23 @@ Errata E4, card X1c (the X1 residuals).
   seam, the dispose result, the template material, no stopped orphans, and the
   sweep trust rule. A mode-file lsof stub lets one instance switch between the
   real lsof and each untrusted answer.
+
+FNXC:CccConfinedShell 2026-10-14-17:30:
+Errata E6-X, card X1c repair 1.
+- Item 1 (the orphan kill can never replace the closure error) has no test
+  here: the frozen seam cannot reach /bin/ps, so it is proven by a reported
+  fault-simulation mutant (a ps capture that throws `spawn ENOMEM`).
+- Item 2: dispose reports unconfirmed when its final sweep finds a survivor.
+  The lsof stub's "self-only" mode is a trusted scan that misses the child, so
+  the exec confirms while the reaper-stopped child survives it.
+- Item 3: an older stopped process the test owns is never killed. The reaper
+  can only report processes of its own sandbox (and foreign zombies), so the
+  frozen seams cannot put this pid in its report; the reported mutant does.
+- Item 4: the stateful "real-once" stub pins `killStoppedSeen`.
+- Item 5: every sweep scan runs lsof with `-b`, and still finds clone processes.
+- Item 6: K1's `cccPlanningPathComparisonKey` is the shell's one path key.
+- Item 7: the dylib-closure discovery rules are template material.
+- Item 9: the node-overwrite check accepts only EPERM.
 */
 import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -66,7 +83,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import { acquireCccSemanticProofLoopbackPort } from "../ccc-campaign-proof-sandbox.js";
+import { cccPlanningPathComparisonKey } from "@fusion/core";
+import {
+  acquireCccSemanticProofLoopbackPort,
+  cccDarwinLinkedRuntimeFiles,
+  cccExecutableInstallRoot,
+  cccIsHomebrewRuntimePath,
+  cccResolveLinkedPath,
+  cccSealedToolchainRoot,
+} from "../ccc-campaign-proof-sandbox.js";
 import {
   CCC_CONFINED_DEFAULT_DENIED_NAMES,
   CCC_CONFINED_SHELL_SEALED_ENV_KEYS,
@@ -349,31 +374,45 @@ async function esrchWithin(pid: number, deadlineMs: number): Promise<boolean> {
   }
 }
 
-type LsofMode = "real" | "real-exit-1" | "empty-exit-1" | "omit-self";
+type LsofMode = "real" | "real-exit-1" | "empty-exit-1" | "omit-self" | "self-only" | "real-once";
 
 /**
  * A stand-in for the sweep's lsof, which the controller runs outside the
  * sandbox. A mode file picks its answer per scan: "real" execs /usr/sbin/lsof,
  * "real-exit-1" runs it and then exits 1, "empty-exit-1" prints nothing and
  * exits 1, and "omit-self" prints well-formed fields for pid 1 only, so the
- * controller's own pid is missing.
+ * controller's own pid is missing. E6-X items 2 and 4 add two modes:
+ * "self-only" is a trusted scan that lists only the controller (the stub's
+ * parent), so it finds no clone process, and "real-once" is stateful: its
+ * first scan is the real lsof and every later scan fails. Every scan appends
+ * its arguments to `argsLog`.
  */
-async function modeLsof(dir: string): Promise<{ path: string; setMode: (mode: LsofMode) => Promise<void> }> {
+async function modeLsof(dir: string): Promise<{ path: string; argsLog: string; setMode: (mode: LsofMode) => Promise<void> }> {
   const path = join(dir, `lsof-mode-${randomBytes(4).toString("hex")}`);
   const modeFile = `${path}.mode`;
+  const usedFile = `${path}.used`;
+  const argsLog = `${path}.args`;
   await writeFile(modeFile, "real\n");
   await writeFile(path, [
     "#!/bin/sh",
     `read -r mode < '${modeFile}'`,
+    `printf '%s\\n' "$*" >> '${argsLog}'`,
     'case "$mode" in',
     "  empty-exit-1) exit 1 ;;",
     "  omit-self) printf 'p1\\nftxt\\nD0x1\\ni2\\n'; exit 0 ;;",
+    `  self-only) printf 'p%s\\nftxt\\nD0x1\\ni2\\n' "$PPID"; exit 0 ;;`,
+    `  real-once) if [ -e '${usedFile}' ]; then exit 1; fi; : > '${usedFile}'; exec /usr/sbin/lsof "$@" ;;`,
     '  real-exit-1) /usr/sbin/lsof "$@"; exit 1 ;;',
     '  *) exec /usr/sbin/lsof "$@" ;;',
     "esac",
     "",
   ].join("\n"), { mode: 0o755 });
-  return { path, setMode: (mode) => writeFile(modeFile, `${mode}\n`) };
+  return { path, argsLog, setMode: (mode) => writeFile(modeFile, `${mode}\n`) };
+}
+
+/** The `ps` state of a pid ("T..." when stopped), or "" when ps lists nothing. */
+function psStat(pid: number): string {
+  return spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
 }
 
 type Fixture = {
@@ -813,7 +852,8 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(confined.output).toMatch(/^bin-write-rc=1$/mu);
     expect(confined.output).toContain("toolchains-mkdir-err EPERM");
     expect(confined.output).not.toContain("toolchains-mkdir-ok");
-    expect(confined.output).toMatch(/^node-overwrite-err E(?:PERM|ACCES)$/mu);
+    // E6-X item 9: EPERM only. The clone's 0o555 mode alone would give EACCES, so only the sandbox deny gives EPERM.
+    expect(confined.output).toMatch(/^node-overwrite-err EPERM$/mu);
     // Positive control: the same shell writes the scratch home, beside the toolchains directory.
     expect(confined.output).toMatch(/^home-rc=0$/mu);
     expect(existsSync(join(dirname(execPath), "planted"))).toBe(false);
@@ -1109,6 +1149,110 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(await esrchWithin(orphan!, 2_000)).toBe(true);
   });
 
+  it("spares an older stopped same-uid process the test owns, stopped before the exec started, while the unconfirmed exec's reaper-stopped child is killed", async () => {
+    // E6-X item 3: a reaper-reported pid is killed only when ps shows the controller's uid, a stopped state and a
+    // start time no earlier than the exec's start. This older process is same-uid and stopped, so only its start
+    // time spares it if it is ever reported (the reported-mutant run puts it in the reaper's list).
+    const older = spawn(process.execPath, ["-e", `setInterval(()=>{},1000)/*${RUN_TOKEN}*/`], { stdio: "ignore" });
+    sleepers.push(older);
+    const spawnedBy = Date.now();
+    const olderPid = older.pid!;
+    expect(olderPid).toBeGreaterThan(1);
+    process.kill(olderPid, "SIGSTOP");
+    for (const deadline = Date.now() + 2_000; !psStat(olderPid).startsWith("T") && Date.now() < deadline;) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    expect(psStat(olderPid)).toMatch(/^T/u);
+    // ps start times have one-second resolution, so the exec starts in a later second than the older process.
+    const nextSecond = (Math.floor(spawnedBy / 1_000) + 1) * 1_000;
+    if (Date.now() < nextSecond) await new Promise((resolveWait) => setTimeout(resolveWait, nextSecond - Date.now()));
+
+    const lsof = await modeLsof(shared.root);
+    await lsof.setMode("empty-exit-1");
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+    const refused = await settle(ops, `node -e 'setInterval(()=>{},1000)/*${RUN_TOKEN}*/' & echo "ORPHAN $!"`, shared.worktree);
+    const [child] = track(refused.output);
+    expect(refused.error).toBeInstanceOf(CccConfinementClosureError);
+    // Positive control: the child the reaper stopped (same uid, stopped, started after the exec began) is killed.
+    expect(child).toBeGreaterThan(1);
+    expect(await esrchWithin(child!, 2_000)).toBe(true);
+    // The older stopped process is still there, still stopped.
+    expect(psStat(olderPid)).toMatch(/^T/u);
+  });
+
+  it("kills every process a failing sweep had stopped, so a command that killed its reaper leaves no stopped orphan when a later lsof scan fails, while the real lsof confirms the same command", async () => {
+    // E6-X item 4: the reaper is killed, so it reports nothing; only the controller's own stopped set names the child.
+    const command = (tag: string) => [
+      `node -e 'setInterval(()=>require("fs").appendFileSync("src/hb-${tag}","y"),50)/*${RUN_TOKEN}*/' & echo "ORPHAN $!" >> src/pids-${tag}`,
+      `while [ ! -s src/hb-${tag} ]; do :; done`,
+      "kill -9 $PPID",
+    ].join("; ");
+    const lsof = await modeLsof(shared.root);
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+
+    // Control: the real lsof sees the child, kills it and confirms closure (the exec still reports the lost reaper).
+    const control = await settle(ops, command("k0"), shared.worktree);
+    const [controlPid] = track(control.output, join(shared.worktree, "src", "pids-k0"));
+    expect(controlPid).toBeGreaterThan(1);
+    expect(control.error).toBeInstanceOf(Error);
+    expect(control.error).not.toBeInstanceOf(CccConfinementClosureError);
+    expect(control.closure!.killed).toContain(controlPid);
+    expect(await esrchWithin(controlPid!, 2_000)).toBe(true);
+
+    // The first scan is real (it lists the controller and the child, which the sweep stops), and every later scan fails.
+    await lsof.setMode("real-once");
+    const refused = await settle(ops, command("k1"), shared.worktree);
+    const [stoppedPid] = track(refused.output, join(shared.worktree, "src", "pids-k1"));
+    expect(stoppedPid).toBeGreaterThan(1);
+    expect(refused.error).toBeInstanceOf(CccConfinementClosureError);
+    expect((refused.error as CccConfinementClosureError).record!.killed).toContain(stoppedPid);
+    expect(await esrchWithin(stoppedPid!, 2_000)).toBe(true);
+  });
+
+  it("dispose reports unconfirmed when its final sweep finds and kills a process that survived a confirmed exec, while an instance whose exec reaped the same child disposes confirmed", async () => {
+    const command = `node -e 'setInterval(()=>{},1000)/*${RUN_TOKEN}*/' & echo "ORPHAN $!"`;
+    // Control: the exec's sweep (the stub running the real lsof) kills the child, so dispose's final sweep finds nothing.
+    const reapedLsof = await modeLsof(shared.root);
+    const reaped = createCccConfinedBashOperations(shared.input, { lsofPath: reapedLsof.path });
+    const control = await settle(reaped, command, shared.worktree);
+    const [controlPid] = track(control.output);
+    expect(control.error).toBeNull();
+    expect(control.closure!.killed).toContain(controlPid);
+    expect(await reaped.dispose()).toEqual({ closure: "confirmed" });
+
+    // E6-X item 2: a trusted scan that misses the child confirms the exec, and the reaper-stopped child survives it.
+    const lsof = await modeLsof(shared.root);
+    await lsof.setMode("self-only");
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+    const missed = await settle(ops, command, shared.worktree);
+    const [survivor] = track(missed.output);
+    expect(missed.error).toBeNull();
+    expect(survivor).toBeGreaterThan(1);
+    expect(missed.closure).not.toBeNull();
+    expect(missed.closure!.killed).not.toContain(survivor);
+    expect(psStat(survivor!)).toMatch(/^T/u);
+    // Dispose's final sweep (the real lsof again) finds and kills the survivor, which proves that confirmation wrong.
+    await lsof.setMode("real");
+    expect(await ops.dispose()).toEqual({ closure: "unconfirmed" });
+    expect(await esrchWithin(survivor!, 2_000)).toBe(true);
+    expect(await ops.dispose()).toEqual({ closure: "unconfirmed" });
+  });
+
+  it("runs every sweep scan with lsof -b, which skips the stat of each mount point that stalls on an unreachable network mount, and with it a scan still parses, lists the controller and finds the clone's processes", async () => {
+    // E6-X item 5: the stub execs the real lsof with the controller's arguments and logs them.
+    const lsof = await modeLsof(shared.root);
+    const ops = createCccConfinedBashOperations(shared.input, { lsofPath: lsof.path });
+    const result = await settle(ops, `node -e 'setInterval(()=>{},1000)/*${RUN_TOKEN}*/' & echo "ORPHAN $!"`, shared.worktree);
+    const [child] = track(result.output);
+    expect(result.error).toBeNull();
+    expect(child).toBeGreaterThan(1);
+    expect(result.closure!.killed).toContain(child);
+    expect(await esrchWithin(child!, 2_000)).toBe(true);
+    const scans = readFileSync(lsof.argsLog, "utf8").split("\n").filter((line) => line.length > 0);
+    expect(scans.length).toBeGreaterThanOrEqual(2);
+    for (const args of scans) expect(args.split(" ")).toContain("-b");
+  });
+
   it("kills a setsid escaper, an argv[0]-spoofed escaper and a symlink-launched escaper from outside the sandbox after the command kills its reaper", async () => {
     const fx = shared;
     const ops = sharedOps;
@@ -1228,6 +1372,25 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
     expect(CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256).toBe(createHash("sha256").update(material.join("\u0000")).digest("hex"));
   });
 
+  it("binds the template digest to the dylib-closure discovery rules and the read-root derivation, so a rule change that widens a read root changes the digest", () => {
+    // E6-X item 7: the discovered libraries become read roots, so the rules that find and place them are material.
+    const material = CCC_WRITER_SHELL_PROFILE_TEMPLATE_MATERIAL;
+    const rules = material.find((entry) => entry.startsWith("dylib-closure-rules ")) ?? "";
+    for (const rule of [cccDarwinLinkedRuntimeFiles, cccResolveLinkedPath, cccSealedToolchainRoot, cccExecutableInstallRoot, cccIsHomebrewRuntimePath]) {
+      const source = String(rule);
+      expect(source.length).toBeGreaterThan(40);
+      expect(rules).toContain(source);
+    }
+    expect(String(cccResolveLinkedPath)).toContain("@rpath/");
+    // The confined shell's own steps: which executables feed the discovery, and how a discovered file becomes a read root.
+    for (const step of ["function toolchainExecutables(", "function linkedRuntimeFilesForExecutables(", "function assembleWriterProfile("]) {
+      expect(rules).toContain(step);
+    }
+    const sentinel = material.find((entry) => entry.startsWith("writer-profile-sentinel ")) ?? "";
+    expect(sentinel).toContain('(allow file-read* (subpath "/ccc-sentinel/runtime/lib"))');
+    expect(CCC_WRITER_SHELL_PROFILE_TEMPLATE_SHA256).toBe(createHash("sha256").update(material.join("\u0000")).digest("hex"));
+  });
+
   describe("shared write predicate", () => {
     let root: string;
     let srcRoot: string;
@@ -1286,6 +1449,21 @@ describe.skipIf(process.platform !== "darwin")("CCC confined writer shell (Darwi
         expect(refusal(join(srcRoot, admitted))).toBeNull();
       }
       expect(refusal(join(srcRoot, "keys", "custom.key"))).toBeNull();
+    });
+
+    it("refuses a not-yet-existing path whose segment matches a caller-added .ssh only through the capital sharp s, using K1's path key, while near misses are admitted", () => {
+      // E6-X item 6: one path key. Under the old private fold U+1E9E kept its own lower case (U+00DF), which never met "ss".
+      const refusal = (path: string, deniedNames: readonly string[] = [".ssh"]) => cccConfinedWriteRefusal({ path, writeRoots: [srcRoot], deniedNames });
+      const capitalSharpS = join(srcRoot, ".ẞh");
+      expect(existsSync(capitalSharpS)).toBe(false);
+      expect(refusal(capitalSharpS)).toBe("denied-name");
+      expect(refusal(join(capitalSharpS, "id_ed25519"))).toBe("denied-name");
+      expect(refusal(join(srcRoot, ".ßh"))).toBe("denied-name");
+      expect(cccPlanningPathComparisonKey(".ẞh")).toBe(".ssh");
+      // Positive controls: the plain spelling is refused, near misses and an empty caller list are admitted.
+      expect(refusal(join(srcRoot, ".ssh"))).toBe("denied-name");
+      for (const admitted of [".sh", "ssh", ".ẞ", "x.ẞh"]) expect(refusal(join(srcRoot, admitted))).toBeNull();
+      expect(refusal(capitalSharpS, [])).toBeNull();
     });
   });
 

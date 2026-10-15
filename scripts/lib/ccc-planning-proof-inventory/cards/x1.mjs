@@ -70,6 +70,40 @@ measurements.
 The bound is therefore 620 s: at least 1.5 x 261 s (392 s) and 1.5 x the
 slowest run seen here, the stalled 401.5 s (602 s, rounded up), and far below
 P0's 3,600 s maximum.
+
+FNXC:CccPlanningProofInventory 2026-10-14-17:40:
+Card X1c repair 1 (errata E6-X) brings the file to fifty-seven tests, listed
+below in file order: items 2, 3, 4, 5, 6 and 7 add one test each.
+- Item 8, the round-1 adversary's high-load measurement: under 20 bounded CPU
+  burners (load average 24.6 to 36.2, mean 33) the 51-test file passed 51/51
+  in 125 s, and no lsof scan took more than 0.51 s.
+- Repair-1 runs of this file, M5 Max, other agents' suites running: 118 s wall
+  at load 24.96 before and 12.18 after, 116 s wall at load 7.19 before and
+  13.76 after, and on the committed bytes 114 s wall at load 7.83 before and
+  11.39 after. The RED run (the new tests against the round-1 production
+  bytes) took 131 s at load 12.90 to 12.11.
+- The worst duration measured for this file is still round 1's 401.5 s run
+  during a host-wide lsof stall, so the bound stays 620 s: at least 1.5 x
+  401.5 s (602 s) and 1.5 x 125 s at load 33 (188 s), within P0's 3,600 s.
+- Item 5, the lsof stall (a section 6 risk row for the v3.3 editor). Likely
+  cause: without `-b`, lsof stats every mount point before it lists anything,
+  including this host's smbfs Time Machine mount over Tailscale
+  (`/Volumes/.timemachine/...`), and that stat blocks while the server is
+  unreachable. Before: stalls at the 11 s capture limit came in bursts (X1b
+  adversary: 3 of 13 tests failed in one closed check, one standalone scan of
+  11.24 s, then 0 of 90 samples; X1c round 1: hand scans of 10.3 s and 11.1 s,
+  two whole-file runs failed). Flags chosen: `-b`, which tells lsof to skip
+  stat, lstat and readlink on mount points ("avoiding stat(...): -b was
+  specified"). Apple's lsof 4.91 has no `-e`, and a bounded retry was not
+  applied because the stalls came in bursts. Measured in this repair (120
+  interleaved rounds, load 8.1 to 13.3, smbfs mount present): no stall with
+  or without `-b` in that window; without `-b`, lsof warned that it could not
+  stat the smbfs mount on 120 of 120 scans, so it tried that stat every time;
+  median 0.225 s plain against 0.194 s with `-b`, every scan parsed and listed
+  the caller. A test pins `-b` on every sweep scan and shows the scan still
+  parses, lists the controller and finds the clone's processes. Residual: no
+  stall could be provoked here, so the after-rate under a real outage is
+  inferred from the skipped stat, not measured.
 */
 
 const SUITE = "CCC confined writer shell (Darwin sandbox-exec)";
@@ -107,17 +141,23 @@ const NAMES = Object.freeze([
   `${SUITE} > reports CLOSURE_UNCONFIRMED when the sweep's lsof exits 1 or prints unparseable output, while the real lsof confirms the same command`,
   `${SUITE} > trusts a sweep only when its output parses and lists the controller: exit 1 with empty output and output without the controller are unconfirmed, while parsed real output is trusted even when the stub exits 1`,
   `${SUITE} > SIGKILLs every process the reaper stopped when the controller cannot confirm closure, so no stopped orphan remains, while the same command under the real lsof is confirmed`,
+  `${SUITE} > spares an older stopped same-uid process the test owns, stopped before the exec started, while the unconfirmed exec's reaper-stopped child is killed`,
+  `${SUITE} > kills every process a failing sweep had stopped, so a command that killed its reaper leaves no stopped orphan when a later lsof scan fails, while the real lsof confirms the same command`,
+  `${SUITE} > dispose reports unconfirmed when its final sweep finds and kills a process that survived a confirmed exec, while an instance whose exec reaped the same child disposes confirmed`,
+  `${SUITE} > runs every sweep scan with lsof -b, which skips the stat of each mount point that stalls on an unreachable network mount, and with it a scan still parses, lists the controller and finds the clone's processes`,
   `${SUITE} > kills a setsid escaper, an argv[0]-spoofed escaper and a symlink-launched escaper from outside the sandbox after the command kills its reaper`,
   `${SUITE} > kills a setsid escaper from outside the sandbox after the command freezes its reaper past a 2 s timeout`,
   `${SUITE} > serializes concurrent execs on one instance so the later command starts after the earlier one ends`,
   `${SUITE} > emits every deny after the allows, admits loopback only for the owned port, and grants no mach, shm or system-socket`,
   `${SUITE} > binds the template digest to the denied-name pattern, the sealed environment and the loopback rule`,
   `${SUITE} > binds the template digest to the system runtime read roots, the device read files and a sentinel rendering of every rule the writer-profile assembly emits`,
+  `${SUITE} > binds the template digest to the dylib-closure discovery rules and the read-root derivation, so a rule change that widens a read root changes the digest`,
   `${SUITE} > shared write predicate > exports the default denied names as a frozen superset of the planning list plus .envrc`,
   `${SUITE} > shared write predicate > unions caller names with the defaults, folding case and de-duplicating, so a caller cannot drop .env`,
   `${SUITE} > shared write predicate > refuses a path outside the write roots, including through .., a symlink or a relative spelling, while a path inside a root is admitted`,
   `${SUITE} > shared write predicate > refuses a .git segment in any case, while a sibling ordinary file is admitted`,
   `${SUITE} > shared write predicate > refuses every effective denied name as the basename or any segment, folding case like K1, while near-miss names are admitted`,
+  `${SUITE} > shared write predicate > refuses a not-yet-existing path whose segment matches a caller-added .ssh only through the capital sharp s, using K1's path key, while near misses are admitted`,
   `${SUITE} > refuses before any spawn > refuses a non-Darwin platform as platform-unsupported, while the same input on Darwin is admitted`,
   `${SUITE} > refuses before any spawn > refuses a toolchain executable whose bytes changed after sealing, while the unchanged toolchain is admitted`,
   `${SUITE} > refuses before any spawn > refuses to seal an Apple platform binary, which macOS kills when it runs from a clone, while the Homebrew toolchain seals`,

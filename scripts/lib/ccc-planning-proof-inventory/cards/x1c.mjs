@@ -14,6 +14,11 @@ name-closed: the names below are exactly the tests in the file, joined the way
 and the title with " > "), so a skipped, renamed, missing or extra test fails.
 The file runs in about 2 s on the M5 Max; the 120 s command timeout is a hang
 bound for vitest start-up on a loaded host, not a test timeout.
+
+FNXC:CccPlanningProofInventory 2026-10-14-17:40:
+Errata E6-X item 6 (X1c repair 1): the shell and this check both key names
+with K1's `cccPlanningPathComparisonKey`; the test names are unchanged (2 of 2
+passed in about 3 s).
 */
 
 const SUITE = "CCC confined-shell denied names cover K1's planning denied names (E2-81)";
