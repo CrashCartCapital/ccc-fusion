@@ -12,10 +12,6 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
-  CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK,
-  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
-  cccCampaignRequestFloor,
-  cccCampaignRequestSizingGuidance,
   cccPermanentWorkItemHasReason,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
@@ -26,12 +22,10 @@ import {
   inspectCccCampaignProofAttempt,
   inspectCccPrdImport,
   inspectCccPrdProductStatus,
-  parseCccPrdProductExecutionPlan,
   planCccPrdCampaignDriftStop,
   reconcileCccPrdImport,
   settleCccCampaignProofAttempt,
   type ApprovalRequest,
-  type CccCampaignProductExecutionPolicy,
   type CccPrdProductExecutionPlan,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
@@ -883,7 +877,7 @@ async function runProductPolicyCommand(
   }
   const input = parsed.value;
   try {
-    const compiled = compileProductBundle({
+    const compiled = engine.compileCccPrdProductBundle({
       rootDir: input.rootDir,
       manifestPath: input.manifestPath,
       sidecarPath: input.sidecarPath,
@@ -1349,8 +1343,6 @@ async function runGeneratedUnderstanding(
   return 0;
 }
 
-const CCC_PRD_PRODUCT_PREVIEW_SCHEMA = "ccc-prd.product-preview.v1" as const;
-
 class PrdProductCommandError extends Error {
   public constructor(
     public readonly code: string,
@@ -1694,14 +1686,20 @@ async function readTargetHead(targetRoot: string): Promise<string> {
   ).trim();
 }
 
-function readProductExecutionPolicy(
+/*
+FNXC:CccPrdImportPreflight 2026-10-14-18:48:
+Card B3 (D18): the preview/import chain (compile, completeness, provenance, plan, request floor, toolchain custody, both confinement probes, project/target match, HEAD, custody, conformance, v1 replay, identity and digest) now lives in engine `ccc-prd/product-import-preflight.ts`, shared with the planning import bridge. This file keeps argument parsing, project resolution, the PostgreSQL layer check, the confirmation comparison and all rendering, so every code, message and refusal position is unchanged.
+*/
+/**
+ * The plan is read lazily: the shared preflight calls this where the CLI
+ * always read its file (after compile and the preview-only v1 refusal).
+ */
+function readProductExecutionPlan(
   rootDir: string,
   executionPlanPath: string,
-  bundle: CccPrdSemanticBundle,
-): CccCampaignProductExecutionPolicy {
-  let value: unknown;
+): unknown {
   try {
-    value = JSON.parse(
+    return JSON.parse(
       readFileSync(resolveAuthorInput(rootDir, executionPlanPath), "utf8"),
     ) as unknown;
   } catch (error) {
@@ -1712,121 +1710,23 @@ function readProductExecutionPolicy(
         : "execution plan could not be read: " + executionPlanPath,
     );
   }
-  return parseCccPrdProductExecutionPlan(value, bundle).policy;
 }
 
-function assertProductBundleComplete(bundle: CccPrdSemanticBundle): void {
-  for (const [label, values] of [
-    ["requirements", bundle.requirements],
-    ["proofs", bundle.proofs],
-    ["tasks", bundle.tasks],
-    ["workflows", bundle.workflows],
-  ] as const) {
-    if (values.length === 0) {
-      throw new PrdProductCommandError(
-        "CCC_PRD_PRODUCT_BUNDLE_SHALLOW",
-        `CCC PRD product import refuses zero ${label}`,
-      );
-    }
-  }
-  const taskRequirementIds = new Set(
-    bundle.tasks.flatMap(({ requirementIds }) => requirementIds),
-  );
-  const declaredProofIds = new Set(bundle.proofs.map(({ id }) => id));
-  for (const requirement of bundle.requirements) {
-    if (!taskRequirementIds.has(requirement.id)) {
-      throw new PrdProductCommandError(
-        "CCC_PRD_REQUIREMENT_TASK_COVERAGE_MISSING",
-        `CCC PRD requirement ${requirement.id} has no task disposition`,
-      );
-    }
-    if (
-      requirement.proofIds.length === 0
-      || requirement.proofIds.some((proofId) => !declaredProofIds.has(proofId))
-    ) {
-      throw new PrdProductCommandError(
-        "CCC_PRD_REQUIREMENT_PROOF_COVERAGE_MISSING",
-        `CCC PRD requirement ${requirement.id} has no complete proof disposition`,
-      );
-    }
-  }
-}
-
-function productPreviewIdentity(input: {
-  projectId: string;
-  projectPath: string;
-  targetHead: string;
-  bundle: CccPrdSemanticBundle;
-  executionPolicy: CccCampaignProductExecutionPolicy;
-}) {
+/** The CLI's injected seams; anything not injected falls back to the shared preflight's own defaults. */
+function productImportPreflightDependencies(
+  dependencies: PrdCommandDependencies,
+): engine.CccPrdProductImportPreflightDependencies {
   return {
-    schema: CCC_PRD_PRODUCT_PREVIEW_SCHEMA,
-    projectId: input.projectId,
-    projectPath: resolve(input.projectPath),
-    bundleHash: input.bundle.bundleHash,
-    packetHash: input.bundle.sourceHash,
-    sidecarHash: input.bundle.sidecarHash,
-    targetRepository: resolve(input.bundle.targetRepository.path),
-    targetBase: input.bundle.targetRepository.baseCommit,
-    targetHead: input.targetHead,
-    executionPolicy: input.executionPolicy,
+    resolveSemanticProofToolchainPaths:
+      dependencies.resolveSemanticProofToolchainPaths
+      ?? resolveCccPrdSemanticProofToolchainPaths,
+    readTargetHead: dependencies.readTargetHead ?? readTargetHead,
+    inspectVerifierConfinementReadiness: dependencies.inspectVerifierConfinementReadiness,
+    inspectSemanticProofSandboxReadiness: dependencies.inspectSemanticProofSandboxReadiness,
+    assertSemanticProofV2Custody: dependencies.assertSemanticProofV2Custody,
+    assertSemanticProofVerifierConformance: dependencies.assertSemanticProofVerifierConformance,
+    inspectCccPrdImport: dependencies.inspectCccPrdImport,
   };
-}
-
-function productConfirmationDigest(
-  identity: ReturnType<typeof productPreviewIdentity>,
-): string {
-  return createHash("sha256")
-    .update(canonicalCccPrdJson(identity), "utf8")
-    .digest("hex");
-}
-
-function productRequestBudget(
-  bundle: CccPrdSemanticBundle,
-  executionPolicy: CccCampaignProductExecutionPolicy,
-) {
-  const providerTasks = executionPolicy.routes.length;
-  // Same structural floor core's importer enforces (2 per provider task: one
-  // MUTATE turn plus the single REPAIR turn); preview must never admit a
-  // bundle that import will refuse.
-  const deterministicMinimum = cccCampaignRequestFloor(providerTasks);
-  const {
-    recommendedStartingMaximum,
-    headroomAboveRecommendation,
-    sizingPosture,
-  } = cccCampaignRequestSizingGuidance(
-    providerTasks,
-    bundle.bounds.maxRequests,
-  );
-  const recommendationGap = Math.abs(headroomAboveRecommendation);
-  const recommendationPosition = headroomAboveRecommendation === 0
-    ? "meets that recommendation exactly"
-    : `is ${recommendationGap} requests ${sizingPosture === "generous" ? "above" : "below"} that recommendation`;
-  return {
-    scope: "campaign-global" as const,
-    maximum: bundle.bounds.maxRequests,
-    providerTasks,
-    deterministicMinimum,
-    headroomAboveMinimum: bundle.bounds.maxRequests - deterministicMinimum,
-    recommendedStartingMaximum,
-    headroomAboveRecommendation,
-    sizingPosture,
-    completionAdequacy: "unproven" as const,
-    explanation:
-      `Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor. Start at ${CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK} requests per provider task (${recommendedStartingMaximum} total here) unless evidence supports another finite envelope. This packet is ${sizingPosture}: it ${recommendationPosition}, but remains valid because the recommendation is guidance, not an admission or safety ceiling. The campaign cap is global, creates no per-task quota or reservation, and completion adequacy remains unproven.`,
-  };
-}
-
-function assertProductRequestBudgetFloor(
-  bundle: CccPrdSemanticBundle,
-  executionPolicy: CccCampaignProductExecutionPolicy,
-): void {
-  const budget = productRequestBudget(bundle, executionPolicy);
-  if (budget.maximum >= budget.deterministicMinimum) return;
-  throw new PrdProductCommandError(
-    CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
-    `campaign maxRequests ${budget.maximum} is below the structural floor ${budget.deterministicMinimum} (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)`,
-  );
 }
 
 function operatorVerifierConfinementReadiness(
@@ -1892,15 +1792,15 @@ function verifierConfinementBackendLabel(
 }
 
 function productPreview(
-  identity: ReturnType<typeof productPreviewIdentity>,
-  bundle: CccPrdSemanticBundle,
+  admitted: Extract<engine.CccPrdProductTargetPreflight, { kind: "admitted" }>,
   verifierConfinement: VerifierConfinementReadiness,
   semanticProofSandboxReadiness: engine.CccSemanticProofSandboxReadiness,
 ) {
+  const { identity, bundle } = admitted;
   return {
     kind: "preview" as const,
     ...identity,
-    confirmationDigest: productConfirmationDigest(identity),
+    confirmationDigest: admitted.confirmationDigest,
     orderedSources: bundle.orderedSources,
     requirements: bundle.requirements,
     tasks: bundle.tasks,
@@ -1909,7 +1809,7 @@ function productPreview(
     protectedActions: bundle.protectedActions,
     admittedWriteRoots: bundle.admittedWriteRoots,
     bounds: bundle.bounds,
-    requestBudget: productRequestBudget(bundle, identity.executionPolicy),
+    requestBudget: engine.cccPrdProductRequestBudget(bundle, identity.executionPolicy),
     nonGoals: bundle.nonGoals,
     materialCoverage: bundle.materialCoverage,
     verifierConfinement: operatorVerifierConfinementReadiness(
@@ -1958,30 +1858,6 @@ async function withPrdProject(
   }
 }
 
-function compileProductBundle(input: {
-  rootDir: string;
-  manifestPath: string;
-  sidecarPath: string;
-  expectedTarget: string;
-  expectedBase: string;
-}): CccPrdSemanticBundle | { kind: "refusal"; diagnostics?: unknown[] } {
-  const result = compiler.compileCccPrdPacket({
-    ...input,
-    requireMaterialCoverage: true,
-  });
-  if (result.kind === "refusal") return result;
-  assertProductBundleComplete(result);
-  const provenanceDiagnostics = compiler.validateCccPrdPacketImplementationFactProvenance({
-    rootDir: input.rootDir,
-    manifestPath: input.manifestPath,
-    facts: result,
-  });
-  if (provenanceDiagnostics.length > 0) {
-    return { kind: "refusal", diagnostics: provenanceDiagnostics };
-  }
-  return result;
-}
-
 async function runProductPacketCommand(
   args: string[],
   io: PrdCommandIo,
@@ -2024,74 +1900,42 @@ async function runProductPacketCommand(
     return 2;
   }
 
-  let bundle: CccPrdSemanticBundle;
-  let executionPolicy: CccCampaignProductExecutionPolicy;
-  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
-  try {
-    const compiled = compileProductBundle({
-      rootDir,
-      manifestPath,
-      sidecarPath,
-      expectedTarget,
-      expectedBase,
-    });
-    if (compiled.kind === "refusal") {
-      writeRefusalPayload(io, operatorJson(commandContext), compiled);
+  const preflightDependencies = productImportPreflightDependencies(dependencies);
+  // Phase A of the shared preflight: compile through the semantic-proof
+  // sandbox probe, before any project or database access. The sandbox
+  // refusal for `import` comes later, after the cheap exact
+  // confirmation-digest comparison -- a stale digest is a purely local,
+  // free-to-detect defect and must never be preempted by an environment
+  // refusal that depends on this host's capabilities.
+  const packetPreflight = await engine.preflightCccPrdProductPacket({
+    mode: preview ? "preview" : "import",
+    packet: { rootDir, manifestPath, sidecarPath },
+    expectedTarget,
+    expectedBase,
+    executionPlan: () => readProductExecutionPlan(rootDir, executionPlanPath),
+    requestFloor: preview ? "check" : "importer",
+  }, preflightDependencies);
+  switch (packetPreflight.kind) {
+    case "compile_refusal":
+      writeRefusalPayload(io, operatorJson(commandContext), packetPreflight.refusal);
       return 1;
-    }
-    bundle = compiled;
-    if (preview && bundle.schema !== "ccc-prd.bundle.v2") {
-      throw new PrdProductCommandError(
-        "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
-        "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+    case "product_refusal":
+      return writeProductRefusal(
+        io,
+        packetPreflight.code,
+        packetPreflight.message,
+        operatorJson(commandContext),
       );
-    }
-    executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
-    if (preview) assertProductRequestBudgetFloor(bundle, executionPolicy);
-    if (bundle.schema === "ccc-prd.bundle.v2") {
-      const pythonRequired = bundle.proofs.some((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1");
-      semanticProofToolchainPaths = (
-        dependencies.resolveSemanticProofToolchainPaths
-        ?? resolveCccPrdSemanticProofToolchainPaths
-      )({
-        pythonRequired,
-        ...(pythonRequired ? { targetRoot: bundle.targetRepository.path } : {}),
-      });
-    }
-  } catch (error) {
-    const detail = error as { code?: unknown; message?: unknown };
-    return writeProductRefusal(
-      io,
-      typeof detail.code === "string" ? detail.code : "CCC_PRD_PRODUCT_PREFLIGHT_FAILED",
-      typeof detail.message === "string" ? detail.message : "CCC PRD product preflight failed",
-      operatorJson(commandContext),
-    );
+    case "agent_confinement_unavailable":
+      return writeVerifierConfinementImportRefusal(
+        io,
+        packetPreflight.readiness,
+        operatorJson(commandContext),
+      );
+    case "packet_admitted":
+      break;
   }
-
-  const verifierConfinement = await (
-    dependencies.inspectVerifierConfinementReadiness
-    ?? compiler.inspectVerifierConfinementReadiness
-  )();
-  if (importing && !engine.isVerifierConfinementReady(verifierConfinement)) {
-    return writeVerifierConfinementImportRefusal(
-      io,
-      verifierConfinement,
-      operatorJson(commandContext),
-    );
-  }
-  // Probed once here and threaded through preview/import below: the
-  // verifier-conformance preflight needs the semantic-proof-v2 sandbox
-  // (sandbox-exec, Darwin-only today), a distinct backend from the
-  // agent-verification confinement checked just above. See
-  // docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md. The refusal
-  // for this readiness on `import` is issued further below, after the
-  // cheap exact confirmation-digest comparison -- a stale digest is a
-  // purely local, free-to-detect defect and must never be preempted by an
-  // environment refusal that depends on this host's capabilities.
-  const semanticProofSandboxReadiness = await (
-    dependencies.inspectSemanticProofSandboxReadiness
-    ?? compiler.inspectCccSemanticProofSandboxReadiness
-  )();
+  const { verifierConfinement, semanticProofSandboxReadiness } = packetPreflight;
 
   return withPrdProject(io, dependencies, commandContext, async (project) => {
     const layer = project.store.getAsyncLayer();
@@ -2101,90 +1945,27 @@ async function runProductPacketCommand(
         `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
       );
     }
-    if (resolve(project.projectPath) !== resolve(bundle.targetRepository.path)) {
-      throw new PrdProductCommandError(
-        "CCC_PRD_PROJECT_TARGET_MISMATCH",
-        `resolved project ${project.projectPath} does not match PRD target ${bundle.targetRepository.path}`,
-      );
+    // Phase B of the shared preflight: project/target match, HEAD, custody,
+    // verifier conformance (run only when the semantic-proof sandbox is ready;
+    // productPreview's verifierConfinement then carries an explicit
+    // verifierConformanceChecked:false warning), v1 exact replay, then the
+    // identity and its confirmation digest. A coded refusal is rethrown here,
+    // so this wrapper reports it exactly as it did when the chain was inline.
+    const target = await engine.preflightCccPrdProductTarget(
+      packetPreflight,
+      { projectId: project.projectId, projectPath: project.projectPath, layer },
+      {
+        mode: preview ? "preview" : "import",
+        ...(importing ? { idempotencyKey: idempotencyKey! } : {}),
+      },
+      preflightDependencies,
+    );
+    if (target.kind === "product_refusal") {
+      throw new PrdProductCommandError(target.code, target.message);
     }
-    const targetHead = await (dependencies.readTargetHead ?? readTargetHead)(project.projectPath);
-    if (targetHead !== bundle.targetRepository.baseCommit) {
-      throw new PrdProductCommandError(
-        "CCC_PRD_TARGET_HEAD_DRIFT",
-        `target HEAD ${targetHead} does not match frozen base ${bundle.targetRepository.baseCommit}`,
-      );
-    }
-    if (bundle.schema === "ccc-prd.bundle.v2") {
-      const modelWriteRoots = executionPolicy.routes.flatMap((route) => [
-        ...(route.ownedPaths ?? []),
-        ...(route.allowedWriteRoots ?? []),
-      ]);
-      await (
-        dependencies.assertSemanticProofV2Custody
-        ?? assertCccPrdSemanticProofV2Custody
-      )({
-        repositoryRoot: project.projectPath,
-        baseCommit: bundle.targetRepository.baseCommit,
-        proofs: bundle.proofs,
-        modelWriteRoots,
-        toolchainPaths: semanticProofToolchainPaths!,
-      });
-      // Custody above proves the closure/candidate/toolchain shape on
-      // bundle.proofs is exactly what a fresh Git re-derivation would
-      // produce, so those proof definitions are already the correct input
-      // for the conformance preflight below -- no second hydration pass.
-      //
-      // Running a declared proof's real verify command needs the
-      // semantic-proof-v2 sandbox, so this stays gated on
-      // isCccSemanticProofSandboxReady the same way the importing-side
-      // refusal further below (after the confirmation-digest check) is.
-      // Both `preview` and `import` simply skip the real preflight here
-      // when the sandbox isn't ready -- `import` still refuses, but only
-      // after the cheap exact confirmation-digest comparison, not here --
-      // and productPreview's verifierConfinement carries an explicit
-      // verifierConformanceChecked:false warning instead of silently
-      // claiming a check happened.
-      if (engine.isCccSemanticProofSandboxReady(semanticProofSandboxReadiness)) {
-        await (
-          dependencies.assertSemanticProofVerifierConformance
-          ?? engine.assertCccSemanticProofVerifierConformance
-        )({
-          repositoryRoot: project.projectPath,
-          baseCommit: bundle.targetRepository.baseCommit,
-          proofs: bundle.proofs,
-          modelWriteRoots,
-        });
-      }
-    } else {
-      const inspected = await (
-        dependencies.inspectCccPrdImport ?? inspectCccPrdImport
-      )({
-        idempotencyKey: idempotencyKey!,
-        layer,
-        rootDir: project.projectPath,
-      });
-      if (
-        !inspected
-        || inspected.bundleHash !== bundle.bundleHash
-        || resolve(inspected.targetRepository) !== resolve(project.projectPath)
-        || inspected.targetBase !== bundle.targetRepository.baseCommit
-      ) {
-        throw new PrdProductCommandError(
-          "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
-          "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
-        );
-      }
-    }
-    const identity = productPreviewIdentity({
-      projectId: project.projectId,
-      projectPath: project.projectPath,
-      targetHead,
-      bundle,
-      executionPolicy,
-    });
+    const { bundle, executionPolicy, semanticProofToolchainPaths } = target;
     const currentPreview = productPreview(
-      identity,
-      bundle,
+      target,
       verifierConfinement,
       semanticProofSandboxReadiness,
     );
@@ -2193,7 +1974,7 @@ async function runProductPacketCommand(
         io.write(JSON.stringify(currentPreview));
         return 0;
       }
-      // The candidate key is not an input to productPreviewIdentity, so
+      // The candidate key is not an input to the preview identity, so
       // printing one here cannot change the confirmation digest below it.
       const previewLines = renderPreview(currentPreview, {
         packetArgs: [
@@ -2222,15 +2003,13 @@ async function runProductPacketCommand(
     // confinement-unavailable refusal shape as the agent-confinement check
     // above, never the verifier-nonconforming code, since no verifier has
     // been judged yet. Only reached once the confirmation digest above is
-    // confirmed exact, so a stale digest is always reported first.
-    if (
-      bundle.schema === "ccc-prd.bundle.v2"
-      && bundle.proofs.length > 0
-      && !engine.isCccSemanticProofSandboxReady(semanticProofSandboxReadiness)
-    ) {
+    // confirmed exact, so a stale digest is always reported first. The shared
+    // preflight sets importBlocker exactly when a v2 bundle declares proofs
+    // and the semantic-proof sandbox is not ready.
+    if (target.importBlocker) {
       return writeVerifierConfinementImportRefusal(
         io,
-        semanticProofSandboxReadiness,
+        target.importBlocker.readiness,
         operatorJson(commandContext),
       );
     }
