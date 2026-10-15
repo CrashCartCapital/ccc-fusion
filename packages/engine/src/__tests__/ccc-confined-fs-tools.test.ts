@@ -1,11 +1,14 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { createEditTool, createFindTool, createLsTool, createReadTool, createWriteTool } from "@earendil-works/pi-coding-agent";
 import { CCC_PLANNING_DENIED_NAMES } from "@fusion/core";
 import { cccConfinedEffectiveDeniedNames, cccConfinedWriteRefusal } from "../ccc-confinement/confined-shell.js";
 import { createCccConfinedFsOperations } from "../ccc-confinement/confined-fs-tools.js";
+import { createCccConfinedSessionTools } from "../ccc-confinement/session-tool-policy.js";
 
 /*
 FNXC:CccConfinedFsTools 2026-10-14-20:55:
@@ -16,6 +19,56 @@ vi.mock("../ccc-confinement/confined-shell.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../ccc-confinement/confined-shell.js")>();
   return { ...actual, cccConfinedWriteRefusal: vi.fn(actual.cccConfinedWriteRefusal) };
 });
+
+/*
+FNXC:CccConfinedFsTools 2026-10-14-22:52:
+Card C2 repair 1 (time-of-check to time-of-use). The file system calls the confined operations make after their check pass through here unchanged, except that a test can arm one hook that runs just before the next call. The hook swaps an in-root directory for a symlink to a directory outside the root, which is exactly what a concurrent in-session process could do between the check and the open.
+*/
+const raceHook = vi.hoisted(() => ({ beforeNextOpen: null as null | (() => void) }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const hooked = <F extends (...args: never[]) => unknown>(fn: F): F => ((...args: Parameters<F>) => {
+    const hook = raceHook.beforeNextOpen;
+    raceHook.beforeNextOpen = null;
+    hook?.();
+    return fn(...args);
+  }) as F;
+  return { ...actual, open: hooked(actual.open), readFile: hooked(actual.readFile), writeFile: hooked(actual.writeFile) };
+});
+
+const piCodingAgentDir = realpathSync(fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent", import.meta.url)));
+const { agentLoop } = (await import(pathToFileURL(join(piCodingAgentDir, "..", "pi-agent-core", "dist", "agent-loop.js")).href)) as {
+  agentLoop: (...args: unknown[]) => AsyncIterable<unknown>;
+};
+const MODEL = { id: "m", provider: "p", api: "openai-completions", name: "m" };
+const USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+
+/** Runs one prompt through Pi 0.81.1's real agent loop; the first model call answers with all of `toolCalls` in one message. */
+async function runPiLoop(tools: unknown[], toolCalls: ReadonlyArray<{ name: string; arguments: Record<string, unknown> }>): Promise<string[]> {
+  let entries = 0;
+  const results: string[] = [];
+  const streamFn = () => {
+    entries += 1;
+    const first = entries === 1;
+    const content = first
+      ? toolCalls.map((call, index) => ({ type: "toolCall", id: `call-${index + 1}`, name: call.name, arguments: call.arguments }))
+      : [{ type: "text", text: "done" }];
+    const stopReason = first ? "toolUse" : "stop";
+    const message = { role: "assistant", content, api: MODEL.api, provider: MODEL.provider, model: MODEL.id, usage: USAGE, stopReason, timestamp: Date.now() };
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      stream.push({ type: "done", reason: stopReason, message } as never);
+      stream.end();
+    });
+    return stream;
+  };
+  const events = agentLoop([{ role: "user", content: "go", timestamp: Date.now() }], { systemPrompt: "", messages: [], tools },
+    { model: MODEL, convertToLlm: (messages: unknown[]) => messages }, new AbortController().signal, streamFn);
+  for await (const event of events as AsyncIterable<{ type: string; result?: { content?: Array<{ text?: string }> } }>) {
+    if (event.type === "tool_execution_end") results.push((event.result?.content ?? []).map((block) => block.text ?? "").join("\n"));
+  }
+  return results;
+}
 
 const parent = realpathSync(mkdtempSync(join(tmpdir(), "ccc-c2-fs-")));
 const root = join(parent, "root");
@@ -142,6 +195,130 @@ describe("confined file operations (card C2)", () => {
     await expect(writer.execute("t3", { path: "escape", content: "pwned\n" })).rejects.toThrow(/outside-write-roots/);
     expect(readFileSync(outsideFile, "utf8")).toBe("outside-bytes\n");
     expect(readFileSync(join(root, "src", "a.txt"), "utf8")).toBe("alpha\n");
+  });
+
+  it("under a tool policy the confined bash, write and edit run one at a time, so a write or read sent with a shell that swaps an in-root directory for an outside symlink lands inside the root and nothing lands outside", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "ccc-c2-race-")));
+    const raceRoot = join(base, "root");
+    const outside = join(base, "outside");
+    mkdirSync(join(raceRoot, "d"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(raceRoot, "d", "f.txt"), "inside\n");
+    writeFileSync(join(outside, "f.txt"), "outside-secret\n");
+    try {
+      const events: string[] = [];
+      const confined = createCccConfinedFsOperations({ readRoots: [raceRoot], writeRoots: [raceRoot], deniedNames: DENIED });
+      const fs = {
+        ...confined,
+        write: {
+          mkdir: async (directory: string) => {
+            events.push("write:mkdir");
+            return confined.write.mkdir(directory);
+          },
+          writeFile: async (path: string, content: string) => {
+            events.push("write:writeFile");
+            return confined.write.writeFile(path, content);
+          },
+        },
+        read: {
+          ...confined.read,
+          readFile: async (path: string) => {
+            events.push("read:readFile");
+            return confined.read.readFile(path);
+          },
+        },
+      };
+      // The shell holds the swap for its whole run, as a background loop in a confined command could.
+      const bash = {
+        exec: async () => {
+          events.push("bash:start");
+          renameSync(join(raceRoot, "d"), join(raceRoot, "d.parked"));
+          symlinkSync(outside, join(raceRoot, "d"));
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          unlinkSync(join(raceRoot, "d"));
+          renameSync(join(raceRoot, "d.parked"), join(raceRoot, "d"));
+          events.push("bash:end");
+          return { exitCode: 0 };
+        },
+        dispose: async () => Object.freeze({ closure: "confirmed" as const }),
+      };
+      const tools = createCccConfinedSessionTools({
+        names: ["bash", "read", "write", "edit"],
+        confinement: { fs, bash } as never,
+        cwd: raceRoot,
+        readRoots: [raceRoot],
+        deniedNames: DENIED,
+      });
+      await runPiLoop(tools, [
+        { name: "bash", arguments: { command: "swap d" } },
+        { name: "write", arguments: { path: "d/t.txt", content: "planted\n" } },
+      ]);
+
+      // The write's first file operation comes after the shell has finished and put the directory back.
+      expect(events).toEqual(["bash:start", "bash:end", "write:mkdir", "write:writeFile"]);
+      expect(readdirSync(outside).sort()).toEqual(["f.txt"]);
+      const landed = join(raceRoot, "d", "t.txt");
+      expect(existsSync(landed) ? readFileSync(landed, "utf8") : "missing").toBe("planted\n");
+
+      // read is not sequential itself; the shell is, so a message holding both runs one call at a time.
+      events.length = 0;
+      const results = await runPiLoop(tools, [
+        { name: "bash", arguments: { command: "swap d" } },
+        { name: "read", arguments: { path: "d/f.txt" } },
+      ]);
+      expect(events).toEqual(["bash:start", "bash:end", "read:readFile"]);
+      expect(results.join("\n")).toContain("inside");
+      expect(results.join("\n")).not.toContain("outside-secret");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("a read or write whose checked directory is swapped for an outside symlink before the open is refused, and no outside bytes are returned or written", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "ccc-c2-swap-")));
+    const swapRoot = join(base, "root");
+    const outside = join(base, "outside");
+    mkdirSync(join(swapRoot, "d"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(swapRoot, "d", "f.txt"), "inside\n");
+    writeFileSync(join(outside, "f.txt"), "outside-secret\n");
+    const swap = () => {
+      renameSync(join(swapRoot, "d"), join(swapRoot, "d.parked"));
+      symlinkSync(outside, join(swapRoot, "d"));
+    };
+    const restore = () => {
+      unlinkSync(join(swapRoot, "d"));
+      renameSync(join(swapRoot, "d.parked"), join(swapRoot, "d"));
+    };
+    try {
+      const ops = createCccConfinedFsOperations({ readRoots: [swapRoot], writeRoots: [swapRoot], deniedNames: DENIED });
+      raceHook.beforeNextOpen = swap;
+      const read = ops.read.readFile(join(swapRoot, "d", "f.txt")).then((bytes) => `resolved: ${bytes.toString("utf8")}`, (error: Error) => error.message);
+      expect(await read).toMatch(/confined path refused \(outside-read-roots\)/);
+      restore();
+
+      raceHook.beforeNextOpen = swap;
+      const written = ops.write.writeFile(join(swapRoot, "d", "t.txt"), "planted\n").then(() => "resolved", (error: Error) => error.message);
+      expect(await written).toMatch(/confined path refused \(outside-write-roots\)/);
+      restore();
+      expect(existsSync(join(outside, "t.txt")) ? readFileSync(join(outside, "t.txt"), "utf8") : "").toBe("");
+      expect(readFileSync(join(outside, "f.txt"), "utf8")).toBe("outside-secret\n");
+
+      // A new file's name made a dangling symlink to an outside path before the open: refused, and nothing is created there.
+      raceHook.beforeNextOpen = () => symlinkSync(join(outside, "created.txt"), join(swapRoot, "d", "new.txt"));
+      const created = ops.write.writeFile(join(swapRoot, "d", "new.txt"), "planted\n").then(() => "resolved", (error: Error) => error.message);
+      expect(await created).toMatch(/confined path refused \(outside-write-roots\)/);
+      expect(existsSync(join(outside, "created.txt"))).toBe(false);
+      unlinkSync(join(swapRoot, "d", "new.txt"));
+
+      // Positive control: without the swap the same read and write land inside the root.
+      expect((await ops.read.readFile(join(swapRoot, "d", "f.txt"))).toString("utf8")).toBe("inside\n");
+      await ops.write.writeFile(join(swapRoot, "d", "t.txt"), "planted\n");
+      expect(readFileSync(join(swapRoot, "d", "t.txt"), "utf8")).toBe("planted\n");
+    } finally {
+      raceHook.beforeNextOpen = null;
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 
   it("validates denied names against [A-Za-z0-9._*-] with a TypeError before any predicate call", () => {

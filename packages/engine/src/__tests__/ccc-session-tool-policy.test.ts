@@ -19,7 +19,8 @@ import {
   type CccPlanningRouteBinding,
   type CustomProvider,
 } from "@fusion/core";
-import { attachCccProviderAttemptBoundRoute, createFnAgent } from "../pi.js";
+import { attachCccProviderAttemptBoundRoute, createFnAgent, setHostExtensionPaths } from "../pi.js";
+import { createSkillsOverrideFromSelection, resolveSessionSkills } from "../skill-resolver.js";
 import { createCccPlanningProviderAttemptBinding } from "../ccc-planning/provider-binding.js";
 import { createCccCampaignReadyTool } from "../ccc-campaign-ready.js";
 import { connectMcpSessionTools } from "../mcp-session-tools.js";
@@ -271,16 +272,43 @@ describe("closed session tool policy (card C2, D11)", () => {
   });
 
   it("a critic session's final tools equal exactly the 5 critic names, its grep carries CCC_CONFINED_TOOL_MARK, Pi's grep is never created, and host extensions and skills are off", async () => {
-    prepareSession();
-    await createFnAgent(sessionOptions() as never);
+    /*
+    FNXC:CccSessionToolPolicy 2026-10-14-22:48:
+    Card C2 repair 1. Pi 0.81.1's noExtensions and noSkills flags do not drop additionalExtensionPaths or additionalSkillPaths, so this test gives the session a host extension path, an additional skill path and a skill selection, and proves none of them reaches the resource loader under a policy; the positive control shows the same inputs do reach it without one.
+    */
+    const skillsOverride = vi.fn();
+    vi.mocked(resolveSessionSkills).mockReturnValue({ skills: [], diagnostics: [] } as never);
+    vi.mocked(createSkillsOverrideFromSelection).mockReturnValue(skillsOverride as never);
+    setHostExtensionPaths(["/nonexistent/c2-host-ext"]);
+    const skillInputs = { additionalSkillPaths: [root], skills: ["c2-skill"] };
+    try {
+      prepareSession();
+      await createFnAgent(sessionOptions(skillInputs) as never);
 
-    expect(finalNames()).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
-    expect(sessionArgs().tools).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
-    const grep = sessionArgs().customTools.find((tool) => tool.name === "grep");
-    expect(marked(grep)).toBe(true);
-    for (const name of ["find", "ls", "read"]) expect(marked(sessionArgs().customTools.find((tool) => tool.name === name))).toBe(true);
-    expect(createGrepTool).not.toHaveBeenCalled();
-    expect(vi.mocked(DefaultResourceLoader).mock.calls.at(-1)?.[0]).toMatchObject({ noExtensions: true, noSkills: true });
+      expect(finalNames()).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
+      expect(sessionArgs().tools).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
+      const grep = sessionArgs().customTools.find((tool) => tool.name === "grep");
+      expect(marked(grep)).toBe(true);
+      for (const name of ["find", "ls", "read"]) expect(marked(sessionArgs().customTools.find((tool) => tool.name === name))).toBe(true);
+      expect(createGrepTool).not.toHaveBeenCalled();
+      const loaderOptions = vi.mocked(DefaultResourceLoader).mock.calls.at(-1)?.[0] as unknown as Record<string, unknown>;
+      expect(loaderOptions).toMatchObject({ noExtensions: true, noSkills: true });
+      expect(loaderOptions).not.toHaveProperty("additionalExtensionPaths");
+      expect(loaderOptions).not.toHaveProperty("additionalSkillPaths");
+      expect(loaderOptions).not.toHaveProperty("skillsOverride");
+
+      // Positive control: without the policy the same host extension path, skill path and skill selection reach the loader.
+      prepareSession();
+      await createFnAgent(sessionOptions({ ...skillInputs, cccProviderAttemptBinding: undefined }) as never);
+      const openOptions = vi.mocked(DefaultResourceLoader).mock.calls.at(-1)?.[0] as unknown as Record<string, unknown>;
+      expect(openOptions.additionalExtensionPaths).toEqual(["/nonexistent/c2-host-ext"]);
+      expect(openOptions.additionalSkillPaths).toEqual([expect.any(String)]);
+      expect(openOptions.skillsOverride).toBe(skillsOverride);
+    } finally {
+      setHostExtensionPaths([]);
+      vi.mocked(resolveSessionSkills).mockReset();
+      vi.mocked(createSkillsOverrideFromSelection).mockReset();
+    }
   });
 
   it("refuses an out-of-policy custom tool, toolsAllowlist entry or builtinToolsAllowlist entry, and an unmarked tool named grep; positive control: in-policy entries create the session", async () => {
@@ -345,6 +373,46 @@ describe("closed session tool policy (card C2, D11)", () => {
     const piGrep = criticTools().map((tool) => (tool.name === "grep" ? (createGrepTool(root) as unknown as ToolDefinition) : tool));
     expect(() => assertCccSessionToolSet(CRITIC_POLICY, piGrep)).toThrow(expect.objectContaining({ code: "CCC_SESSION_TOOL_POLICY_REFUSED" }));
     expect(() => assertCccSessionToolSet(CRITIC_POLICY, piGrep)).toThrow(/grep is not a Fusion confined tool/);
+  });
+
+  it("a frozen structural copy of an issued policy gets the full final check: a critic copy without its verdict tool or with a foreign ccc_submit_verdict, and a linked writer copy without fn_complete_phase, are refused; positive control: the copies with their tools create sessions", async () => {
+    /*
+    FNXC:CccSessionToolPolicy 2026-10-14-22:48:
+    Card C2 repair 1 (D11, verify-v2 item 37). createFnAgent recognises an issued policy by its content, not its object identity, so a caller that spreads, rebuilds or deserializes the policy it was issued still gets the names, digest and Fusion-tool check.
+    */
+    const criticCopy = Object.freeze({ ...CRITIC_POLICY }) as CccSessionToolPolicy;
+    expect(criticCopy).not.toBe(CRITIC_POLICY);
+    const foreignVerdict = { ...verdictTool, parameters: Type.Object({ anything: Type.String() }) } as ToolDefinition;
+    for (const customTools of [[], [foreignVerdict]]) {
+      prepareSession();
+      await expect(createFnAgent(sessionOptions({ cccProviderAttemptBinding: criticBinding(criticCopy), customTools }) as never))
+        .rejects.toMatchObject({ code: "CCC_SESSION_TOOL_POLICY_REFUSED" });
+      expect(createAgentSession).not.toHaveBeenCalled();
+    }
+    const linked = buildCccSessionToolPolicy({
+      roleClass: "writer",
+      linkedWriter: true,
+      readRoots: [root],
+      writeRoots: [join(root, "src")],
+      tools: [...writerTools(), readyTool()],
+    });
+    const linkedCopy = Object.freeze({ ...linked }) as CccSessionToolPolicy;
+    const linkedOptions = (customTools: ToolDefinition[]) => sessionOptions({
+      cccProviderAttemptBinding: linkedWriterBinding(linkedCopy),
+      cccConfinement: writerConfinement,
+      customTools,
+    });
+    prepareSession();
+    await expect(createFnAgent(linkedOptions([]) as never)).rejects.toMatchObject({ code: "CCC_SESSION_TOOL_POLICY_REFUSED" });
+    expect(createAgentSession).not.toHaveBeenCalled();
+
+    // Positive control: each copy with its own tools creates its session.
+    prepareSession();
+    await createFnAgent(sessionOptions({ cccProviderAttemptBinding: criticBinding(criticCopy) }) as never);
+    expect(finalNames()).toEqual([...CCC_PLANNING_TOOLSETS.critic]);
+    prepareSession();
+    await createFnAgent(linkedOptions([readyTool()]) as never);
+    expect(finalNames()).toEqual([...CCC_PLANNING_LINKED_WRITER_TOOLSET]);
   });
 
   it("a linked writer session through createFnAgent keeps fn_complete_phase through the wrapper chain and is refused without it", async () => {
