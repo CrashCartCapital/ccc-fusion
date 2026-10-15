@@ -14,6 +14,10 @@ Repair 1 of card C2 adds eight tests (grep matching in a worker with a deadline 
 FNXC:CccPlanningProof 2026-10-15-00:52:
 Repair 2 of card C2 (errata E14) adds four tests: a FIFO inside a root that a confined read, edit, write or grep never blocks on, a wrapped ccc_probe_echo that records what the model sent and never ok for an inexact echo, and the refusal of a tool policy buildCccSessionToolPolicy did not build. The fs and grep files now make a FIFO with /usr/bin/mkfifo, present on macOS and on the Linux runners. Measured with parallel agents running: 4.9 s vitest duration for the five files (44 tests). The 120 s hang bound is unchanged.
 */
+/*
+FNXC:CccPlanningProof 2026-10-15-05:07:
+The C2 extension-boundary successor adds two tests: policy-bound critic and linked writer sessions prevent package discovery and extension-factory execution while preserving explicit M3 provider registration, and an unbound legacy session still discovers enabled project and user extensions. The five files now hold 46 exact names; the 120 s hang bound is unchanged.
+*/
 
 const FILES = Object.freeze([
   "src/__tests__/ccc-session-tool-policy.test.ts",
@@ -80,6 +84,8 @@ export const OFFLINE = Object.freeze([
       `${PROBE} > a wrapped ccc_submit_verdict records verdict-shape ok and aborts the turn exactly once`,
       `${POLICY} > refuses a critic session given tools readonly, builtinToolsAllowlist WebFetch and one MCP server with CCC_SESSION_TOOL_POLICY_REFUSED before any MCP connection or session`,
       `${POLICY} > positive control: the same options with no binding policy yield a session containing WebFetch`,
+      `${POLICY} > policy-bound critic and linked writer sessions never discover extensions or execute their factories, while the explicit M3 provider still registers`,
+      `${POLICY} > positive control: an unbound legacy session discovers enabled project and user extensions and executes their factories`,
       `${POLICY} > a critic session's final tools equal exactly the 5 critic names, its grep carries CCC_CONFINED_TOOL_MARK, Pi's grep is never created, and host extensions and skills are off`,
       `${POLICY} > refuses an out-of-policy custom tool, toolsAllowlist entry or builtinToolsAllowlist entry, and an unmarked tool named grep; positive control: in-policy entries create the session`,
       `${POLICY} > buildCccSessionToolPolicy for a linked writer gives ccc-linked-writer-tools.v1 and CCC_PLANNING_LINKED_WRITER_TOOLSET; assertCccSessionToolSet admits the ready tool and refuses the set without it and a plain writer policy with it`,

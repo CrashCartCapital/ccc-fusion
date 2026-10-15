@@ -7,7 +7,9 @@ import {
   createAgentSession,
   createGrepTool,
   createReadTool,
+  DefaultPackageManager,
   DefaultResourceLoader,
+  discoverAndLoadExtensions,
   ModelRegistry,
   ModelRuntime,
   type AgentSession,
@@ -75,8 +77,24 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
         skillsOverride: undefined,
       };
     }),
-    DefaultPackageManager: vi.fn(),
-    discoverAndLoadExtensions: vi.fn().mockResolvedValue({ errors: [], runtime: { pendingProviderRegistrations: [] } }),
+    DefaultPackageManager: vi.fn().mockImplementation(function () {
+      return {
+        resolve: vi.fn().mockResolvedValue({
+          extensions: EXTENSION_PATHS.map((path, index) => ({
+            path,
+            enabled: true,
+            metadata: { source: path, scope: index === 0 ? "project" : "user", origin: "package" },
+          })),
+          skills: [],
+          prompts: [],
+          themes: [],
+        }),
+      };
+    }),
+    discoverAndLoadExtensions: vi.fn().mockImplementation(async () => {
+      extensionFactorySideEffect();
+      return { extensions: [], errors: [], runtime: { pendingProviderRegistrations: [] } };
+    }),
     getAgentDir: vi.fn(() => "/test/agent-dir"),
     ModelRuntime: { create: vi.fn() },
     ModelRegistry: vi.fn().mockImplementation(function () {
@@ -97,7 +115,9 @@ vi.mock("../mcp-session-tools.js", () => ({
   buildMcpCapabilityPrompt: vi.fn(() => ""),
 }));
 
-const { PROVIDERS } = vi.hoisted(() => ({
+const { PROVIDERS, EXTENSION_PATHS, extensionFactorySideEffect } = vi.hoisted(() => ({
+  EXTENSION_PATHS: ["/synthetic/c2-project-extension.ts", "/synthetic/c2-user-extension.ts"],
+  extensionFactorySideEffect: vi.fn(),
   PROVIDERS: [
     {
       id: "provider-m3",
@@ -247,7 +267,10 @@ describe("closed session tool policy (card C2, D11)", () => {
     vi.mocked(createAgentSession).mockReset();
     vi.mocked(createGrepTool).mockClear();
     vi.mocked(connectMcpSessionTools).mockClear();
+    vi.mocked(DefaultPackageManager).mockClear();
     vi.mocked(DefaultResourceLoader).mockClear();
+    vi.mocked(discoverAndLoadExtensions).mockClear();
+    extensionFactorySideEffect.mockClear();
   });
 
   it("refuses a critic session given tools readonly, builtinToolsAllowlist WebFetch and one MCP server with CCC_SESSION_TOOL_POLICY_REFUSED before any MCP connection or session", async () => {
@@ -272,6 +295,58 @@ describe("closed session tool policy (card C2, D11)", () => {
 
     expect(sessionArgs().tools).toContain("WebFetch");
     expect(createGrepTool).toHaveBeenCalled();
+  });
+
+  it("policy-bound critic and linked writer sessions never discover extensions or execute their factories, while the explicit M3 provider still registers", async () => {
+    /*
+    FNXC:CccSessionToolPolicy 2026-10-15-05:07:
+    The C2 extension-boundary successor covers provider bootstrap before the resource loader: enabled project and user package extensions would execute a factory during discovery, so a policy must prevent discovery itself while preserving explicit custom-provider registration.
+    */
+    const linked = buildCccSessionToolPolicy({
+      roleClass: "writer",
+      linkedWriter: true,
+      readRoots: [root],
+      writeRoots: [join(root, "src")],
+      tools: [...writerTools(), readyTool()],
+    });
+    for (const options of [
+      sessionOptions(),
+      sessionOptions({
+        cccProviderAttemptBinding: linkedWriterBinding(linked),
+        cccConfinement: writerConfinement,
+        customTools: [readyTool()],
+      }),
+    ]) {
+      prepareSession();
+      await createFnAgent(options as never);
+
+      expect({
+        packageDiscovery: vi.mocked(DefaultPackageManager).mock.calls.length,
+        extensionDiscovery: vi.mocked(discoverAndLoadExtensions).mock.calls.length,
+        factoryEffects: extensionFactorySideEffect.mock.calls.length,
+      }).toEqual({ packageDiscovery: 0, extensionDiscovery: 0, factoryEffects: 0 });
+      const registry = vi.mocked(ModelRegistry).mock.results.at(-1)!.value as ModelRegistry;
+      expect(registry.registerProvider).toHaveBeenCalledWith(M3_KEY, expect.objectContaining({
+        baseUrl: PROVIDERS[0]!.baseUrl,
+        models: expect.arrayContaining([expect.objectContaining({ id: MODEL_ID })]),
+      }));
+      expect(createAgentSession).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("positive control: an unbound legacy session discovers enabled project and user extensions and executes their factories", async () => {
+    prepareSession();
+    await createFnAgent(sessionOptions({ cccProviderAttemptBinding: undefined }) as never);
+
+    expect(DefaultPackageManager).toHaveBeenCalledTimes(1);
+    expect(discoverAndLoadExtensions).toHaveBeenCalledTimes(1);
+    expect(discoverAndLoadExtensions).toHaveBeenCalledWith(
+      expect.arrayContaining(EXTENSION_PATHS),
+      root,
+      join(root, ".fusion", "disabled-auto-extension-discovery"),
+    );
+    expect(extensionFactorySideEffect).toHaveBeenCalledTimes(1);
+    expect(createAgentSession).toHaveBeenCalledTimes(1);
   });
 
   it("a critic session's final tools equal exactly the 5 critic names, its grep carries CCC_CONFINED_TOOL_MARK, Pi's grep is never created, and host extensions and skills are off", async () => {
