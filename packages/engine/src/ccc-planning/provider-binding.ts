@@ -10,7 +10,7 @@ import type {
   CccProviderAttemptSettlementInputOf,
   CccSessionToolPolicy,
 } from "../agent-runtime.js";
-import { CCC_PROVIDER_ATTEMPT_ROUTE_MARKER } from "../pi.js";
+import { attachCccProviderAttemptBoundRoute } from "../pi.js";
 
 /*
 FNXC:CccPlanningProviderBinding 2026-10-14-14:50:
@@ -19,6 +19,10 @@ A planning session is bound to exactly one route: the provider, model and transp
 /*
 FNXC:CccPlanningProviderBinding 2026-10-14-17:37:
 Repair 1 (errata E5-P1 item 9). The recorded route also carries the route binding's role class and toolset digest, so session creation can refuse a tool policy that was not issued for this binding. Only the provider, model and transport take part in the route-drift check.
+*/
+/*
+FNXC:CccPlanningProviderBinding 2026-10-14-18:43:
+Repair 2 (errata E7-P item 7). The route is recorded through attachCccProviderAttemptBoundRoute, the one writer of the bound-route marker, which card WR also uses for a linked writer's controller.
 */
 export function createCccPlanningProviderAttemptBinding(i: Readonly<{
   controller: CccProviderAttemptController<CccPlanningCallScope>;
@@ -34,7 +38,7 @@ export function createCccPlanningProviderAttemptBinding(i: Readonly<{
     roleClass: i.binding.roleClass,
     toolsetDigest: i.binding.toolsetDigest,
   });
-  const controller: CccProviderAttemptController<CccPlanningCallScope> = Object.freeze({
+  const controller = attachCccProviderAttemptBoundRoute<CccPlanningCallScope>(Object.freeze({
     preDispatch: async (input: CccCampaignProviderDispatchInput) => {
       if (input.providerId !== route.providerId || input.modelId !== route.modelId || input.transport !== route.transport) {
         throw new CccProviderAttemptIdentityError(
@@ -46,8 +50,7 @@ export function createCccPlanningProviderAttemptBinding(i: Readonly<{
       return inner.preDispatch(input);
     },
     reconcile: (input: CccProviderAttemptSettlementInputOf<CccPlanningCallScope>) => inner.reconcile(input),
-    [CCC_PROVIDER_ATTEMPT_ROUTE_MARKER]: route,
-  });
+  }), route);
   return Object.freeze({
     turnKey: i.turnKey,
     controller,

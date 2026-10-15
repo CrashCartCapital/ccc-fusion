@@ -12,6 +12,10 @@ Measured on the M5 Max under concurrent agent load: about 16 s wall for the thre
 FNXC:CccPlanningProofInventory 2026-10-14-17:37:
 Repair 1 (errata E5-P1). The name list is the 62 tests the three P1 files now hold, read back from a passing Vitest JSON run. The settlement file also drives the real receipt adapter over a loopback HTTP server it starts itself on 127.0.0.1 port 0 and closes in a finally block, so it still needs no network beyond loopback and no PostgreSQL. Re-measured under concurrent agent load: about 5 s wall for the three P1 files plus pi.test.ts (166 tests); the 120 s timeouts are unchanged.
 */
+/*
+FNXC:CccPlanningProofInventory 2026-10-14-18:50:
+Repair 2 (errata E7-P). The name list is the 84 tests the three P1 files now hold, read back from a passing Vitest JSON run. The new transport-failure tests stay on loopback: the refused-connection case binds 127.0.0.1 port 0, closes it and then dials it, and the adapter-timeout case stubs fetch under fake timers for setTimeout and clearTimeout only, with a loopback server that must see no request. No test needs PostgreSQL or a network beyond loopback. Re-measured under concurrent agent load: about 6 s wall for the three P1 files plus pi.test.ts (188 tests); the 120 s timeouts are unchanged.
+*/
 
 const SEAM_FILES = Object.freeze([
   "src/__tests__/ccc-planning-provider-settlement.test.ts",
@@ -62,6 +66,11 @@ export const OFFLINE = Object.freeze([
       "createCccPlanningProviderAttemptBinding binds one exact route > refuses a dispatch with a different transport as route-drift and never asks the inner controller",
       "createCccPlanningProviderAttemptBinding binds one exact route > positive control: the exact route is forwarded to the inner controller unchanged",
       "createCccPlanningProviderAttemptBinding binds one exact route > returns a frozen planning binding whose frozen controller carries the bound route under a symbol key",
+      "attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7) > returns a frozen controller that carries exactly the five route values, copied and frozen, and forwards both methods",
+      "attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7) > refuses an empty route value",
+      "attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7) > refuses a missing route value",
+      "attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7) > refuses a controller that already carries a bound route",
+      "attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7) > refuses a controller with a key other than preDispatch and reconcile",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning binding whose provider is not the session's default provider, before any provider is registered",
       "planning session creation enforces the bound route and the planning seams (D48) > positive control: the bound provider as the default provider creates the session with the receipt adapter on that provider only",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses scopeKind planning without a toolPolicy at session creation",
@@ -77,6 +86,9 @@ export const OFFLINE = Object.freeze([
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a tool policy that is not frozen at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning-linked-writer binding whose controller carries no bound route at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning-linked-writer binding whose bound provider is not the session's default provider at session creation",
+      "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning-linked-writer binding whose bound model is not the session's default model at session creation",
+      "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning-linked-writer binding when the session names no default model at session creation",
+      "planning session creation enforces the bound route and the planning seams (D48) > refuses a planning binding whose bound model is not the session's default model at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses an empty confinement object under a policy that allows bash at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a confinement with no bash key under a policy that allows bash at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a confined bash with no exec function at session creation",
@@ -90,6 +102,7 @@ export const OFFLINE = Object.freeze([
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a tool policy whose role class is not the route binding's at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > refuses a tool policy on a campaign-scope binding at session creation",
       "planning session creation enforces the bound route and the planning seams (D48) > positive control: a linked writer with a confined bash and the linked writer policy creates its session",
+      "planning session creation enforces the bound route and the planning seams (D48) > positive control (E7-P item 7): a planning-linked-writer controller marked with attachCccProviderAttemptBoundRoute creates its session",
       "planning session creation enforces the bound route and the planning seams (D48) > positive control: a probe tool policy with exactly the role toolset plus the probe tool creates its session",
       "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > a mismatched terminal receipt in planning scope: one proved_failed reconcile, a CccProviderRouteReceiptError, and dispatch keys [pi-stream:1]",
       "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > a missing terminal receipt in planning scope: one proved_failed reconcile, a CccProviderRouteReceiptError, and dispatch keys [pi-stream:1]",
@@ -104,6 +117,7 @@ export const OFFLINE = Object.freeze([
       "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > control: campaign scope with the same mismatched receipt keeps today's refusal before reconcile",
       "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > refuses a dispatch permit carrying a planning scope under a hand-built binding without scopeKind, before any provider call (E5-P1 item 7)",
       "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > refuses a proved_failed terminal hold carrying a planning scope under a hand-built binding without scopeKind, before any provider call (E5-P1 item 7)",
+      "planning-scope route refusal settles once and leaves the slot loop (D10, item 42) > the item-7 refusal of a dispatch permit settles the reserved call once with no upstream request, so the slot is left neither reserved nor dispatched_unknown (E7-P item 6)",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a missing terminal receipt settles once as receipt-missing, refuses with CccProviderRouteReceiptError, keeps dispatch keys [pi-stream:1] and sends one upstream request",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a conflicting terminal receipt settles once as receipt-mismatch, refuses with CccProviderRouteReceiptError, keeps dispatch keys [pi-stream:1] and sends one upstream request",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a incomplete terminal receipt settles once as receipt-missing, refuses with CccProviderRouteReceiptError, keeps dispatch keys [pi-stream:1] and sends one upstream request",
@@ -111,13 +125,25 @@ export const OFFLINE = Object.freeze([
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a socket destroyed mid-stream is a transport failure: no reconcile, and re-entry holds as dispatched_unknown with keys [pi-stream:1, pi-stream:1]",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > an adapter timeout is a transport failure: no reconcile, and re-entry holds as dispatched_unknown",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > control: an upstream HTTP 500 settles provider-error-event and the retry advances to pi-stream:2",
-      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a provider error that carries an observed receipt keeps that receipt in its provider-error-event evidence (E5-P1 item 10)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > a finish_reason error whose terminal receipt names another model settles once as receipt-mismatch and never retries: keys [pi-stream:1] and one upstream request (E7-P item 3)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > control (E7-P item 3): the same finish_reason error with the bound model's receipt settles provider-error-event, keeps that receipt in its evidence (E5-P1 item 10), and the retry advances to pi-stream:2",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > keeps the observed route, bounded to 256 characters, in the receipt-mismatch evidence for the bound model announced first and another model after it (E7-P item 4)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > keeps the observed route, bounded to 256 characters, in the receipt-mismatch evidence for another model announced first and the bound model after it (E7-P item 4)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > keeps the observed route, bounded to 256 characters, in the receipt-mismatch evidence for a conflicting provider (E7-P item 4)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > keeps the observed route, bounded to 256 characters, in the receipt-mismatch evidence for a conflicting model of 10000 characters (E7-P item 4)",
+      "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > keeps the observed route, bounded to 256 characters, in the receipt-mismatch evidence for a single mismatched receipt whose model has 10000 characters (E7-P item 4)",
       "planning-scope settlement through the real receipt adapter over a loopback upstream (E5-P1 item 4) > positive control: an exact terminal receipt through the real adapter commits on pi-stream:1 with one upstream request",
+      "an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8) > (a) a last data line cut mid-JSON at a clean end of stream is a transport failure: no reconcile, re-entry holds with keys [pi-stream:1, pi-stream:1], one upstream request",
+      "an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8) > (b) a clean end after a complete line with no [DONE] and no receipt stays a transport failure, not receipt-missing: no reconcile, re-entry holds, one upstream request",
+      "an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8) > (c) a refused connection is a transport failure: no reconcile, re-entry holds with keys [pi-stream:1, pi-stream:1], one upstream request",
+      "an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8) > (d) a malformed data line mid-stream, followed by a valid finish, receipt and [DONE], is a transport failure: the adapter abandoned the stream, so nothing is settled",
+      "an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8) > the adapter's own timeout firing after the body completed is a transport failure, not an upstream error (E7-P item 8)",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > the campaign controller still satisfies CccProviderAttemptController<CccProviderAttemptScope>",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > assigns the real campaign controller to K1's CccProviderAttemptControllerView<CccProviderAttemptScope> (item 51)",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > refuses the real campaign controller as a planning-scope K1 view with an assignability error",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > the equality check is strict and the scope kind is a closed set",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > passes the planning factory binding to createFnAgent options and AgentRuntimeOptions with no cast, and types the confined bash dispose structurally (E5-P1 items 5 and 12)",
+      "Pi seam types carry the real campaign controller (type-only, compiled in-test) > exports the 5-key CccProviderAttemptBoundRoute and attachCccProviderAttemptBoundRoute from pi.ts, and the marker reader returns that same type (E7-P item 7)",
       "Pi seam types carry the real campaign controller (type-only, compiled in-test) > re-exports K1's view types from core instead of keeping engine copies (E5-P1 item 6)",
     ]),
     platform: "any",

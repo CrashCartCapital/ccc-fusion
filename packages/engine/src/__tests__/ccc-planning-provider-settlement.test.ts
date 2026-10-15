@@ -27,6 +27,10 @@ Card P1 proof for the planning-scope settlement rule (CONTRACT-v3 section 2.12, 
 FNXC:CccPlanningProviderSeam 2026-10-14-17:22:
 Repair 1 (errata E5-P1). The refused slot is remembered before the settlement is awaited, so a lost reconcile response cannot let a later stream move past it (item 1). The receipt adapter's own abort shape stays dispatched_unknown (item 2). The real adapter, driven over a loopback SSE server this file owns on port 0, marks a terminal-receipt failure as a route refusal (settled once, keys [pi-stream:1], one upstream request), a lost connection or adapter timeout as a transport failure (never settled, re-entry holds), and an upstream HTTP error as neither, which settles provider-error-event and lets a retry take pi-stream:2 (item 4); a provider error keeps an observed receipt in its evidence (item 10). A planning controller's scope under a session binding without the planning scopeKind is refused before any provider call (item 7). Linked writers run on campaign-shaped scopes (card BF), so their fixture uses a campaign authority binding.
 */
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:32:
+Repair 2 (errata E7-P, final). Through the real adapter, any error raised after the body began and before [DONE] is a transport failure: a cut inside the last data line, a clean end with no [DONE] and no receipt, a refused connection and a malformed data line mid-stream all leave the attempt dispatched_unknown, with one upstream request (items 1 and 2). A finish_reason error whose terminal receipt names another model refuses receipt-mismatch and never retries; the same error with the bound model's receipt still settles provider-error-event (item 3, E7-0). A conflicting receipt keeps the conflicting provider and model, bounded, in its receipt-mismatch evidence (item 4). The item-7 refusal of a dispatch permit settles the reserved call once with no upstream request, so the slot is left neither reserved nor dispatched_unknown (item 6). The adapter's own timeout is a transport failure even when it fires after the body completed (item 8, fake timers, fetch stubbed to a body the adapter's abort cannot touch).
+*/
 
 vi.mock("../skill-resolver.js", () => ({
   resolveSessionSkills: vi.fn(),
@@ -304,6 +308,13 @@ function adapterAbortStream() {
       yield { type: "error", reason: "aborted", error: aborted };
     },
   };
+}
+
+/** E7-P item 4: an observed receipt value over 256 characters keeps a prefix and the sha256 of the whole value. */
+function boundedRouteValue(value: string): string {
+  if (value.length <= 256) return value;
+  const suffix = `...sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+  return `${value.slice(0, 256 - suffix.length)}${suffix}`;
 }
 
 function refusalDigest(reason: string, observed: Readonly<{ provider: string; model: string }> | null): string {
@@ -743,8 +754,50 @@ describe("planning-scope route refusal settles once and leaves the slot loop (D1
     expect(first.outcome.ok).toBe(false);
     expect(String(outcomeError(first.outcome))).toMatch(/planning scope.*campaign session binding/);
     expect(providerStream).not.toHaveBeenCalled();
-    expect(controller.reconcile).not.toHaveBeenCalled();
+    // E7-P item 6: a permit reserved the call, so it is settled once; a hold reserved nothing, so nothing is settled.
+    expect(controller.reconcile).toHaveBeenCalledTimes(hold ? 0 : 1);
     expect(dispatchKeys(controller)).toEqual(["pi-stream:1"]);
+  });
+
+  it("the item-7 refusal of a dispatch permit settles the reserved call once with no upstream request, so the slot is left neither reserved nor dispatched_unknown (E7-P item 6)", async () => {
+    const controller = fakeLedgerController();
+    const providerStream = vi.fn(() => doneStream(terminalMessage(REQUESTED_UPSTREAM)));
+    const agent = await createPlanningAgent({
+      controller,
+      providerStream,
+      scopeKind: "campaign",
+      binding: handBuiltCampaignBinding(controller),
+    });
+
+    const first = await drain(agent.stream());
+
+    expect(first.outcome.ok).toBe(false);
+    expect(String(outcomeError(first.outcome))).toMatch(/planning scope.*campaign session binding/);
+    expect(providerStream).not.toHaveBeenCalled();
+    expect(controller.reconcile).toHaveBeenCalledTimes(1);
+    const settlement = controller.reconcile.mock.calls[0]![0];
+    expect(settlement).toMatchObject({
+      dispatchKey: "pi-stream:1",
+      turnKey: TURN_KEY,
+      outcome: "proved_failed",
+      refusalReason: "effective-route-drift",
+      observerId: "pi",
+      evidenceDigest: refusalDigest("effective-route-drift", null),
+    });
+    expect(settlement).not.toHaveProperty("effectiveRoute");
+
+    // The ledger now answers slot 1 with its proved_failed terminal, not with a dispatched_unknown hold.
+    const second = await drain(agent.stream());
+    expect(second.outcome.ok).toBe(false);
+    expect(String(outcomeError(second.outcome))).not.toMatch(/dispatched_unknown/);
+    await expect(controller.preDispatch.mock.results[1]!.value).resolves.toMatchObject({
+      kind: "hold",
+      reason: "terminal",
+      scope: { dispatchKey: "pi-stream:1", state: "proved_failed" },
+    });
+    expect(dispatchKeys(controller)).toEqual(["pi-stream:1", "pi-stream:1"]);
+    expect(providerStream).not.toHaveBeenCalled();
+    expect(controller.reconcile).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -753,22 +806,26 @@ describe("planning-scope settlement through the real receipt adapter over a loop
     vi.mocked(ModelRuntime.create).mockReset();
   });
 
+  // E7-P item 4: a conflicting receipt keeps the value that conflicts with the bound route; the item-9 ruling keeps an
+  // incomplete or non-terminal receipt as receipt-missing with no observed route.
   const RECEIPT_FAILURE_CASES = [
-    { label: "missing", tail: "", reason: "receipt-missing" },
+    { label: "missing", tail: "", reason: "receipt-missing", observed: null },
     {
       label: "conflicting",
       tail: `${receiptComments("minimax", "MiniMax-M3")}: x-omniroute-model=MiniMax-M2.7\n`,
       reason: "receipt-mismatch",
+      observed: { provider: "minimax", model: "MiniMax-M2.7" },
     },
-    { label: "incomplete", tail: ": x-omniroute-model=MiniMax-M3\n", reason: "receipt-missing" },
+    { label: "incomplete", tail: ": x-omniroute-model=MiniMax-M3\n", reason: "receipt-missing", observed: null },
     {
       label: "non-terminal",
       tail: `${receiptComments("minimax", "MiniMax-M3")}data: ${JSON.stringify({ id: "c1", choices: [] })}\n\n`,
       reason: "receipt-missing",
+      observed: null,
     },
   ];
 
-  for (const { label, tail, reason } of RECEIPT_FAILURE_CASES) it(`a ${label} terminal receipt settles once as ${reason}, refuses with CccProviderRouteReceiptError, keeps dispatch keys [pi-stream:1] and sends one upstream request`, async () => {
+  for (const { label, tail, reason, observed } of RECEIPT_FAILURE_CASES) it(`a ${label} terminal receipt settles once as ${reason}, refuses with CccProviderRouteReceiptError, keeps dispatch keys [pi-stream:1] and sends one upstream request`, async () => {
     await withLoopback(sseReply(tail), async (baseUrl, requests) => {
       const controller = fakeLedgerController();
       const providerStream = realAdapterStream(baseUrl);
@@ -776,14 +833,14 @@ describe("planning-scope settlement through the real receipt adapter over a loop
 
       const first = await drain(agent.stream());
       expect(outcomeError(first.outcome)).toBeInstanceOf(CccProviderRouteReceiptError);
-      expect(outcomeError(first.outcome)).toMatchObject({ reason, requested: REQUESTED_UPSTREAM, observed: null });
+      expect(outcomeError(first.outcome)).toMatchObject({ reason, requested: REQUESTED_UPSTREAM, observed });
       expect(controller.reconcile).toHaveBeenCalledTimes(1);
       const settlement = controller.reconcile.mock.calls[0]![0];
       expect(settlement).toMatchObject({
         dispatchKey: "pi-stream:1",
         outcome: "proved_failed",
         refusalReason: reason,
-        evidenceDigest: refusalDigest(reason, null),
+        evidenceDigest: refusalDigest(reason, observed),
       });
       expect(settlement).not.toHaveProperty("effectiveRoute");
 
@@ -876,21 +933,110 @@ describe("planning-scope settlement through the real receipt adapter over a loop
     });
   });
 
-  it("a provider error that carries an observed receipt keeps that receipt in its provider-error-event evidence (E5-P1 item 10)", async () => {
+  it("a finish_reason error whose terminal receipt names another model settles once as receipt-mismatch and never retries: keys [pi-stream:1] and one upstream request (E7-P item 3)", async () => {
     const observed = { provider: "minimax", model: "MiniMax-M2.7" } as const;
     await withLoopback(sseReply(receiptComments(observed.provider, observed.model), "error"), async (baseUrl, requests) => {
       const controller = fakeLedgerController();
       const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
 
       const first = await drain(agent.stream());
+      expect(outcomeError(first.outcome)).toBeInstanceOf(CccProviderRouteReceiptError);
+      expect(outcomeError(first.outcome)).toMatchObject({ reason: "receipt-mismatch", requested: REQUESTED_UPSTREAM, observed });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      const settlement = controller.reconcile.mock.calls[0]![0];
+      expect(settlement).toMatchObject({
+        dispatchKey: "pi-stream:1",
+        outcome: "proved_failed",
+        refusalReason: "receipt-mismatch",
+        evidenceDigest: refusalDigest("receipt-mismatch", observed),
+      });
+      expect(settlement).not.toHaveProperty("effectiveRoute");
+
+      const second = await drain(agent.stream());
+      expect(outcomeError(second.outcome)).toBeInstanceOf(CccProviderRouteReceiptError);
+      expect(distinctDispatchKeys(controller)).toEqual(["pi-stream:1"]);
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(requests()).toBe(1);
+    });
+  });
+
+  it("control (E7-P item 3): the same finish_reason error with the bound model's receipt settles provider-error-event, keeps that receipt in its evidence (E5-P1 item 10), and the retry advances to pi-stream:2", async () => {
+    const reply: LoopbackReply = (request, response, ordinal) =>
+      sseReply(receiptComments("minimax", "MiniMax-M3"), ordinal === 1 ? "error" : "stop")(request, response, ordinal);
+    await withLoopback(reply, async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
+
+      const first = await drain(agent.stream());
       expect(first.outcome.ok).toBe(false);
       expect(outcomeError(first.outcome)).not.toBeInstanceOf(CccProviderRouteReceiptError);
+      expect(String(outcomeError(first.outcome))).toMatch(/finish_reason: error/);
       expect(controller.reconcile).toHaveBeenCalledTimes(1);
       expect(controller.reconcile.mock.calls[0]![0]).toMatchObject({
         dispatchKey: "pi-stream:1",
         outcome: "proved_failed",
         refusalReason: "provider-error-event",
-        evidenceDigest: refusalDigest("provider-error-event", observed),
+        evidenceDigest: refusalDigest("provider-error-event", REQUESTED_UPSTREAM),
+      });
+
+      const retry = await drain(agent.stream());
+      expect(retry.outcome.ok).toBe(true);
+      expect(dispatchKeys(controller)).toEqual(["pi-stream:1", "pi-stream:2"]);
+      expect(controller.reconcile.mock.calls[1]![0]).toMatchObject({ dispatchKey: "pi-stream:2", outcome: "committed" });
+      expect(requests()).toBe(2);
+    });
+  });
+
+  const BOUNDED_OBSERVED_CASES = [
+    {
+      label: "the bound model announced first and another model after it",
+      tail: `${receiptComments("minimax", "MiniMax-M3")}: x-omniroute-model=MiniMax-M2.7\n`,
+      reason: "receipt-mismatch",
+      observed: { provider: "minimax", model: "MiniMax-M2.7" },
+    },
+    {
+      label: "another model announced first and the bound model after it",
+      tail: `${receiptComments("minimax", "MiniMax-M2.7")}: x-omniroute-model=MiniMax-M3\n`,
+      reason: "receipt-mismatch",
+      observed: { provider: "minimax", model: "MiniMax-M2.7" },
+    },
+    {
+      label: "a conflicting provider",
+      tail: `${receiptComments("minimax", "MiniMax-M3")}: x-omniroute-provider=glm\n`,
+      reason: "receipt-mismatch",
+      observed: { provider: "glm", model: "MiniMax-M3" },
+    },
+    {
+      label: "a conflicting model of 10000 characters",
+      tail: `${receiptComments("minimax", "MiniMax-M3")}: x-omniroute-model=${"M".repeat(10_000)}\n`,
+      reason: "receipt-mismatch",
+      observed: { provider: "minimax", model: boundedRouteValue("M".repeat(10_000)) },
+    },
+    {
+      label: "a single mismatched receipt whose model has 10000 characters",
+      tail: receiptComments("minimax", "Z".repeat(10_000)),
+      reason: "receipt-mismatch",
+      observed: { provider: "minimax", model: boundedRouteValue("Z".repeat(10_000)) },
+    },
+  ];
+
+  for (const { label, tail, reason, observed } of BOUNDED_OBSERVED_CASES) it(`keeps the observed route, bounded to 256 characters, in the ${reason} evidence for ${label} (E7-P item 4)`, async () => {
+    await withLoopback(sseReply(tail), async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
+
+      const first = await drain(agent.stream());
+      const error = outcomeError(first.outcome) as CccProviderRouteReceiptError;
+      expect(error).toBeInstanceOf(CccProviderRouteReceiptError);
+      expect(error).toMatchObject({ reason, requested: REQUESTED_UPSTREAM, observed });
+      expect(error.observed!.provider.length).toBeLessThanOrEqual(256);
+      expect(error.observed!.model.length).toBeLessThanOrEqual(256);
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(controller.reconcile.mock.calls[0]![0]).toMatchObject({
+        dispatchKey: "pi-stream:1",
+        outcome: "proved_failed",
+        refusalReason: reason,
+        evidenceDigest: refusalDigest(reason, observed),
       });
       expect(requests()).toBe(1);
     });
@@ -910,6 +1056,155 @@ describe("planning-scope settlement through the real receipt adapter over a loop
         effectiveRoute: { omniRoute: { final: REQUESTED_UPSTREAM } },
       });
       expect(requests()).toBe(1);
+    });
+  });
+});
+
+describe("an error before [DONE] is a transport failure through the real receipt adapter (E7-P items 1, 2 and 8)", () => {
+  beforeEach(() => {
+    vi.mocked(ModelRuntime.create).mockReset();
+  });
+
+  /**
+   * What section 2.12 requires of a transport failure: the error event carries cccTransportFailure and no route marker,
+   * nothing is settled, re-entry holds the same slot as dispatched_unknown, and one upstream request was made.
+   */
+  async function expectTransportHold(
+    agent: Awaited<ReturnType<typeof createPlanningAgent>>,
+    controller: FakeController,
+    upstreamRequests: () => number,
+  ) {
+    const first = await drain(agent.stream());
+    expect(first.outcome.ok).toBe(false);
+    expect(outcomeError(first.outcome)).not.toBeInstanceOf(CccProviderRouteReceiptError);
+    const errorEvent = first.events.find((event) => event?.type === "error");
+    expect(errorEvent).toMatchObject({ type: "error", reason: "error", cccTransportFailure: true });
+    expect(errorEvent).not.toHaveProperty("cccRouteFailure");
+    expect(controller.reconcile).not.toHaveBeenCalled();
+
+    const second = await drain(agent.stream());
+    expect(String(outcomeError(second.outcome))).toMatch(/dispatched_unknown/);
+    expect(dispatchKeys(controller)).toEqual(["pi-stream:1", "pi-stream:1"]);
+    expect(controller.reconcile).not.toHaveBeenCalled();
+    expect(upstreamRequests()).toBe(1);
+    return errorEvent;
+  }
+
+  it("(a) a last data line cut mid-JSON at a clean end of stream is a transport failure: no reconcile, re-entry holds with keys [pi-stream:1, pi-stream:1], one upstream request", async () => {
+    const reply: LoopbackReply = (_request, response) => {
+      response.writeHead(200, SSE_HEADERS);
+      response.write(CONTENT_CHUNK);
+      response.end('data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"wor');
+    };
+    await withLoopback(reply, async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
+
+      const errorEvent = await expectTransportHold(agent, controller, requests);
+      expect(errorEvent.error.errorMessage).toMatch(/JSON/);
+    });
+  });
+
+  it("(b) a clean end after a complete line with no [DONE] and no receipt stays a transport failure, not receipt-missing: no reconcile, re-entry holds, one upstream request", async () => {
+    const reply: LoopbackReply = (_request, response) => {
+      response.writeHead(200, SSE_HEADERS);
+      response.write(CONTENT_CHUNK);
+      response.end();
+    };
+    await withLoopback(reply, async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
+
+      await expectTransportHold(agent, controller, requests);
+    });
+  });
+
+  it("(c) a refused connection is a transport failure: no reconcile, re-entry holds with keys [pi-stream:1, pi-stream:1], one upstream request", async () => {
+    // A loopback port this test binds and then closes, so nothing listens on it.
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const chosen = (server.address() as AddressInfo).port;
+        server.close(() => resolve(chosen));
+      });
+    });
+    const baseUrl = `http://127.0.0.1:${port}/v1`;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      const controller = fakeLedgerController();
+      const providerStream = realAdapterStream(baseUrl);
+      const agent = await createPlanningAgent({ controller, providerStream });
+      const upstreamRequests = () =>
+        fetchSpy.mock.calls.filter(([target]) => String(target).startsWith(baseUrl)).length;
+
+      await expectTransportHold(agent, controller, upstreamRequests);
+      expect(providerStream).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("(d) a malformed data line mid-stream, followed by a valid finish, receipt and [DONE], is a transport failure: the adapter abandoned the stream, so nothing is settled", async () => {
+    const reply: LoopbackReply = (_request, response) => {
+      response.writeHead(200, SSE_HEADERS);
+      response.write(CONTENT_CHUNK);
+      response.write("data: {not-json}\n\n");
+      response.write(finishChunk("stop"));
+      response.end(`${receiptComments("minimax", "MiniMax-M3")}data: [DONE]\n\n`);
+    };
+    await withLoopback(reply, async (baseUrl, requests) => {
+      const controller = fakeLedgerController();
+      const agent = await createPlanningAgent({ controller, providerStream: realAdapterStream(baseUrl) });
+
+      await expectTransportHold(agent, controller, requests);
+    });
+  });
+
+  it("the adapter's own timeout firing after the body completed is a transport failure, not an upstream error (E7-P item 8)", async () => {
+    const TIMEOUT_MS = 60_000;
+    const body = [
+      CONTENT_CHUNK,
+      finishChunk("stop"),
+      receiptComments("minimax", "MiniMax-M3"),
+      "data: [DONE]\n\n",
+    ].join("");
+    // Any request that escapes the fetch stub lands on this file's own loopback server and fails the count below.
+    await withLoopback((_request, response) => response.end(), async (baseUrl, requests) => {
+      let pulls = 0;
+      const stubbed = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls += 1;
+          if (pulls === 1) {
+            controller.enqueue(new TextEncoder().encode(body));
+            return;
+          }
+          // The whole body, [DONE] included, has been read: only now does the adapter's timer fire.
+          vi.advanceTimersByTime(TIMEOUT_MS);
+          controller.close();
+        },
+      });
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(stubbed, { status: 200, headers: SSE_HEADERS }),
+      );
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const stream = realAdapterStream(baseUrl)(MODEL, { messages: [] }, { timeoutMs: TIMEOUT_MS });
+        const events: any[] = [];
+        for await (const event of stream as AsyncIterable<any>) events.push(event);
+
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(pulls).toBe(2);
+        const errorEvent = events.find((event) => event?.type === "error");
+        expect(errorEvent).toMatchObject({ type: "error", reason: "error", cccTransportFailure: true });
+        expect(errorEvent).not.toHaveProperty("cccRouteFailure");
+        expect(errorEvent.error.errorMessage).toMatch(/aborted/);
+        expect(events.some((event) => event?.type === "done")).toBe(false);
+        expect(requests()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        fetchSpy.mockRestore();
+      }
     });
   });
 });

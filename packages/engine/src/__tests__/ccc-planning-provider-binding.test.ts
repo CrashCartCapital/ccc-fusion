@@ -11,9 +11,9 @@ import {
   type CccPlanningRouteBinding,
   type CustomProvider,
 } from "@fusion/core";
-import { CCC_PROVIDER_ATTEMPT_ROUTE_MARKER, createFnAgent } from "../pi.js";
+import { attachCccProviderAttemptBoundRoute, CCC_PROVIDER_ATTEMPT_ROUTE_MARKER, createFnAgent } from "../pi.js";
 import { createCccPlanningProviderAttemptBinding } from "../ccc-planning/provider-binding.js";
-import type { CccConfinement, CccProviderPinCheck, CccSessionToolPolicy } from "../agent-runtime.js";
+import type { CccConfinement, CccProviderAttemptController, CccProviderPinCheck, CccSessionToolPolicy } from "../agent-runtime.js";
 
 /*
 FNXC:CccPlanningProviderSeam 2026-10-14-14:30:
@@ -22,6 +22,10 @@ Card P1 proof for binding a planning session to one exact route (CONTRACT-v3 sec
 /*
 FNXC:CccPlanningProviderSeam 2026-10-14-17:22:
 Repair 1 (errata E5-P1). D48 fails closed for linked writers too: a planning-linked-writer binding without the bound-route marker, or with a bound provider that is not the default provider, is refused at session creation (item 3; card BF attaches the marker). When the tool policy allows bash the confinement must carry a confined bash with exec and dispose, and the confined file operations are shape-checked (items 8 and 12). The tool policy must match the binding: allowed tools equal K1's cccPlanningSessionToolNames, denied names include CCC_PLANNING_DENIED_NAMES, and the toolset digest and role class equal the route binding's (item 9). The bound-route marker therefore carries the route binding's role class and toolset digest, and the fixtures pair matching digests.
+*/
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:35:
+Repair 2 (errata E7-P, final). A bound route's model must be the session's default model as well as its provider, so a linked writer (and a planning binding) naming another model is refused at session creation, before any provider call (item 5). The 5-key bound route has one exported type, CccProviderAttemptBoundRoute, and one writer, attachCccProviderAttemptBoundRoute, which card WR uses for a linked writer's controller and the planning factory uses for its own (item 7).
 */
 
 vi.mock("../skill-resolver.js", () => ({
@@ -289,6 +293,74 @@ describe("createCccPlanningProviderAttemptBinding binds one exact route", () => 
   });
 });
 
+/** A plain frozen controller around the fake inner controller, typed as the seam controller it stands for. */
+function plainController(inner = innerController()): CccProviderAttemptController<CccPlanningCallScope> {
+  return Object.freeze({ preDispatch: inner.preDispatch, reconcile: inner.reconcile }) as unknown as CccProviderAttemptController<CccPlanningCallScope>;
+}
+
+describe("attachCccProviderAttemptBoundRoute writes the 5-key bound route that card WR attaches (E7-P item 7)", () => {
+  it("returns a frozen controller that carries exactly the five route values, copied and frozen, and forwards both methods", async () => {
+    const inner = innerController();
+    // Card BF's core data may carry more than the five values; only the five are recorded.
+    const wider: BoundRouteMarker = { ...LINKED_WRITER_ROUTE, bindingHash: "f".repeat(64) } as BoundRouteMarker;
+
+    const marked = attachCccProviderAttemptBoundRoute(plainController(inner), wider);
+
+    expect(Object.isFrozen(marked)).toBe(true);
+    expect(Object.keys(marked).sort()).toEqual(["preDispatch", "reconcile"]);
+    const recorded = (marked as unknown as Record<symbol, unknown>)[CCC_PROVIDER_ATTEMPT_ROUTE_MARKER];
+    expect(recorded).toEqual(LINKED_WRITER_ROUTE);
+    expect(recorded).not.toBe(wider);
+    expect(Object.isFrozen(recorded)).toBe(true);
+    expect(Object.keys(recorded as object).sort()).toEqual(["modelId", "providerId", "roleClass", "toolsetDigest", "transport"]);
+    await expect(marked.preDispatch(MATCHING_DISPATCH)).resolves.toBe(inner.decision);
+    expect(inner.preDispatch).toHaveBeenCalledWith(MATCHING_DISPATCH);
+    const settlement = { dispatchKey: "pi-stream:1" } as any;
+    await expect(marked.reconcile(settlement)).resolves.toBe(inner.settled);
+    expect(inner.reconcile).toHaveBeenCalledWith(settlement);
+  });
+
+  const ATTACH_REFUSALS: ReadonlyArray<Readonly<{
+    label: string;
+    controller: () => CccProviderAttemptController<CccPlanningCallScope>;
+    route: BoundRouteMarker;
+    message: RegExp;
+  }>> = [
+    {
+      label: "an empty route value",
+      controller: () => plainController(),
+      route: Object.freeze({ ...LINKED_WRITER_ROUTE, modelId: "" }),
+      message: /bound route modelId must be a non-empty string/,
+    },
+    {
+      label: "a missing route value",
+      controller: () => plainController(),
+      route: (({ toolsetDigest: _toolsetDigest, ...rest }) => rest)(LINKED_WRITER_ROUTE) as unknown as BoundRouteMarker,
+      message: /bound route toolsetDigest must be a non-empty string/,
+    },
+    {
+      label: "a controller that already carries a bound route",
+      controller: () => attachCccProviderAttemptBoundRoute(plainController(), LINKED_WRITER_ROUTE),
+      route: LINKED_WRITER_ROUTE,
+      message: /already carries a bound route/,
+    },
+    {
+      label: "a controller with a key other than preDispatch and reconcile",
+      controller: () => {
+        const inner = innerController();
+        return Object.freeze({ preDispatch: inner.preDispatch, reconcile: inner.reconcile, extra: 1 }) as unknown as CccProviderAttemptController<CccPlanningCallScope>;
+      },
+      route: LINKED_WRITER_ROUTE,
+      message: /must expose exactly preDispatch, reconcile/,
+    },
+  ];
+
+  for (const { label, controller, route, message } of ATTACH_REFUSALS) it(`refuses ${label}`, () => {
+    const target = controller();
+    expect(() => attachCccProviderAttemptBoundRoute(target, route)).toThrow(message);
+  });
+});
+
 describe("planning session creation enforces the bound route and the planning seams (D48)", () => {
   let pinCheck: Mock<CccProviderPinCheck>;
 
@@ -449,6 +521,30 @@ describe("planning session creation enforces the bound route and the planning se
       }),
       message: /provider omniroute-glm-pinned.*default provider omniroute-minimax-m3-pinned/,
     },
+    // E7-P item 5: the bound model is checked at session creation too, before any provider call.
+    {
+      label: "a planning-linked-writer binding whose bound model is not the session's default model",
+      overrides: () => ({
+        cccProviderAttemptBinding: linkedWriterBinding(Object.freeze({ ...LINKED_WRITER_ROUTE, modelId: "minimax/MiniMax-M2.7" })),
+        cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }),
+      }),
+      message: /model minimax\/MiniMax-M2\.7 must be the session default model minimax\/MiniMax-M3/,
+    },
+    {
+      label: "a planning-linked-writer binding when the session names no default model",
+      overrides: () => ({
+        cccProviderAttemptBinding: linkedWriterBinding(),
+        cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }),
+        defaultModelId: undefined,
+      }),
+      message: /model minimax\/MiniMax-M3 must be the session default model undefined/,
+    },
+    {
+      label: "a planning binding whose bound model is not the session's default model",
+      // A planning route binding's modelId is a closed set of exact models, so the session default is the one that differs.
+      overrides: () => ({ defaultModelId: "minimax/MiniMax-M2.7" }),
+      message: /model minimax\/MiniMax-M3 must be the session default model minimax\/MiniMax-M2\.7/,
+    },
     // E5-P1 items 8 and 12: the confinement's runtime shape.
     {
       label: "an empty confinement object under a policy that allows bash",
@@ -560,6 +656,24 @@ describe("planning session creation enforces the bound route and the planning se
       cccProviderPinCheck: pinCheck,
     })).resolves.toBeDefined();
     expect(pinCheck).toHaveBeenCalledWith(PROVIDERS);
+  });
+
+  it("positive control (E7-P item 7): a planning-linked-writer controller marked with attachCccProviderAttemptBoundRoute creates its session", async () => {
+    prepareSession({ provider: M3_KEY, id: "minimax/MiniMax-M3" });
+    const binding = Object.freeze({
+      turnKey: TURN_KEY,
+      controller: attachCccProviderAttemptBoundRoute(plainController(), LINKED_WRITER_ROUTE),
+      receiptAdapterId: ADAPTER,
+      scopeKind: "planning-linked-writer" as const,
+      toolPolicy: LINKED_WRITER_POLICY,
+    });
+
+    await expect(createFnAgent(sessionOptions({
+      cccProviderAttemptBinding: binding,
+      cccConfinement: Object.freeze({ bash: CONFINED_BASH, fs: FS_OPERATIONS }),
+    }) as any)).resolves.toBeDefined();
+    expect(pinCheck).toHaveBeenCalledWith(PROVIDERS);
+    expect(ModelRuntime.create).toHaveBeenCalledTimes(1);
   });
 
   it("positive control: a probe tool policy with exactly the role toolset plus the probe tool creates its session", async () => {

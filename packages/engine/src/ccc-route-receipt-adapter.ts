@@ -32,8 +32,22 @@ type CccTerminalRouteFailureKind =
   | "receipt-incomplete"
   | "receipt-not-terminal";
 
-function terminalRouteFailure(kind: CccTerminalRouteFailureKind, message: string): Error {
-  return Object.assign(new Error(message), { cccRouteFailure: kind });
+/*
+FNXC:CccRouteReceiptFailureMarker 2026-10-14-18:38:
+Errata E7-P item 4. A conflicting receipt is evidence of which routes the upstream announced, so the parser keeps, per field, the first value and the first value that disagreed with it, and a conflict's error carries them as cccRouteObserved; the adapter copies that onto the error event next to cccRouteFailure. The values are copied as announced; the planning seam picks the one that conflicts with the bound route and bounds its length.
+*/
+/** The receipt values announced for each field, in order: the first, then the first that disagreed with it. */
+export type CccTerminalRouteObservedValues = Readonly<{
+  provider: readonly string[];
+  model: readonly string[];
+}>;
+
+function terminalRouteFailure(
+  kind: CccTerminalRouteFailureKind,
+  message: string,
+  observed?: CccTerminalRouteObservedValues,
+): Error {
+  return Object.assign(new Error(message), { cccRouteFailure: kind }, observed ? { cccRouteObserved: observed } : {});
 }
 
 function takeCompleteSseLines(value: string, final = false): {
@@ -56,6 +70,8 @@ export function createCccTerminalRouteSseCommentParser(): CccTerminalRouteSseCom
   let buffer = "";
   let provider: string | undefined;
   let model: string | undefined;
+  let conflictingProvider: string | undefined;
+  let conflictingModel: string | undefined;
   let conflict = false;
   let receiptObserved = false;
   let nonTerminalReceipt = false;
@@ -68,11 +84,17 @@ export function createCccTerminalRouteSseCommentParser(): CccTerminalRouteSseCom
       const field = match[1]!.toLowerCase();
       const value = match[2]!;
       if (field === "provider") {
-        if (provider !== undefined && provider !== value) conflict = true;
+        if (provider !== undefined && provider !== value) {
+          conflict = true;
+          conflictingProvider ??= value;
+        }
         provider ??= value;
         return;
       }
-      if (model !== undefined && model !== value) conflict = true;
+      if (model !== undefined && model !== value) {
+        conflict = true;
+        conflictingModel ??= value;
+      }
       model ??= value;
       return;
     }
@@ -101,7 +123,13 @@ export function createCccTerminalRouteSseCommentParser(): CccTerminalRouteSseCom
       const { lines } = takeCompleteSseLines(buffer, true);
       for (const line of lines) consumeLine(line);
       if (conflict) {
-        throw terminalRouteFailure("receipt-conflicting", "CCC SSE stream contains a conflicting terminal route receipt");
+        const announced = (first: string | undefined, conflicting: string | undefined) =>
+          Object.freeze([first, conflicting].filter((value): value is string => value !== undefined));
+        throw terminalRouteFailure(
+          "receipt-conflicting",
+          "CCC SSE stream contains a conflicting terminal route receipt",
+          Object.freeze({ provider: announced(provider, conflictingProvider), model: announced(model, conflictingModel) }),
+        );
       }
       if (nonTerminalReceipt) {
         throw terminalRouteFailure("receipt-not-terminal", "CCC SSE stream route receipt is not terminal");
@@ -187,7 +215,8 @@ async function runCccTerminalRouteReceiptRequest(
       options.timeoutMs,
     );
   let responseBody: ReadableStream<Uint8Array> | undefined;
-  // Set when the connection itself failed: fetch rejected, the body read rejected, or the stream ended without [DONE].
+  // Set when the connection itself failed: fetch rejected, the body read rejected, the stream ended without [DONE],
+  // or processing the body failed before [DONE] (E7-P item 1).
   const transport = { failed: false };
   if (options.signal?.aborted) forwardAbort();
   else options.signal?.addEventListener("abort", forwardAbort, { once: true });
@@ -208,6 +237,10 @@ async function runCccTerminalRouteReceiptRequest(
       throw fetchError;
     }
     responseBody = response.body ?? undefined;
+    /*
+    FNXC:CccRouteReceiptFailureMarker 2026-10-14-18:55:
+    Residual (errata E7-P item 8, recorded, not changed). A missing API key (thrown before the request) and a throw from this onResponse hook (after the upstream answered, before its body is read) carry no marker, so the planning seam classifies them as the upstream's own error and settles provider-error-event. No one-line label change separates them: the seam has no local-failure class, and marking the hook's throw as a transport failure needs a try/catch around it.
+    */
     await options.onResponse?.({
       status: response.status,
       headers: Object.fromEntries(response.headers.entries()),
@@ -256,12 +289,13 @@ async function runCccTerminalRouteReceiptRequest(
     // Only the timeout aborts the request controller without a caller abort, so this is the adapter timeout.
     const timedOut = requestController.signal.aborted && !callerAborted;
     const routeFailure = (error as { cccRouteFailure?: unknown } | null)?.cccRouteFailure;
+    const routeObserved = (error as { cccRouteObserved?: unknown } | null)?.cccRouteObserved;
     const marker = callerAborted
       ? {}
       : transport.failed || timedOut
         ? { cccTransportFailure: true as const }
         : typeof routeFailure === "string"
-          ? { cccRouteFailure: routeFailure }
+          ? { cccRouteFailure: routeFailure, ...(routeObserved === undefined ? {} : { cccRouteObserved: routeObserved }) }
           : {};
     let abortReason = error;
     if (responseBody && !responseBody.locked) {
@@ -560,6 +594,19 @@ async function consumeReceiptAdapterSse(
     if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /u, ""));
   };
 
+  /*
+  FNXC:CccRouteReceiptFailureMarker 2026-10-14-18:38:
+  Errata E7-P item 1. Any error raised while the body is being processed, before [DONE] was seen, means the adapter abandoned a stream whose outcome it never learned: a last data line cut mid-JSON at a clean end, a malformed data line mid-stream, or any other parse failure. It is marked as a transport failure before it is rethrown, so a planning session leaves the attempt dispatched_unknown instead of settling it as the upstream's own error. An upstream-reported error never passes through here: finish_reason error is recorded on the output and thrown only after [DONE].
+  */
+  const processBeforeDone = (process: () => void): void => {
+    try {
+      process();
+    } catch (processError) {
+      if (!sawDone) transport.failed = true;
+      throw processError;
+    }
+  };
+
   try {
     while (true) {
       let next: Awaited<ReturnType<typeof reader.read>>;
@@ -572,23 +619,28 @@ async function consumeReceiptAdapterSse(
       if (next.done) {
         break;
       }
-      receiptParser.push(next.value);
-      sseBuffer += decoder.decode(next.value, { stream: true });
-      const { lines, remainder } = takeCompleteSseLines(sseBuffer);
-      sseBuffer = remainder;
-      for (const line of lines) consumeLine(line);
+      const chunk = next.value;
+      processBeforeDone(() => {
+        receiptParser.push(chunk);
+        sseBuffer += decoder.decode(chunk, { stream: true });
+        const { lines, remainder } = takeCompleteSseLines(sseBuffer);
+        sseBuffer = remainder;
+        for (const line of lines) consumeLine(line);
+      });
     }
   } finally {
     reader.releaseLock();
   }
-  sseBuffer += decoder.decode();
-  const { lines: finalLines } = takeCompleteSseLines(sseBuffer, true);
-  for (const line of finalLines) consumeLine(line);
-  if (dataLines.length > 0) consumeData(dataLines.join("\n"));
+  processBeforeDone(() => {
+    sseBuffer += decoder.decode();
+    const { lines: finalLines } = takeCompleteSseLines(sseBuffer, true);
+    for (const line of finalLines) consumeLine(line);
+    if (dataLines.length > 0) consumeData(dataLines.join("\n"));
 
-  finishTextBlock();
-  finishThinkingBlock();
-  finishToolCallBlocks();
+    finishTextBlock();
+    finishThinkingBlock();
+    finishToolCallBlocks();
+  });
   return { sawDone, sawFinishReason };
 }
 

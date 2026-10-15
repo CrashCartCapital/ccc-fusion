@@ -21,6 +21,10 @@ Card P1 proof that the Pi seam types still carry the real campaign controller (C
 FNXC:CccPlanningProviderSeam 2026-10-14-17:22:
 Repair 1 (errata E5-P1). The planning binding the factory returns is passed to createFnAgent's options and to AgentRuntimeOptions with no cast, because both option properties are typed with the K1 view scope while the binding alias keeps its campaign default (item 5). The engine's view type names are re-exports of K1's, so the compiler resolves each one to its declaration in core (item 6). CccConfinement.bash is typed structurally with the dispose result X1c returns, without importing X1c (items 12, E6-0).
 */
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:36:
+Repair 2 (errata E7-P item 7). pi.ts exports the bound-route type CccProviderAttemptBoundRoute, pinned here to exactly its five string keys, and its one writer attachCccProviderAttemptBoundRoute, which card WR imports to mark a linked writer's controller. The marker reader returns that same exported type.
+*/
 
 // ------------------------------------------------------------ compile-time fixtures
 
@@ -174,6 +178,25 @@ const PLANNING_OPTIONS: [string, string] = [join(TESTS_DIR, "__p1_seam_planning_
   "",
 ].join("\n")];
 
+/** E7-P item 7: the exported 5-key bound route and its writer, imported as card WR will import them. */
+const BOUND_ROUTE: [string, string] = [join(TESTS_DIR, "__p1_seam_bound_route.ts"), [
+  'import type { CccProviderAttemptScope } from "@fusion/core";',
+  'import { attachCccProviderAttemptBoundRoute, type CccProviderAttemptBoundRoute } from "../pi.js";',
+  'import type * as Engine from "../agent-runtime.js";',
+  "type Assert<T extends true> = T;",
+  "type Same<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;",
+  'export type Keys = Assert<Same<keyof CccProviderAttemptBoundRoute, "modelId" | "providerId" | "roleClass" | "toolsetDigest" | "transport">>;',
+  "export type Shape = Assert<Same<CccProviderAttemptBoundRoute, Readonly<{ providerId: string; modelId: string; transport: string; roleClass: string; toolsetDigest: string }>>>;",
+  "export function probe(",
+  "  controller: Engine.CccProviderAttemptController<CccProviderAttemptScope>,",
+  "  route: CccProviderAttemptBoundRoute,",
+  "): Engine.CccProviderAttemptController<CccProviderAttemptScope> {",
+  "  return attachCccProviderAttemptBoundRoute(controller, route);",
+  "}",
+  "",
+].join("\n")];
+const PI_SOURCE = join(ENGINE_ROOT, "src", "pi.ts");
+
 /** The K1 view types the engine must take from core instead of redefining (E5-P1 item 6). */
 const K1_VIEW_TYPES = Object.freeze([
   ["CccProviderAttemptRouteBindingView", join(CORE_SRC, "ccc-campaign", "types.ts")],
@@ -218,6 +241,7 @@ describe("Pi seam types carry the real campaign controller (type-only, compiled 
       [WRONG_SCOPE[0]]: WRONG_SCOPE[1],
       [NON_VACUOUS[0]]: NON_VACUOUS[1],
       [PLANNING_OPTIONS[0]]: PLANNING_OPTIONS[1],
+      [BOUND_ROUTE[0]]: BOUND_ROUTE[1],
     });
     findings = checked.byFile;
     program = checked.program;
@@ -250,6 +274,23 @@ describe("Pi seam types carry the real campaign controller (type-only, compiled 
 
   it("passes the planning factory binding to createFnAgent options and AgentRuntimeOptions with no cast, and types the confined bash dispose structurally (E5-P1 items 5 and 12)", () => {
     expect(findings.get(PLANNING_OPTIONS[0])).toEqual([]);
+  });
+
+  it("exports the 5-key CccProviderAttemptBoundRoute and attachCccProviderAttemptBoundRoute from pi.ts, and the marker reader returns that same type (E7-P item 7)", () => {
+    expect(findings.get(BOUND_ROUTE[0])).toEqual([]);
+    const pi = program.getSourceFile(PI_SOURCE);
+    if (!pi) throw new Error("compiler did not load pi.ts");
+    const found = { typeExported: false, typeDeclarations: 0, readerReturnType: "" };
+    ts.forEachChild(pi, (node) => {
+      if (ts.isTypeAliasDeclaration(node) && node.name.text === "CccProviderAttemptBoundRoute") {
+        found.typeDeclarations += 1;
+        found.typeExported = node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+      }
+      if (ts.isFunctionDeclaration(node) && node.name?.text === "readCccProviderAttemptBoundRoute") {
+        found.readerReturnType = node.type?.getText(pi) ?? "";
+      }
+    });
+    expect(found).toEqual({ typeExported: true, typeDeclarations: 1, readerReturnType: "CccProviderAttemptBoundRoute | undefined" });
   });
 
   it("re-exports K1's view types from core instead of keeping engine copies (E5-P1 item 6)", () => {

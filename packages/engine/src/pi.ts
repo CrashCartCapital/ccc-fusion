@@ -43,6 +43,7 @@ import {
   getEnabledPiExtensionPaths,
   canonicalCccPrdJson,
   cccPlanningSessionToolNames,
+  CCC_PLANNING_AUDIT_STRING_MAX,
   CCC_PLANNING_DENIED_NAMES,
   compareCccPrdCodeUnits,
   getFusionAgentDir,
@@ -848,7 +849,12 @@ function validateCccSessionToolPolicy(value: unknown, scopeKind: unknown): void 
   }
 }
 
-type CccProviderAttemptBoundRoute = Readonly<{
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:41:
+Errata E7-0 and E7-P item 7. The bound route is exactly five strings, one exported type, written only by attachCccProviderAttemptBoundRoute and read only by readCccProviderAttemptBoundRoute. Card WR attaches it where it creates a linked-writer session, from the five values card BF supplies in its core data (BF never imports the engine); the planning factory attaches it for a planning session. The writer returns a new frozen controller whose own string keys stay exactly preDispatch and reconcile, so it works on a controller that is already frozen.
+*/
+/** The route a binding's controller is bound to, recorded under CCC_PROVIDER_ATTEMPT_ROUTE_MARKER (D48). */
+export type CccProviderAttemptBoundRoute = Readonly<{
   providerId: string;
   modelId: string;
   transport: string;
@@ -856,9 +862,53 @@ type CccProviderAttemptBoundRoute = Readonly<{
   toolsetDigest: string;
 }>;
 
+const CCC_PROVIDER_ATTEMPT_BOUND_ROUTE_KEYS = Object.freeze(
+  ["modelId", "providerId", "roleClass", "toolsetDigest", "transport"] as const,
+);
+
+/**
+ * Returns a frozen controller that forwards both methods to `controller` and carries a frozen copy of exactly the
+ * five `route` values under CCC_PROVIDER_ATTEMPT_ROUTE_MARKER. Refuses an empty or missing route value, a controller
+ * whose own keys are not exactly preDispatch and reconcile, and a controller that already carries a bound route.
+ */
+export function attachCccProviderAttemptBoundRoute<S extends CccProviderAttemptViewScope>(
+  controller: import("./agent-runtime.js").CccProviderAttemptController<S>,
+  route: CccProviderAttemptBoundRoute,
+): import("./agent-runtime.js").CccProviderAttemptController<S> {
+  const label = "attachCccProviderAttemptBoundRoute";
+  if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
+    throw new Error(`${label} controller must be an object`);
+  }
+  exactObjectKeys(controller as unknown as Record<string, unknown>, ["preDispatch", "reconcile"], `${label} controller`);
+  if (typeof controller.preDispatch !== "function" || typeof controller.reconcile !== "function") {
+    throw new Error(`${label} controller methods must be functions`);
+  }
+  if ((controller as unknown as Record<PropertyKey, unknown>)[CCC_PROVIDER_ATTEMPT_ROUTE_MARKER] !== undefined) {
+    throw new Error(`${label} controller already carries a bound route`);
+  }
+  const values = (route ?? {}) as Record<string, unknown>;
+  for (const key of CCC_PROVIDER_ATTEMPT_BOUND_ROUTE_KEYS) {
+    if (typeof values[key] !== "string" || (values[key] as string).length === 0) {
+      throw new Error(`${label} bound route ${key} must be a non-empty string`);
+    }
+  }
+  const bound: CccProviderAttemptBoundRoute = Object.freeze({
+    providerId: route.providerId,
+    modelId: route.modelId,
+    transport: route.transport,
+    roleClass: route.roleClass,
+    toolsetDigest: route.toolsetDigest,
+  });
+  return Object.freeze({
+    preDispatch: (input: CccCampaignProviderDispatchInput) => controller.preDispatch(input),
+    reconcile: (input: import("./agent-runtime.js").CccProviderAttemptSettlementInputOf<S>) => controller.reconcile(input),
+    [CCC_PROVIDER_ATTEMPT_ROUTE_MARKER]: bound,
+  });
+}
+
 /*
 FNXC:CccPlanningProviderSeam 2026-10-14-17:37:
-Repair 1 (errata E5-P1 items 3 and 9). The bound-route marker also carries the route binding's role class and toolset digest, so session creation can check the tool policy against the binding it was issued for. createCccPlanningProviderAttemptBinding writes all five fields, and card BF writes the same five for a planning-linked writer.
+Repair 1 (errata E5-P1 items 3 and 9). The bound-route marker also carries the route binding's role class and toolset digest, so session creation can check the tool policy against the binding it was issued for. createCccPlanningProviderAttemptBinding writes all five fields, and card WR attaches the same five for a planning-linked writer from card BF's core data (E7-0).
 */
 /** The route a planning binding factory recorded on its frozen controller, if any. */
 function readCccProviderAttemptBoundRoute(binding: CccProviderAttemptViewBinding): CccProviderAttemptBoundRoute | undefined {
@@ -971,7 +1021,11 @@ Session creation for a planning or planning-linked-writer binding (CONTRACT-v3 s
 */
 /*
 FNXC:CccPlanningProviderSeam 2026-10-14-17:37:
-Repair 1 (errata E5-P1 item 3). D48 fails closed for both planning scope kinds: a planning or planning-linked-writer binding whose controller carries no CCC_PROVIDER_ATTEMPT_ROUTE_MARKER is refused, as is a bound provider that is not the default provider. Card BF must attach the marker to a linked writer's controller.
+Repair 1 (errata E5-P1 item 3). D48 fails closed for both planning scope kinds: a planning or planning-linked-writer binding whose controller carries no CCC_PROVIDER_ATTEMPT_ROUTE_MARKER is refused, as is a bound provider that is not the default provider. Card WR attaches the marker to a linked writer's controller with attachCccProviderAttemptBoundRoute (E7-0).
+*/
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:41:
+Errata E7-P item 5. The bound model must be the session's default model as well as its provider, checked here before any provider call. Card WR's linked-writer controller has no route-drift check of its own, so without this a linked writer whose default model differs from its bound route would spend one provider call before the terminal receipt refused it. The check applies to planning bindings too, which closes the same gap for a planning binding whose controller was marked with attachCccProviderAttemptBoundRoute rather than built by the planning factory.
 */
 function assertCccPlanningSessionBinding(
   options: AgentOptions,
@@ -1005,6 +1059,11 @@ function assertCccPlanningSessionBinding(
     throw new Error(
       `ccc-fusion planning binding provider ${route.providerId} must be the session default provider `
       + `${String(options.defaultProvider)} (D48)`,
+    );
+  }
+  if (route.modelId !== options.defaultModelId) {
+    throw new Error(
+      `${label} model ${route.modelId} must be the session default model ${String(options.defaultModelId)} (D48)`,
     );
   }
   assertCccSessionToolPolicyMatchesBinding(binding.toolPolicy, scopeKind, route);
@@ -1297,18 +1356,58 @@ const CCC_PLANNING_ROUTE_BINDING_KIND = "ccc-planning-route.v1";
 FNXC:CccPlanningProviderSeam 2026-10-14-17:37:
 Errata E5-P1 item 7. A planning controller's scope must never get campaign semantics. A scope whose binding is a planning route binding (kind ccc-planning-route.v1) is refused, permit or hold, before any provider call unless the session binding's scopeKind is planning. A planning-linked writer runs on campaign-shaped scopes (card BF), whose bindings carry no scope kind, so a linked-writer scope cannot be told apart from a campaign scope here and is not checked.
 */
-function assertCccProviderAttemptScopeKind(
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:41:
+Errata E7-P item 6. The item-7 check needs the scope the controller returned, because a planning controller that a hand-built binding wraps carries no marker, so it cannot run on the binding before preDispatch. The check therefore returns its refusal, and the stream settles a refused dispatch permit once before throwing it (a hold reserved nothing and is only refused).
+*/
+function cccProviderAttemptScopeKindRefusal(
   binding: CccProviderAttemptViewBinding,
   scope: CccProviderAttemptViewScope,
   label: string,
-): void {
+): Error | undefined {
   const scopeBindingKind = (scope?.binding as unknown as { kind?: unknown } | undefined)?.kind;
   if (scopeBindingKind === CCC_PLANNING_ROUTE_BINDING_KIND && binding.scopeKind !== "planning") {
-    throw new Error(
+    return new Error(
       `ccc-fusion ${label} scope is a planning scope (${CCC_PLANNING_ROUTE_BINDING_KIND}) but the session binding is a `
       + `${binding.scopeKind ?? "campaign"} session binding`,
     );
   }
+  return undefined;
+}
+
+/*
+FNXC:CccPlanningProviderSeam 2026-10-14-18:41:
+Errata E7-P item 4. A route value recorded in refusal evidence is at most CCC_PLANNING_AUDIT_STRING_MAX (256) characters: a longer value keeps a prefix and the sha256 of the whole value, so two long values stay distinguishable and the evidence stays bounded. A conflicting receipt records, per field, the first announced value that differs from the bound route (else the announced value), so the evidence names the route that conflicted, whichever order the upstream announced it in.
+*/
+function boundCccObservedRouteValue(value: string): string {
+  if (value.length <= CCC_PLANNING_AUDIT_STRING_MAX) return value;
+  const suffix = `...sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+  let cut = CCC_PLANNING_AUDIT_STRING_MAX - suffix.length;
+  const last = value.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return `${value.slice(0, cut)}${suffix}`;
+}
+
+function boundCccObservedRoute(observed: CccOmniRouteObservation | null): CccOmniRouteObservation | null {
+  if (!observed) return null;
+  return { provider: boundCccObservedRouteValue(observed.provider), model: boundCccObservedRouteValue(observed.model) };
+}
+
+function readCccConflictingRouteObservation(
+  event: Record<string, unknown>,
+  requested: CccOmniRouteObservation,
+): CccOmniRouteObservation | null {
+  const announced = event.cccRouteObserved;
+  if (!announced || typeof announced !== "object" || Array.isArray(announced)) return null;
+  const pick = (values: unknown, boundValue: string): string | undefined => {
+    if (!Array.isArray(values)) return undefined;
+    const strings = values.filter((value): value is string => typeof value === "string");
+    return strings.find((value) => value !== boundValue) ?? strings[0];
+  };
+  const provider = pick((announced as Record<string, unknown>).provider, requested.provider);
+  const model = pick((announced as Record<string, unknown>).model, requested.model);
+  if (provider === undefined && model === undefined) return null;
+  return { provider: provider ?? "", model: model ?? "" };
 }
 
 /** Terminal-receipt failure kinds the receipt adapter marks on its error events (E5-P1 item 4). */
@@ -1329,6 +1428,16 @@ type CccPlanningErrorEventClass =
 FNXC:CccPlanningProviderSeam 2026-10-14-17:37:
 Errata E5-P1 items 2 and 4. How a planning scope reads an error event from the receipt adapter. A caller abort (reason aborted) and a transport failure (cccTransportFailure: a terminated stream, socket reset, fetch failure or adapter timeout) are never settled, so the attempt stays dispatched_unknown (section 2.12 lost-connection rule). A terminal-receipt failure (cccRouteFailure) is a route refusal. Any other error is the upstream's own (an HTTP status or finish_reason error) and settles provider-error-event. Transport is read before a route failure, so an unknown outcome is never settled as a known one.
 */
+/** Whether a terminal receipt names the bound route, by the same rule as a committed stream's receipt check. */
+function cccOmniRouteReceiptMatches(expectation: CccOmniRouteExpectation, result: unknown): boolean {
+  try {
+    requireCccOmniRouteReceipt(expectation, undefined, result);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function classifyCccPlanningErrorEvent(event: Record<string, unknown>): CccPlanningErrorEventClass {
   if (event.reason === "aborted") return { kind: "aborted-or-unknown" };
   if (event.cccTransportFailure === true) return { kind: "transport" };
@@ -1371,39 +1480,6 @@ function createCccProviderAttemptControlledStream(input: {
       }
       let source!: AsyncIterable<any> & { result: () => Promise<any> };
       let scope!: CccProviderAttemptViewScope;
-      while (true) {
-        const dispatchKey = `pi-stream:${input.state.nextSlot}`;
-        const request = {
-          turnKey: input.binding.turnKey,
-          dispatchKey,
-          providerId: String(input.model.provider),
-          modelId: String(input.model.id),
-          transport: "pi",
-        } as const;
-        const decision = await input.binding.controller.preDispatch(request);
-        assertCccProviderAttemptScopeKind(
-          input.binding,
-          decision.scope,
-          decision.kind === "dispatch-permit" ? "dispatch-permit" : `${decision.reason} hold`,
-        );
-        if (decision.kind === "dispatch-permit") {
-          assertCccProviderAttemptPermitScope(request, decision.scope);
-          scope = decision.scope;
-          source = input.dispatch(input.dispatchModel, input.context, input.requestOptions);
-          break;
-        }
-        assertCccProviderAttemptScopeAssociation(request, decision.scope, `${decision.reason} hold`);
-        if (decision.reason === "terminal" && decision.scope.state === "proved_failed") {
-          assertCccProviderAttemptProvedFailedTerminalScope(decision.scope);
-          // A slot this session refused on its route never advances (D10, item 42); a provider-error
-          // proved_failed slot still does (E2-1). Only planning scopes record refusals.
-          const refusal = input.state.routeRefusals.get(dispatchKey);
-          if (refusal) throw refusal;
-          input.state.nextSlot += 1;
-          continue;
-        }
-        throw cccProviderAttemptHoldError(decision, dispatchKey);
-      }
 
       /*
       FNXC:CccPlanningProviderSeam 2026-10-14-15:05:
@@ -1413,6 +1489,13 @@ function createCccProviderAttemptControlledStream(input: {
       FNXC:CccPlanningProviderSeam 2026-10-14-17:37:
       Repair 1 (errata E5-P1 items 1, 10 and 11). A route refusal is written to routeRefusals before its settlement is awaited, so a lost or malformed reconcile response cannot let a later stream on this session move past the refused slot. A provider-error-event keeps the observed terminal receipt in its evidence when the error carries one. Effective-route drift stays unreachable in planning scope (accepted, item 11), so there is no drift branch.
       */
+      /*
+      FNXC:CccPlanningProviderSeam 2026-10-14-18:43:
+      Repair 2 (errata E7-P items 4 and 6). The refusal helpers are defined before the slot loop, because the item-6 refusal settles a dispatch permit inside it. Every observed route value in a refusal is bounded (boundCccObservedRoute). The only use of effective-route-drift is that item-6 refusal: a planning controller's scope under a session binding whose scopeKind is not "planning", where no provider request is sent. The receipt handling after a dispatch still has no drift branch (item 11). Its requested route is the binding's receipt-adapter route when there is one, else the Pi model.
+      */
+      const refusalRequested: CccOmniRouteObservation = planningRequested
+        ?? splitCccProviderQualifiedModel(input.model.id)
+        ?? { provider: String(input.model.provider), model: String(input.model.id) };
       const settlePlanningRefusal = async (refusal: CccProviderRouteReceiptError): Promise<void> => {
         const reconciliation: CccProviderAttemptSubmittedReconciliation = {
           ...scope,
@@ -1435,20 +1518,67 @@ function createCccProviderAttemptControlledStream(input: {
         observed: Readonly<{ provider: string; model: string }> | null,
       ) => new CccProviderRouteReceiptError(
         reason,
-        { provider: planningRequested!.provider, model: planningRequested!.model },
-        observed,
+        { provider: refusalRequested.provider, model: refusalRequested.model },
+        boundCccObservedRoute(observed),
       );
+      /** Remembers the refused slot, then settles it once (D10, E5-P1 item 1). */
+      const rememberAndSettleRefusal = async (refusal: CccProviderRouteReceiptError): Promise<void> => {
+        input.state.routeRefusals.set(scope.dispatchKey, refusal);
+        failure = refusal;
+        await settlePlanningRefusal(refusal);
+      };
       /** Remembers the refused slot, then settles it once, then throws out of the slot loop (D10). */
       const refusePlanningRoute = async (
         reason: "receipt-missing" | "receipt-mismatch",
         observed: Readonly<{ provider: string; model: string }> | null,
       ): Promise<never> => {
         const refusal = planningRefusal(reason, observed);
-        input.state.routeRefusals.set(scope.dispatchKey, refusal);
-        failure = refusal;
-        await settlePlanningRefusal(refusal);
+        await rememberAndSettleRefusal(refusal);
         throw refusal;
       };
+
+      while (true) {
+        const dispatchKey = `pi-stream:${input.state.nextSlot}`;
+        const request = {
+          turnKey: input.binding.turnKey,
+          dispatchKey,
+          providerId: String(input.model.provider),
+          modelId: String(input.model.id),
+          transport: "pi",
+        } as const;
+        const decision = await input.binding.controller.preDispatch(request);
+        const scopeKindRefusal = cccProviderAttemptScopeKindRefusal(
+          input.binding,
+          decision.scope,
+          decision.kind === "dispatch-permit" ? "dispatch-permit" : `${decision.reason} hold`,
+        );
+        if (scopeKindRefusal) {
+          if (decision.kind === "dispatch-permit") {
+            // E7-P item 6: the permit reserved this call, so settle it once, with no provider request, before refusing.
+            assertCccProviderAttemptPermitScope(request, decision.scope);
+            scope = decision.scope;
+            await rememberAndSettleRefusal(planningRefusal("effective-route-drift", null));
+          }
+          throw scopeKindRefusal;
+        }
+        if (decision.kind === "dispatch-permit") {
+          assertCccProviderAttemptPermitScope(request, decision.scope);
+          scope = decision.scope;
+          source = input.dispatch(input.dispatchModel, input.context, input.requestOptions);
+          break;
+        }
+        assertCccProviderAttemptScopeAssociation(request, decision.scope, `${decision.reason} hold`);
+        if (decision.reason === "terminal" && decision.scope.state === "proved_failed") {
+          assertCccProviderAttemptProvedFailedTerminalScope(decision.scope);
+          // A slot this session refused on its route never advances (D10, item 42); a provider-error
+          // proved_failed slot still does (E2-1). Only planning scopes record refusals.
+          const refusal = input.state.routeRefusals.get(dispatchKey);
+          if (refusal) throw refusal;
+          input.state.nextSlot += 1;
+          continue;
+        }
+        throw cccProviderAttemptHoldError(decision, dispatchKey);
+      }
 
       let terminalDoneEvent: unknown;
       let finalResultPromise: Promise<any> | undefined;
@@ -1541,12 +1671,18 @@ function createCccProviderAttemptControlledStream(input: {
                   const observed = readCccOmniRouteFinal(errorPayload) ?? null;
                   if (errorClass.kind === "route") {
                     // A terminal-receipt failure is a route refusal: settle once and never advance (E5-P1 item 4).
-                    await refusePlanningRoute(
-                      errorClass.routeFailure === "receipt-conflicting" || observed ? "receipt-mismatch" : "receipt-missing",
-                      observed,
-                    );
+                    // A conflicting receipt keeps the route that conflicted in its evidence (E7-P item 4).
+                    const conflicting = errorClass.routeFailure === "receipt-conflicting";
+                    const routeObserved = observed
+                      ?? (conflicting ? readCccConflictingRouteObservation(event as Record<string, unknown>, refusalRequested) : null);
+                    await refusePlanningRoute(conflicting || routeObserved ? "receipt-mismatch" : "receipt-missing", routeObserved);
                   }
                   if (errorClass.kind === "upstream") {
+                    // E7-0, E7-P item 3: a terminal receipt naming another route refuses receipt-mismatch and never
+                    // retries, even when the upstream ended with finish_reason error.
+                    if (observed && !cccOmniRouteReceiptMatches(input.omniRouteRequested!, errorPayload)) {
+                      await refusePlanningRoute("receipt-mismatch", observed);
+                    }
                     // A provider error is a known failed effect: settle it, and a retry may take the next slot (E2-1).
                     await settlePlanningRefusal(planningRefusal("provider-error-event", observed));
                     input.state.nextSlot += 1;
